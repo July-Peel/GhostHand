@@ -1,0 +1,27 @@
+services:
+  ghosthand:
+    build:
+      context: ..
+      dockerfile: backend/Dockerfile
+    image: ghosthand/server:m2
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ghosthand-data:/data
+    environment:
+      GH_ADMIN_USER: ${GH_ADMIN_USER:-admin}
+      GH_ADMIN_PASSWORD: ${GH_ADMIN_PASSWORD:-}
+      GH_PUBLIC_URL: ${GH_PUBLIC_URL:-}
+      GH_DEMO_DEVICES: ${GH_DEMO_DEVICES:-true}
+      GH_TLS_FINGERPRINT: ${GH_TLS_FINGERPRINT:-}
+      GH_BEHIND_CLOUDFLARE: ${GH_BEHIND_CLOUDFLARE:-false}
+    healthcheck:
+      test: ["CMD", "/ghosthand", "health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  ghosthand-data:

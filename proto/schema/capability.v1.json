@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GhostHand v1 capability descriptor",
+  "type": "object",
+  "required": ["id", "version", "lane", "params_schema"],
+  "properties": {
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9_]*\\.[a-z][a-z0-9_]*$" },
+    "version": { "type": "integer", "minimum": 1 },
+    "lane": { "enum": ["ui", "bg"] },
+    "disabled_by_default": { "type": "boolean" },
+    "params_schema": { "type": ["object", "boolean"] }
+  }
+}

@@ -1,0 +1,30 @@
+# 本地私有文档、示范与编辑器配置
+计划文档/
+示范文件/
+.vscode/
+
+# 各个构建输出与依赖目录
+**/dist/
+**/node_modules/
+backend/out/
+backend/bin/
+*.exe
+
+# Windows Helper (.NET / Visual Studio / Installer)
+frontend/helper-windows/.vs/
+frontend/helper-windows/**/bin/
+frontend/helper-windows/**/obj/
+frontend/helper-windows/installer/Output/
+
+# 运行时数据、本地数据库与环境变量
+data/
+backend/data/
+*.db
+*.db-*
+.env
+.env.*
+!.env.example
+
+# 系统残留文件
+.DS_Store
+Thumbs.db

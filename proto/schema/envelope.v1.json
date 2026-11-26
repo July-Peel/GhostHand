@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GhostHand v1 message envelope",
+  "type": "object",
+  "required": ["v", "type", "id", "seq", "ack", "ts", "payload"],
+  "properties": {
+    "v": { "const": 1 },
+    "type": {
+      "enum": [
+        "hello", "welcome", "ping", "pong", "caps.report", "state.update", "state.sleeping", "config.update",
+        "task.assign", "task.pause", "task.resume", "task.cancel", "task.confirm_reply", "task.accepted",
+        "task.progress", "task.heartbeat", "task.confirm_request", "task.result", "upload.request", "upload.ticket",
+        "flow.sync", "agent.update", "agent.restart", "helper.restart", "device.reboot", "log.collect",
+        "agent.update_result", "log.ready", "helper.state", "agent.rollback", "agent.uninstall", "operation.result",
+        "mcp.tool_call", "mcp.tool_result", "mcp.task_display", "mcp.task_finish"
+      ]
+    },
+    "id": { "type": "string", "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$" },
+    "seq": { "type": "integer", "minimum": 0 },
+    "ack": { "type": "integer", "minimum": 0 },
+    "ts": { "type": "integer", "description": "Unix milliseconds" },
+    "payload": { "type": "object" }
+  }
+}

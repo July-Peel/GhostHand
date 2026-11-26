@@ -1,0 +1,14 @@
+{
+  "id": "/",
+  "name": "GhostHand",
+  "short_name": "GhostHand",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "lang": "zh-CN",
+  "theme_color": "#4F46E5",
+  "background_color": "#FAFAFA",
+  "icons": [
+    { "src": "/icon.svg", "type": "image/svg+xml", "sizes": "any", "purpose": "any maskable" }
+  ]
+}

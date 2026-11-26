@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GhostHand v1 capability parameters",
+  "$defs": {
+    "device.info": {
+      "type": "object",
+      "additionalProperties": false
+    },
+    "device.battery": {
+      "type": "object",
+      "additionalProperties": false
+    },
+    "screen.capture": {
+      "type": "object",
+      "properties": {
+        "upload": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    }
+  }
+}
