@@ -31,11 +31,12 @@ type Server struct {
 	origin      string
 	web         fs.FS
 	agents      *agents.Service
+	unlock      *agents.UnlockManager
 	fingerprint string
 }
 
-func New(store *db.Store, authentication *auth.Service, config *settings.Service, desk *workbench.Service, fleet *agents.Service, origin, fingerprint string, web fs.FS) http.Handler {
-	s := &Server{store: store, auth: authentication, settings: config, workbench: desk, origin: origin, web: web, agents: fleet, fingerprint: fingerprint}
+func New(store *db.Store, authentication *auth.Service, config *settings.Service, desk *workbench.Service, fleet *agents.Service, unlock *agents.UnlockManager, origin, fingerprint string, web fs.FS) http.Handler {
+	s := &Server{store: store, auth: authentication, settings: config, workbench: desk, origin: origin, web: web, agents: fleet, unlock: unlock, fingerprint: fingerprint}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /readyz", s.ready)

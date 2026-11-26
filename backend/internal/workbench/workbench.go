@@ -22,8 +22,9 @@ import (
 )
 
 const (
-	pageSize = 60
-	taskTTL  = 30 * time.Minute
+	pageSize     = 60
+	taskTTL      = 30 * time.Minute
+	brainTaskTTL = 90 * time.Minute
 )
 
 var (
@@ -139,14 +140,15 @@ func commandFor(capability proto.CapabilityID) Command {
 }
 
 type Service struct {
-	store         *db.Store
-	demo          bool
-	fileDir       string
-	config        *settings.Service
-	dataDir       string
-	brainMu       sync.Mutex
-	brainSessions map[string]map[string]context.CancelFunc
-	refreshSeq    atomic.Int64
+	desktopUnlocker DesktopUnlocker
+	store           *db.Store
+	demo            bool
+	fileDir         string
+	config          *settings.Service
+	dataDir         string
+	brainMu         sync.Mutex
+	brainSessions   map[string]map[string]context.CancelFunc
+	refreshSeq      atomic.Int64
 }
 
 func New(store *db.Store, config *settings.Service, dataDir string, demo bool) (*Service, error) {
@@ -231,6 +233,10 @@ func (s *Service) Devices(ctx context.Context) ([]Device, error) {
 		devices = append(devices, device)
 	}
 	return devices, rows.Err()
+}
+
+func (s *Service) DemoEnabled() bool {
+	return s.demo
 }
 
 func (s *Service) Messages(ctx context.Context, deviceID string, before int64) (Page, error) {
@@ -482,15 +488,17 @@ func (s *Service) CleanupDeviceState(ctx context.Context, deviceID string, local
 
 func createTask(ctx context.Context, tx *sql.Tx, userID int64, device Device, command Command, prompt string, now time.Time) error {
 	source, title := "quick", command.Title
+	ttl := taskTTL
 	if command.Capability == proto.BrainTask {
 		source, title = "brain", limitText(prompt, 80)
+		ttl = brainTaskTTL
 	}
-	_, err := insertTask(ctx, tx, userID, device, command, prompt, source, title, now, taskTTL)
+	_, err := insertTask(ctx, tx, userID, device, command, prompt, source, title, now, ttl, false)
 	return err
 }
 
 func insertTask(ctx context.Context, tx *sql.Tx, userID int64, device Device, command Command, prompt, source, title string,
-	now time.Time, ttl time.Duration) (string, error) {
+	now time.Time, ttl time.Duration, quiet bool) (string, error) {
 	var bytes [16]byte
 	if _, err := rand.Read(bytes[:]); err != nil {
 		return "", err
@@ -517,10 +525,12 @@ func insertTask(ctx context.Context, tx *sql.Tx, userID int64, device Device, co
 	`, id, device.ID, userID, command.Capability, now.UnixMilli(), expires.UnixMilli(), due, command.Lane, total, source, prompt, title); err != nil {
 		return "", err
 	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO chat_messages(device_id, sender, type, task_id, created_at) VALUES (?, 'agent', 'task_card', ?, ?)
-	`, device.ID, id, now.UnixMilli()); err != nil {
-		return "", err
+	if !quiet {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO chat_messages(device_id, sender, type, task_id, created_at) VALUES (?, 'agent', 'task_card', ?, ?)
+		`, device.ID, id, now.UnixMilli()); err != nil {
+			return "", err
+		}
 	}
 	if err := addTaskEvent(ctx, tx, id, "queue", "queued", "任务已入队", now.UnixMilli()); err != nil {
 		return "", err

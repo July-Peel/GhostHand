@@ -32,6 +32,8 @@ type helperLink struct {
 	waiting       map[int]chan captureReply
 	mcp           bool
 	browserBridge bool
+	lockDesktop   bool
+	session       uint32
 }
 
 type captureReply struct {
@@ -86,6 +88,10 @@ func (p *host) capture(ctx context.Context, task string) ([]byte, error) {
 }
 
 func (p *host) callHelper(ctx context.Context, task, method string, params any) (captureReply, error) {
+	return p.callHelperSession(ctx, 0, task, method, params)
+}
+
+func (p *host) callHelperSession(ctx context.Context, session uint32, task, method string, params any) (captureReply, error) {
 	if err := ctx.Err(); err != nil {
 		return captureReply{}, err
 	}
@@ -94,7 +100,7 @@ func (p *host) callHelper(ctx context.Context, task, method string, params any) 
 		return captureReply{}, taskFailure{proto.ErrDesktopLocked, errors.New("desktop is locked or unavailable")}
 	}
 	ipc := p.helperLink()
-	if ipc == nil {
+	if ipc == nil || (session != 0 && ipc.session != session) {
 		return captureReply{}, taskFailure{proto.ErrHelperUnavailable, errors.New("Helper unavailable")}
 	}
 	if method == "mcp.call" && !ipc.mcp {
@@ -102,6 +108,9 @@ func (p *host) callHelper(ctx context.Context, task, method string, params any) 
 	}
 	if strings.HasPrefix(method, "browser.") && !ipc.browserBridge {
 		return captureReply{}, taskFailure{proto.ErrCapUnsupported, errors.New("Windows Helper 需要升级以管理浏览器扩展")}
+	}
+	if method == "desktop.lock" && !ipc.lockDesktop {
+		return captureReply{}, taskFailure{proto.ErrHelperUnavailable, errors.New("Windows Helper 需要升级以锁定桌面")}
 	}
 	reply := make(chan captureReply, 1)
 	ipc.mu.Lock()

@@ -23,7 +23,10 @@ var errBrainDenied = errors.New("管理员已拒绝该操作，任务已停止�
 
 var brainCommand = Command{Title: "AI 任务", Capability: proto.BrainTask, Lane: proto.UILane}
 
-type brainTask struct{ id, device, prompt, title, source string }
+type brainTask struct {
+	id, device, prompt, title, source string
+	quiet                             bool
+}
 
 func CanonicalTools(tools []proto.MCPTool) []proto.MCPTool {
 	result := make([]proto.MCPTool, 0, len(proto.DeviceTools))
@@ -225,12 +228,14 @@ func (s *Service) cancelDeviceBrainSessions(deviceID string) {
 }
 
 func (s *Service) runBrain(parent context.Context, task brainTask) {
-	ctx, cancel := context.WithTimeout(parent, 12*time.Minute)
+	ctx, cancel := context.WithTimeout(parent, brainTaskTTL)
 	defer cancel()
 	s.registerBrainSession(task.device, task.id, cancel)
 	defer s.unregisterBrainSession(task.device, task.id)
 	go s.watchBrain(ctx, cancel, task.id)
-	reply, err := s.runLoop(ctx, task)
+	unlock := taskUnlock{service: s, task: task}
+	defer unlock.finish(parent)
+	reply, err := s.runLoop(ctx, task, &unlock)
 	if parent.Err() != nil {
 		return
 	}
@@ -321,7 +326,7 @@ func (s *Service) deviceAutoApprove(ctx context.Context, device string) bool {
 	return auto
 }
 
-func (s *Service) runLoop(ctx context.Context, task brainTask) (string, error) {
+func (s *Service) runLoop(ctx context.Context, task brainTask, unlock *taskUnlock) (string, error) {
 	var raw string
 	var autoApprove bool
 	if err := s.store.QueryRowContext(ctx, "SELECT mcp_tools, auto_approve=1 FROM devices WHERE id=?", task.device).Scan(&raw, &autoApprove); err != nil {
@@ -412,17 +417,17 @@ func (s *Service) runLoop(ctx context.Context, task brainTask) (string, error) {
 				}
 			}
 			step++
-			result, err := s.callDevice(ctx, task, step, 1, call.Name, call.Args, label, windowID, autoApprove)
+			attempt := 1
+			result, err := s.callDevice(ctx, task, step, attempt, call.Name, call.Args, label, windowID, autoApprove)
+			if err != nil {
+				return "", err
+			}
+			result, err = unlock.retry(ctx, result, step, &attempt, call.Name, call.Args, label, windowID, autoApprove)
 			if err != nil {
 				return "", err
 			}
 			if hint := confirmationHint(result.Error); (tool.RiskLevel == "interactive" || tool.RiskLevel == "system") && hint != "" {
-				if s.deviceAutoApprove(ctx, task.device) {
-					result, err = s.callDevice(ctx, task, step, 2, call.Name, call.Args, label, windowID, true)
-					if err != nil {
-						return "", err
-					}
-				} else {
+				if !s.deviceAutoApprove(ctx, task.device) {
 					justification := label + " " + string(call.Args)
 					if windowID != "" && observedWindow.Title != "" {
 						justification = limitText(observedWindow.Title, 120) + " · " + justification
@@ -434,10 +439,15 @@ func (s *Service) runLoop(ctx context.Context, task brainTask) (string, error) {
 					if !approved {
 						return "", errBrainDenied
 					}
-					result, err = s.callDevice(ctx, task, step, 2, call.Name, call.Args, label, windowID, true)
-					if err != nil {
-						return "", err
-					}
+				}
+				attempt++
+				result, err = s.callDevice(ctx, task, step, attempt, call.Name, call.Args, label, windowID, true)
+				if err != nil {
+					return "", err
+				}
+				result, err = unlock.retry(ctx, result, step, &attempt, call.Name, call.Args, label, windowID, true)
+				if err != nil {
+					return "", err
 				}
 			}
 			observedWindow = nextToolWindow(observedWindow, call.Name, result)

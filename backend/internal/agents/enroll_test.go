@@ -92,6 +92,26 @@ func TestFixedKeyEnrollRejoinByMachineID(t *testing.T) {
 	if name != "PC-1-Renamed" || group != "Office" || msgCount != 1 {
 		t.Fatalf("name=%q group=%q msgCount=%d; want PC-1-Renamed, Office, 1", name, group, msgCount)
 	}
+	if _, err := svc.RenameDevice(ctx, 1, res1.DeviceID, "财务部\n恶意换行", false); err != ErrInvalid {
+		t.Fatalf("name containing newline: %v", err)
+	}
+	if name, err := svc.RenameDevice(ctx, 1, res1.DeviceID, "  财务部工作站  ", false); err != nil || name != "财务部工作站" {
+		t.Fatalf("rename: %q, %v", name, err)
+	}
+	if _, err := svc.Enroll(ctx, proto.Enrollment{
+		Key: fixedKey, MachineID: "11111111111111111111111111111111", Token: token1New,
+		Name: "AnotherHostName", Platform: proto.Windows, Arch: "amd64", OSVersion: "Windows 11",
+	}, "127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	var detail string
+	if err := store.QueryRowContext(ctx, `SELECT name,(SELECT detail_json FROM audit_logs WHERE device_id=devices.id AND action='device.rename')
+		FROM devices WHERE id=?`, res1.DeviceID).Scan(&name, &detail); err != nil {
+		t.Fatal(err)
+	}
+	if name != "财务部工作站" || detail != `{"new_name":"财务部工作站","old_name":"PC-1-Renamed"}` {
+		t.Fatalf("name=%q audit=%s", name, detail)
+	}
 
 	// Revoked device cannot rejoin until restored.
 	if err := svc.Revoke(ctx, 1, res1.DeviceID); err != nil {

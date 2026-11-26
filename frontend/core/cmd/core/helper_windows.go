@@ -255,6 +255,7 @@ func (p *host) watchHelper(ctx context.Context, h *helperProcess, events <-chan 
 	defer first.Stop()
 
 	ready := false
+	desktop := desktopState(h.session)
 	for {
 		select {
 		case <-ctx.Done():
@@ -272,7 +273,8 @@ func (p *host) watchHelper(ctx context.Context, h *helperProcess, events <-chan 
 		case <-registered:
 			first.Stop()
 			ready = true
-			p.set("", "ready")
+			desktop = desktopState(h.session)
+			p.set(desktop, "ready")
 			if request != nil {
 				request <- nil
 				request = nil
@@ -287,9 +289,22 @@ func (p *host) watchHelper(ctx context.Context, h *helperProcess, events <-chan 
 				token.Close()
 			}
 			if !active || session != h.session {
+				p.set("", "restarting")
 				return ready, request, nil
 			}
-			p.set(desktopState(session), "")
+			nextDesktop := desktopState(session)
+			if desktop != "unlocked" && nextDesktop == "unlocked" {
+				link := p.helperLink()
+				if !ready || link == nil || link.session != session {
+					p.set(nextDesktop, "restarting")
+					return ready, request, nil
+				}
+				desktop = nextDesktop
+				p.set(desktop, "ready")
+				continue
+			}
+			desktop = nextDesktop
+			p.set(desktop, "")
 		case next := <-p.restart:
 			if request != nil {
 				request <- errors.New("helper restart already in progress")
@@ -308,6 +323,7 @@ type rpcRequest struct {
 		Tasks         bool   `json:"tasks"`
 		MCP           bool   `json:"mcp"`
 		BrowserBridge bool   `json:"browser_bridge"`
+		LockDesktop   bool   `json:"lock_desktop"`
 	} `json:"params"`
 }
 
@@ -337,7 +353,8 @@ func (h *helperProcess) serve(ctx context.Context, p *host, registered chan stru
 			return err
 		}
 		link := &helperLink{conn: conn, done: make(chan struct{}), stopped: stopped,
-			waiting: make(map[int]chan captureReply), mcp: request.Params.MCP, browserBridge: request.Params.BrowserBridge}
+			waiting: make(map[int]chan captureReply), mcp: request.Params.MCP, browserBridge: request.Params.BrowserBridge,
+			lockDesktop: request.Params.LockDesktop, session: h.session}
 		if request.Params.Tasks {
 			p.mu.Lock()
 			p.ipc = link

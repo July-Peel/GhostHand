@@ -5,8 +5,9 @@ import { Activity, ArrowLeft, ArrowUp, BatteryCharging, Camera, Check, ChevronDo
 import { api, devicesKey, errorText, messagesKey } from './api'
 import type { Command, ConfirmCard, Device, MediaCard, Message, Session, StatusCard, TaskAction, TaskCard } from './api'
 import { Battery, Connection, Details, DeviceIcon, Panel, desktops } from './device-ui'
-import { DeviceOperations } from './agent-ui'
+import { BrowserExtensionSection, DeviceOperations } from './agent-ui'
 import { agentAPI, connectionKey } from './agent-api'
+import { RDPSection } from './rdp-ui'
 import { MarkdownContent } from './markdown'
 
 const timeFormat = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
@@ -266,7 +267,9 @@ export function Conversation({ device, commands, session, opened, back }: {
         </Panel>
       )}
       {details && <Details
+        key={device.id}
         device={device}
+        csrf={session.csrf_token}
         close={() => { if (!removeDevice.isPending) { removeDevice.reset(); setDetails(false) } }}
         onToggleAutoApprove={!device.is_demo && device.platform === 'windows' ? enabled => policy.mutate(enabled) : undefined}
         policyPending={policy.isPending}
@@ -274,6 +277,8 @@ export function Conversation({ device, commands, session, opened, back }: {
         deletePending={removeDevice.isPending}
         deleteError={removeDevice.isError ? errorText(removeDevice.error) : undefined}
       >
+        {!device.is_demo && device.platform === 'windows' && <BrowserExtensionSection device={device} session={session} />}
+        {!device.is_demo && device.platform === 'windows' && <RDPSection device={device} session={session} />}
         {!device.is_demo && <DeviceOperations device={device} session={session} />}
       </Details>}
     </>

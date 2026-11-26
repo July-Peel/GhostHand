@@ -60,6 +60,7 @@ func New(ctx context.Context, store *db.Store, dir string) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer clear(key)
 	if len(key) != 32 {
 		return nil, errors.New("settings.key must contain exactly 32 bytes")
 	}
@@ -80,7 +81,8 @@ func loadKey(ctx context.Context, store *db.Store, path string) ([]byte, error) 
 	}
 	var hasCredentials bool
 	if err := store.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM integration_settings WHERE secret IS NOT NULL)
-		OR EXISTS(SELECT 1 FROM attachments WHERE storage_ref IS NOT NULL)`).
+		OR EXISTS(SELECT 1 FROM attachments WHERE storage_ref IS NOT NULL)
+		OR EXISTS(SELECT 1 FROM device_rdp_credentials)`).
 		Scan(&hasCredentials); err != nil {
 		return nil, err
 	}
@@ -110,6 +112,26 @@ func loadKey(ctx context.Context, store *db.Store, path string) ([]byte, error) 
 	}
 	saved = true
 	return key, nil
+}
+
+func (s *Service) Seal(aad, plain []byte) ([]byte, error) {
+	nonce := make([]byte, s.aead.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	return s.aead.Seal(nonce, nonce, plain, aad), nil
+}
+
+func (s *Service) SealedSize(plainSize int) int {
+	return s.aead.NonceSize() + plainSize + s.aead.Overhead()
+}
+
+func (s *Service) Open(aad, sealed []byte) ([]byte, error) {
+	n := s.aead.NonceSize()
+	if len(sealed) < s.SealedSize(0) {
+		return nil, errors.New("invalid encrypted credential")
+	}
+	return s.aead.Open(nil, sealed[:n], sealed[n:], aad)
 }
 
 func (s *Service) Read(ctx context.Context) (map[Kind]Configuration, error) {

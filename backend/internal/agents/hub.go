@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -19,11 +21,17 @@ import (
 )
 
 type peer struct {
-	conn     *websocket.Conn
-	id       string
-	gen      uint64
-	interval time.Duration
-	asleep   bool
+	secureTransport      bool
+	desktopOperations    bool
+	desktopRequests      chan desktopRequest
+	desktopDone          chan struct{}
+	desktopPending       sync.Map
+	desktopPolicyChanged chan struct{}
+	conn                 *websocket.Conn
+	id                   string
+	gen                  uint64
+	interval             time.Duration
+	asleep               bool
 }
 
 var errStale = errors.New("stale device connection")
@@ -53,7 +61,8 @@ func (s *Service) Connect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
-	p, welcome, err := s.attach(ctx, conn, hello, ip)
+	secure := r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
+	p, welcome, err := s.attach(ctx, conn, hello, ip, secure)
 	if err != nil {
 		if errors.Is(err, ErrDenied) {
 			_ = conn.Close(websocket.StatusPolicyViolation, "E_AUTH")
@@ -64,6 +73,7 @@ func (s *Service) Connect(w http.ResponseWriter, r *http.Request) {
 	}
 	reason := "network_error"
 	defer func() { s.detach(p, reason) }()
+	defer close(p.desktopDone)
 	if err := sendFrame(ctx, conn, proto.Welcome, welcome, 0); err != nil {
 		return
 	}
@@ -84,7 +94,7 @@ func validState(state proto.DeviceState) bool {
 	return state.BatteryPct == nil || (*state.BatteryPct >= 0 && *state.BatteryPct <= 100)
 }
 
-func (s *Service) attach(ctx context.Context, conn *websocket.Conn, hello proto.HelloPayload, ip string) (*peer, proto.WelcomePayload, error) {
+func (s *Service) attach(ctx context.Context, conn *websocket.Conn, hello proto.HelloPayload, ip string, secure bool) (*peer, proto.WelcomePayload, error) {
 	s.connectionMu.Lock()
 	defer s.connectionMu.Unlock()
 	now := time.Now()
@@ -98,7 +108,9 @@ func (s *Service) attach(ctx context.Context, conn *websocket.Conn, hello proto.
 	if s.cloudflare && interval > 90 {
 		interval = 90
 	}
-	p := &peer{conn: conn, id: hello.DeviceID, interval: time.Duration(interval) * time.Second}
+	p := &peer{conn: conn, id: hello.DeviceID, interval: time.Duration(interval) * time.Second, secureTransport: secure,
+		desktopOperations: hello.DesktopOperations && hello.Platform == proto.Windows,
+		desktopRequests:   make(chan desktopRequest), desktopDone: make(chan struct{}), desktopPolicyChanged: make(chan struct{}, 1)}
 	welcome := proto.WelcomePayload{HeartbeatSec: interval, ServerTime: now.UnixMilli(), TaskHeartbeat: hello.TaskInventory}
 	err := s.store.Write(ctx, func(tx *sql.Tx) error {
 		c, hash, err := authenticate(ctx, tx, p.id, hello.Token)
@@ -115,6 +127,13 @@ func (s *Service) attach(ctx context.Context, conn *websocket.Conn, hello proto.
 		}
 		if platform != hello.Platform {
 			return ErrDenied
+		}
+		if p.desktopOperations {
+			policy, err := readDesktopPolicy(ctx, tx, p.id)
+			if err != nil {
+				return err
+			}
+			welcome.DesktopPolicy = &policy
 		}
 		if hello.Fresh {
 			if hello.LastAck != 0 || len(hello.RunningTasks) != 0 {
@@ -281,6 +300,15 @@ func (s *Service) servePeer(ctx context.Context, p *peer, sent uint64) string {
 		case <-ctx.Done():
 			return "server_restart"
 		case <-changed:
+		case <-p.desktopPolicyChanged:
+			policy, err := readDesktopPolicy(ctx, s.store, p.id)
+			if err != nil || sendFrame(ctx, p.conn, proto.ConfigUpdate, policy, ack) != nil {
+				return "network_error"
+			}
+		case req := <-p.desktopRequests:
+			if err := sendFrame(ctx, p.conn, req.kind, req.payload, ack); err != nil {
+				return "network_error"
+			}
 		case <-unstable.C:
 			if !p.asleep {
 				s.markState(p, proto.Unstable)
@@ -319,6 +347,13 @@ func (s *Service) servePeer(ctx context.Context, p *peer, sent uint64) string {
 			}
 		}
 	}
+}
+
+func readDesktopPolicy(ctx context.Context, q rowQuerier, device string) (proto.DesktopPolicy, error) {
+	var policy proto.DesktopPolicy
+	err := q.QueryRowContext(ctx, `SELECT COALESCE((SELECT keep_system_awake FROM device_rdp_credentials WHERE device_id=?),0)`,
+		device).Scan(&policy.KeepSystemAwake)
+	return policy, err
 }
 
 func (s *Service) flush(ctx context.Context, p *peer, sent *uint64, ack uint64) error {
@@ -360,7 +395,7 @@ func (s *Service) receive(ctx context.Context, p *peer, frame proto.Envelope) (a
 		return 0, ErrInvalid
 	}
 	if frame.Seq == 0 && frame.Type != proto.Ping && frame.Type != proto.StateUpdate && frame.Type != proto.StateSleeping &&
-		frame.Type != proto.TaskHeartbeat {
+		frame.Type != proto.TaskHeartbeat && frame.Type != proto.BrowserExtensionStatusResult && frame.Type != proto.RDPResult {
 		return 0, ErrInvalid
 	}
 	if frame.Seq != 0 && frame.Type != proto.CapsReport && frame.Type != proto.OperationResult &&
@@ -390,6 +425,16 @@ func (s *Service) receive(ctx context.Context, p *peer, frame proto.Envelope) (a
 			}
 		}
 		if frame.Seq == 0 {
+			if frame.Type == proto.BrowserExtensionStatusResult || frame.Type == proto.RDPResult {
+				var result proto.DesktopResult
+				if !p.desktopOperations || len(frame.Payload) > 8192 || json.Unmarshal(frame.Payload, &result) != nil {
+					return ErrInvalid
+				}
+				if deliverDesktopResult(p, result) {
+					return workbench.RecordChange(ctx, tx, p.id)
+				}
+				return nil
+			}
 			if frame.Type == proto.TaskHeartbeat {
 				return workbench.ApplyTaskHeartbeat(ctx, tx, p.id, frame.Payload, now)
 			}
@@ -433,7 +478,7 @@ func (s *Service) receive(ctx context.Context, p *peer, frame proto.Envelope) (a
 		}
 		return workbench.RecordChange(ctx, tx, p.id)
 	})
-	if err == nil && frame.Seq == 0 && frame.Type != proto.TaskHeartbeat {
+	if err == nil && frame.Seq == 0 && (frame.Type == proto.Ping || frame.Type == proto.StateUpdate || frame.Type == proto.StateSleeping) {
 		p.asleep = frame.Type == proto.StateSleeping
 	}
 	return agentAck, err

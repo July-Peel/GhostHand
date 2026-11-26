@@ -2,12 +2,51 @@ package brain
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"ghosthand/proto"
 )
+
+func TestToolLimitAndHistoryCompaction(t *testing.T) {
+	s := &Session{names: map[string]string{"device_get_status": proto.ToolStatus}}
+	output := make([]json.RawMessage, 100)
+	for i := range output {
+		output[i] = json.RawMessage(fmt.Sprintf(`{"type":"function_call","call_id":"call_%d","name":"device_get_status","arguments":"{}"}`, i))
+	}
+	turn, err := s.readTurn(output[:99])
+	if err != nil || len(turn.Calls) != 99 {
+		t.Fatalf("99 calls: got %d, err=%v", len(turn.Calls), err)
+	}
+	if _, err := s.readTurn(output); err == nil {
+		t.Fatal("100 parallel calls accepted")
+	}
+	s.input = nil
+	full := "head:" + strings.Repeat("示例", 1000) + ":tail"
+	for i := 0; i < 26; i++ {
+		s.Return([]Call{{ID: fmt.Sprint(i)}}, []Observation{{Text: full}})
+		if i == 23 && s.input[0].(map[string]any)["output"] != full {
+			t.Fatal("history was compacted before the 25th round")
+		}
+	}
+	for i, item := range s.input {
+		text := item.(map[string]any)["output"].(string)
+		if i >= 11 {
+			if text != full {
+				t.Fatalf("recent round %d was compacted", i)
+			}
+			continue
+		}
+		if !strings.HasPrefix(text, "head:") || !strings.HasSuffix(text, ":tail") ||
+			!strings.Contains(text, "历史长输出已截断") || len(text) > 2100 || !utf8.ValidString(text) {
+			t.Fatalf("invalid compacted output at round %d", i)
+		}
+	}
+}
 
 func TestOpenAIResponsesLoop(t *testing.T) {
 	ctx := t.Context()

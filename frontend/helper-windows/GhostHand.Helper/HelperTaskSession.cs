@@ -6,6 +6,10 @@ namespace GhostHand.Helper;
 
 internal sealed class HelperTaskSession(StreamReader reader, StreamWriter writer)
 {
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool LockWorkStation();
+
     private readonly SemaphoreSlim writeGate = new(1);
     private readonly CancellationTokenSource lifetime = new();
     private TaskCompletionSource? heartbeatReply;
@@ -63,6 +67,11 @@ internal sealed class HelperTaskSession(StreamReader reader, StreamWriter writer
                             data.TryGetProperty("step_index", out var step) || data.TryGetProperty("step", out step) ? step.GetInt32() : 0,
                             data.TryGetProperty("step_total", out var total) ? total.GetInt32() : 0,
                             data.TryGetProperty("step_name", out var name) ? name.GetString() ?? "" : "");
+                        break;
+                    case "desktop.lock":
+                        var lockId = frame.GetProperty("id").GetInt32();
+                        var error = LockWorkStation() ? "" : "E_INTERNAL";
+                        await SendAsync(new { jsonrpc = "2.0", id = lockId, result = new { error } }, lifetime.Token);
                         break;
                     case "screen.capture":
                     case "mcp.call":

@@ -10,7 +10,7 @@ import { Conversation } from './conversation'
 import { Battery, Connection, DeviceIcon, Panel } from './device-ui'
 import { SettingsPanel } from './settings'
 import { PairingPanel, ReleasesPanel } from './agent-ui'
-import { connectionKey } from './agent-api'
+import { connectionKey, rdpKey } from './agent-api'
 
 const useWorkspace = create<{
   selected: string | null
@@ -59,10 +59,12 @@ function useEvents() {
         if (refreshAll) {
           void client.invalidateQueries({ queryKey: ['messages'] })
           void client.invalidateQueries({ queryKey: ['connection'] })
+          void client.invalidateQueries({ queryKey: ['rdp'] })
         } else {
           for (const id of changedDevices) {
             void client.invalidateQueries({ queryKey: messagesKey(id) })
             void client.invalidateQueries({ queryKey: connectionKey(id) })
+            void client.invalidateQueries({ queryKey: rdpKey(id) })
           }
         }
         refreshAll = false

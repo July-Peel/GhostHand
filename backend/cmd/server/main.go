@@ -93,6 +93,8 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("open workbench: %w", err)
 	}
+	unlock := agents.NewUnlockManager(fleet, config)
+	desk.SetDesktopUnlocker(unlock)
 	if err := desk.Seed(ctx); err != nil {
 		return fmt.Errorf("seed demo devices: %w", err)
 	}
@@ -129,7 +131,7 @@ func run() error {
 		return err
 	}
 	server := &http.Server{
-		Addr: addr, Handler: api.New(store, authentication, config, desk, fleet, origin, fingerprint, web),
+		Addr: addr, Handler: api.New(store, authentication, config, desk, fleet, unlock, origin, fingerprint, web),
 		BaseContext:       func(net.Listener) context.Context { return ctx },
 		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, IdleTimeout: 75 * time.Second,
 		MaxHeaderBytes: 32 << 10,

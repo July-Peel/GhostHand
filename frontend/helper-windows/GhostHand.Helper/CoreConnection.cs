@@ -33,7 +33,7 @@ internal static class CoreConnection
         {
             AutoFlush = true
         };
-        await SendAsync("helper.register", 1, new { nonce, tasks = true, mcp = true, browser_bridge = true }, reader, writer);
+        await SendAsync("helper.register", 1, new { nonce, tasks = true, mcp = true, browser_bridge = true, lock_desktop = true }, reader, writer);
         await new HelperTaskSession(reader, writer).RunAsync();
     }
 

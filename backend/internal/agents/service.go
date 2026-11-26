@@ -293,7 +293,7 @@ func (s *Service) Enroll(ctx context.Context, input proto.Enrollment, ip string)
 			}
 			deviceID = existingID
 			if _, err := tx.ExecContext(ctx, `UPDATE devices
-				SET name=?, arch=?, os_version=?,
+				SET name=CASE WHEN name_customized=1 THEN name ELSE ? END, arch=?, os_version=?,
 				    group_name=CASE WHEN ?<>'' THEN ? ELSE group_name END,
 				    machine_id=CASE WHEN machine_id='' THEN ? ELSE machine_id END
 				WHERE id=?`,

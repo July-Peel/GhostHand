@@ -11,27 +11,61 @@ import (
 )
 
 type host struct {
-	mu        sync.Mutex
-	desktop   string
-	helper    string
-	battery   *int
-	charging  *bool
-	sampledAt time.Time
-	sentPct   *int
-	sentAC    *bool
-	ipc       *helperLink
-	controls  chan overlayControl
-	wake      chan struct{}
-	changed   chan struct{}
-	restart   chan chan error
-	sleeping  atomic.Bool
+	mu            sync.Mutex
+	desktop       string
+	helper        string
+	battery       *int
+	charging      *bool
+	sampledAt     time.Time
+	sentPct       *int
+	sentAC        *bool
+	ipc           *helperLink
+	controls      chan overlayControl
+	wake          chan struct{}
+	changed       chan struct{}
+	restart       chan chan error
+	sleeping      atomic.Bool
+	awakeDesired  atomic.Bool
+	awakeChanged  chan struct{}
+	sessionEvents chan struct{}
 }
 
 func newHost(desktop, helper string) *host {
 	battery, charging := powerStatus()
 	return &host{desktop: desktop, helper: helper, battery: battery, charging: charging, sampledAt: time.Now(),
 		sentPct: battery, sentAC: charging, controls: make(chan overlayControl, 8),
-		wake: make(chan struct{}, 1), changed: make(chan struct{}, 1), restart: make(chan chan error)}
+		wake: make(chan struct{}, 1), changed: make(chan struct{}, 1), restart: make(chan chan error),
+		awakeChanged: make(chan struct{}, 1), sessionEvents: make(chan struct{}, 1)}
+}
+
+func (p *host) applyDesktopPolicy(policy proto.DesktopPolicy) {
+	if p.awakeDesired.Swap(policy.KeepSystemAwake) != policy.KeepSystemAwake {
+		signal(p.awakeChanged)
+	}
+}
+
+func (p *host) runAwakePolicy(ctx context.Context) {
+	var release func()
+	defer func() {
+		if release != nil {
+			release()
+		}
+	}()
+	for ctx.Err() == nil {
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.awakeChanged:
+			if p.awakeDesired.Load() {
+				if release == nil {
+					release = keepAwake()
+				}
+			} else if release != nil {
+				release()
+				release = nil
+			}
+		}
+	}
 }
 
 func (p *host) set(desktop, helper string) {

@@ -22,6 +22,15 @@ func (s *Server) agentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/agent/pair", s.redeemPairing)
 	mux.HandleFunc("GET "+proto.AgentSocketPath, s.agents.Connect)
 	mux.HandleFunc("GET /api/devices/{device}/connection", s.require(s.connectionHistory))
+	mux.HandleFunc("POST /api/devices/{device}/rename", s.require(s.renameDevice))
+	mux.HandleFunc("GET /api/devices/{device}/browser-extension", s.require(s.getBrowserExtension))
+	mux.HandleFunc("POST /api/devices/{device}/browser-extension", s.require(s.changeBrowserExtension))
+	mux.HandleFunc("GET /api/devices/{device}/rdp", s.require(s.rdpStatus))
+	mux.HandleFunc("POST /api/devices/{device}/rdp/config", s.require(s.rdpConfig))
+	mux.HandleFunc("POST /api/devices/{device}/rdp/preflight", s.require(s.rdpOperation(proto.RDPPreflight)))
+	mux.HandleFunc("POST /api/devices/{device}/rdp/unlock", s.require(s.rdpOperation(proto.RDPUnlock)))
+	mux.HandleFunc("POST /api/devices/{device}/rdp/lock", s.require(s.rdpOperation(proto.RDPLock)))
+	mux.HandleFunc("POST /api/agent/rdp/{operation}/credential", s.rdpCredential)
 	mux.HandleFunc("POST /api/devices/{device}/operations", s.require(s.queueOperation))
 	mux.HandleFunc("POST /api/devices/{device}/revoke", s.require(s.revokeDevice))
 	mux.HandleFunc("POST /api/devices/{device}/restore", s.require(s.restoreDevice))
@@ -33,6 +42,26 @@ func (s *Server) agentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/agent/releases/{release}", s.downloadRelease)
 	mux.HandleFunc("POST /api/agent/logs/{operation}/ticket", s.logTicket)
 	mux.HandleFunc("POST /api/agent/logs/{operation}/upload", s.uploadLog)
+}
+
+func (s *Server) renameDevice(w http.ResponseWriter, r *http.Request, session auth.Session, _ string) {
+	var input struct {
+		Name string `json:"name"`
+	}
+	if !readJSON(w, r, &input) {
+		return
+	}
+	id := r.PathValue("device")
+	name, err := s.agents.RenameDevice(r.Context(), session.UserID, id, input.Name, s.workbench.DemoEnabled())
+	if errors.Is(err, agents.ErrInvalid) {
+		fail(w, http.StatusBadRequest, "设备名称须为 1 至 80 个字符，且不能包含换行或控制字符。")
+		return
+	}
+	if err != nil {
+		agentError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"id": id, "name": name})
 }
 
 func (s *Server) pairingResponse(w http.ResponseWriter, r *http.Request, key string) {

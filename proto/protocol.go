@@ -134,18 +134,20 @@ type HelloPayload struct {
 	CapsHash           string        `json:"caps_hash"`
 	RunningTasks       []RunningTask `json:"running_tasks"`
 	TaskInventory      bool          `json:"task_inventory,omitempty"`
+	DesktopOperations  bool          `json:"desktop_operations,omitempty"`
 	PendingTaskResults []string      `json:"pending_task_results,omitempty"`
 	State              DeviceState   `json:"state"`
 }
 
 type WelcomePayload struct {
-	ConnGen       uint64 `json:"conn_gen"`
-	HeartbeatSec  int    `json:"heartbeat_sec"`
-	ServerTime    int64  `json:"server_time"`
-	LastAck       uint64 `json:"last_ack"`
-	NeedCaps      bool   `json:"need_caps"`
-	TokenRotate   string `json:"token_rotate,omitempty"`
-	TaskHeartbeat bool   `json:"task_heartbeat,omitempty"`
+	ConnGen       uint64         `json:"conn_gen"`
+	HeartbeatSec  int            `json:"heartbeat_sec"`
+	ServerTime    int64          `json:"server_time"`
+	LastAck       uint64         `json:"last_ack"`
+	NeedCaps      bool           `json:"need_caps"`
+	TokenRotate   string         `json:"token_rotate,omitempty"`
+	TaskHeartbeat bool           `json:"task_heartbeat,omitempty"`
+	DesktopPolicy *DesktopPolicy `json:"desktop_policy,omitempty"`
 }
 
 type CapabilityID string

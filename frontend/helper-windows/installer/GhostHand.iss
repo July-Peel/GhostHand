@@ -22,6 +22,7 @@ Compression=lzma2
 Source: "{#Stage}\ghosthand-launcher.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Stage}\ghosthand-core.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Stage}\GhostHand.Helper.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#Stage}\FreeRDP\*"; DestDir: "{app}\FreeRDP"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 
 [UninstallRun]
 Filename: "{app}\ghosthand-core.exe"; Parameters: "--cleanup-browser"; Flags: runhidden skipifdoesntexist; RunOnceId: "GhostHandBrowserBridge"

@@ -13,6 +13,14 @@ import (
 
 const mcpTaskTTL = 75 * time.Second
 
+func mcpTTL(tool string, args json.RawMessage, quiet bool) time.Duration {
+	timeout := toolTimeout(tool, args) + 10*time.Second
+	if !quiet {
+		timeout += toolTimeout(tool, args) + 45*time.Second
+	}
+	return max(mcpTaskTTL, timeout)
+}
+
 type MCPDevice struct {
 	ID    string          `json:"id"`
 	Name  string          `json:"name"`
@@ -20,8 +28,9 @@ type MCPDevice struct {
 }
 
 type mcpCommand struct {
-	Tool string          `json:"tool"`
-	Args json.RawMessage `json:"arguments"`
+	Tool  string          `json:"tool"`
+	Args  json.RawMessage `json:"arguments"`
+	Quiet bool            `json:"quiet,omitempty"`
 }
 
 func IsMCPToolAllowed(tool string) bool {
@@ -85,6 +94,18 @@ func (s *Service) MCPCapabilities(ctx context.Context, device string) ([]proto.M
 
 // CallMCP uses the same serialized desktop lane, local stop controls and audit trail as chat.
 func (s *Service) CallMCP(ctx context.Context, user int64, device, tool string, args json.RawMessage) (proto.MCPResult, error) {
+	return s.callMCP(ctx, user, device, tool, args, "")
+}
+
+func (s *Service) CallBrowserExtension(ctx context.Context, user int64, device, action string) (proto.MCPResult, error) {
+	if action != "install" && action != "uninstall" {
+		return proto.MCPResult{}, ErrUnsupported
+	}
+	args, _ := json.Marshal(map[string]string{"action": action, "browser": "chrome"})
+	return s.callMCP(ctx, user, device, proto.ToolBrowserManage, args, "browser_ext."+action)
+}
+
+func (s *Service) callMCP(ctx context.Context, user int64, device, tool string, args json.RawMessage, auditAction string) (proto.MCPResult, error) {
 	var result proto.MCPResult
 	if !IsMCPToolAllowed(tool) {
 		return result, ErrUnsupported
@@ -92,16 +113,17 @@ func (s *Service) CallMCP(ctx context.Context, user int64, device, tool string, 
 	if _, err := proto.ValidateTool(tool, args); err != nil {
 		return result, err
 	}
-	ttl := max(mcpTaskTTL, toolTimeout(tool, args)+10*time.Second)
+	quiet := auditAction != ""
+	ttl := mcpTTL(tool, args, quiet)
 	var taskID string
 	err := s.store.Write(ctx, func(tx *sql.Tx) error {
 		var available, busy bool
 		err := tx.QueryRowContext(ctx, `SELECT d.task_protocol>=2 AND d.conn_state IN ('online','unstable')
 			AND EXISTS (SELECT 1 FROM json_each(d.mcp_tools) WHERE json_extract(value,'$.name')=?),
-			EXISTS (SELECT 1 FROM tasks WHERE device_id=d.id AND source='mcp'
+			EXISTS (SELECT 1 FROM tasks WHERE device_id=d.id AND (source='mcp' OR (? AND lane='ui'))
 				AND state IN ('queued','dispatched','running','paused','waiting_user','cancelling'))
 			FROM devices d JOIN device_credentials c ON c.device_id=d.id
-			WHERE d.id=? AND d.is_demo=0 AND c.revoked_at IS NULL`, tool, device).Scan(&available, &busy)
+			WHERE d.id=? AND d.is_demo=0 AND c.revoked_at IS NULL`, tool, quiet, device).Scan(&available, &busy)
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrDeviceNotFound
 		}
@@ -114,14 +136,19 @@ func (s *Service) CallMCP(ctx context.Context, user int64, device, tool string, 
 		if busy {
 			return ErrTaskControl
 		}
-		command, err := json.Marshal(mcpCommand{tool, args})
+		command, err := json.Marshal(mcpCommand{Tool: tool, Args: args, Quiet: quiet})
 		if err != nil {
 			return err
 		}
 		taskID, err = insertTask(ctx, tx, user, Device{ID: device}, brainCommand, string(command), "mcp",
-			"MCP · "+toolLabel(tool), time.Now(), ttl)
+			"MCP · "+toolLabel(tool), time.Now(), ttl, quiet)
 		if err != nil {
 			return err
+		}
+		if quiet {
+			if err := auditTask(ctx, tx, user, device, taskID, auditAction, time.Now().UnixMilli()); err != nil {
+				return err
+			}
 		}
 		return RecordChange(ctx, tx, device)
 	})
@@ -134,7 +161,7 @@ func (s *Service) CallMCP(ctx context.Context, user int64, device, tool string, 
 		changed := s.store.Changed()
 		var state proto.TaskState
 		var raw sql.NullString
-		err = s.store.QueryRowContext(wait, `SELECT state,(SELECT result_json FROM brain_calls WHERE task_id=tasks.id)
+		err = s.store.QueryRowContext(wait, `SELECT state,(SELECT result_json FROM brain_calls WHERE task_id=tasks.id ORDER BY created_at DESC,id DESC LIMIT 1)
 			FROM tasks WHERE id=?`, taskID).Scan(&state, &raw)
 		if err != nil {
 			break
@@ -165,14 +192,21 @@ func (s *Service) runMCP(parent context.Context, task brainTask) {
 	var command mcpCommand
 	ttl := mcpTaskTTL
 	if json.Unmarshal([]byte(task.prompt), &command) == nil {
-		ttl = max(ttl, toolTimeout(command.Tool, command.Args)+10*time.Second)
+		ttl = mcpTTL(command.Tool, command.Args, command.Quiet)
 	}
+	task.quiet = command.Quiet
+	unlock := taskUnlock{service: s, task: task}
+	defer unlock.finish(parent)
 	ctx, cancel := context.WithTimeout(parent, ttl)
 	defer cancel()
 	go s.watchBrain(ctx, cancel, task.id)
 	state, message := proto.Failed, "外部 MCP 调用失败。"
 	if command.Tool != "" && IsMCPToolAllowed(command.Tool) {
-		result, err := s.callDevice(ctx, task, 1, 1, command.Tool, command.Args, toolLabel(command.Tool), "", true)
+		attempt := 1
+		result, err := s.callDevice(ctx, task, 1, attempt, command.Tool, command.Args, toolLabel(command.Tool), "", true)
+		if err == nil {
+			result, err = unlock.retry(ctx, result, 1, &attempt, command.Tool, command.Args, toolLabel(command.Tool), "", true)
+		}
 		if err == nil && result.Error == "" {
 			state, message = proto.Succeeded, "外部 MCP 调用已完成。"
 		}

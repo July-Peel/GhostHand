@@ -136,6 +136,8 @@ export const api = {
     '/api/settings/llm/models', post({ base_url: baseURL, api_key: key }, csrf),
   ),
   devices: (signal: AbortSignal) => request<DevicesResponse>('/api/devices', { signal }),
+  renameDevice: (id: string, name: string, csrf: string) =>
+    request<{ id: string; name: string }>(devicePath(id) + '/rename', post({ name }, csrf)),
   messages: (id: string, before: number, signal: AbortSignal) => request<MessagePage>(
     devicePath(id) + '/messages' + (before ? '?before=' + before : ''), { signal },
   ),

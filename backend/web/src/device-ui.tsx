@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { BatteryCharging, LoaderCircle, Monitor, Server, Smartphone, Trash2, X } from 'lucide-react'
+import { BatteryCharging, LoaderCircle, Monitor, Pencil, Server, Smartphone, Trash2, X } from 'lucide-react'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
 import type { Device } from './api'
+import { api, devicesKey, errorText } from './api'
 
 export const connections = { online: '在线', unstable: '连接不稳', sleeping: '休眠中', offline: '离线' }
 export const desktops = { unlocked: '桌面可用', locked: '已锁屏', screen_off: '屏幕关闭', no_session: '未登录', headless: '无界面' }
@@ -56,8 +58,9 @@ export function Panel({ title, className, close, children }: {
   )
 }
 
-export function Details({ device, close, onToggleAutoApprove, policyPending, onDelete, deletePending, deleteError, children }: {
+export function Details({ device, csrf, close, onToggleAutoApprove, policyPending, onDelete, deletePending, deleteError, children }: {
   device: Device
+  csrf: string
   close: () => void
   onToggleAutoApprove?: (enabled: boolean) => void
   policyPending?: boolean
@@ -67,13 +70,52 @@ export function Details({ device, close, onToggleAutoApprove, policyPending, onD
   children?: ReactNode
 }) {
   const [confirmDelete, setConfirmDelete] = useState(false)
+  const [name, setName] = useState<string | null>(null)
+  const client = useQueryClient()
+  const rename = useMutation({
+    mutationFn: (value: string) => api.renameDevice(device.id, value, csrf),
+    onSuccess: async (result) => {
+      await client.cancelQueries({ queryKey: devicesKey })
+      client.setQueryData<Awaited<ReturnType<typeof api.devices>>>(devicesKey, current => current && ({
+        ...current,
+        devices: current.devices.map(item => item.id === result.id ? { ...item, name: result.name } : item),
+      }))
+      setName(null)
+      void client.invalidateQueries({ queryKey: devicesKey })
+    },
+  })
+  const endRename = () => { rename.reset(); setName(null) }
   const canDelete = device.conn_state !== 'online'
 
   return (
     <Panel title="设备详情" className="details-panel" close={close}>
       <div className="detail-device">
         <DeviceIcon device={device} />
-        <div><strong>{device.name}</strong><p>{device.os_version}</p></div>
+        <div className="detail-device-name">
+          {name === null ? <div className="agent-actions">
+            <strong>{device.name}</strong>
+            <button type="button" className="icon-button" title="重命名" aria-label="重命名"
+              onClick={() => setName(device.name)}><Pencil size={15} /></button>
+          </div> : <form onSubmit={event => {
+            event.preventDefault()
+            if (!rename.isPending && name.trim()) rename.mutate(name)
+          }} onKeyDown={event => {
+            if (event.key === 'Escape') {
+              event.preventDefault()
+              if (!rename.isPending) endRename()
+            }
+          }}>
+            <div className="agent-actions">
+              <input autoFocus aria-label="设备名称" value={name} disabled={rename.isPending}
+                onFocus={event => event.currentTarget.select()}
+                onChange={event => setName(Array.from(event.target.value).slice(0, 80).join(''))} />
+              <button className="text-button" disabled={rename.isPending || !name.trim()}>保存</button>
+              <button type="button" className="text-button" disabled={rename.isPending} onClick={endRename}>取消</button>
+            </div>
+            {rename.isError && <p role="alert">{errorText(rename.error)}</p>}
+          </form>}
+          <p>{device.os_version}</p>
+        </div>
       </div>
       <dl className="details-list">
         <div><dt>连接</dt><dd><Connection state={device.conn_state} /></dd></div>

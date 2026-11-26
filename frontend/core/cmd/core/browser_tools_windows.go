@@ -137,20 +137,13 @@ func (bridge *browserBridge) execute(ctx context.Context, call proto.MCPCall, ar
 	}
 	key := browserSessionKey{desktop, name}
 	if call.Tool == proto.ToolBrowserManage && args.Action == "status" {
-		return bridge.status(key, desktopErr)
+		return browserStatusReply(bridge.status(key, desktopErr))
 	}
-	if desktopErr != nil && !(call.Tool == proto.ToolBrowserManage && args.Action == "uninstall") {
+	if call.Tool == proto.ToolBrowserManage {
+		return bridge.manage(ctx, key, call.TaskID, args.Action)
+	}
+	if desktopErr != nil {
 		return browserResponse{}, desktopErr
-	}
-	if call.Tool == proto.ToolBrowserManage && args.Action == "uninstall" {
-		if err := bridge.acquire(ctx); err != nil {
-			return browserResponse{}, err
-		}
-		defer bridge.release()
-		if err := bridge.uninstall(ctx, key, call.TaskID); err != nil {
-			return browserResponse{}, err
-		}
-		return bridge.status(key, desktopErr)
 	}
 	if bridge.startErr != nil {
 		return browserResponse{}, bridge.startErr
@@ -167,8 +160,6 @@ func (bridge *browserBridge) execute(ctx context.Context, call proto.MCPCall, ar
 	bridge.mu.Unlock()
 	code := ""
 	switch call.Tool {
-	case proto.ToolBrowserManage:
-		return bridge.status(key, nil)
 	case proto.ToolBrowserTabs:
 		code = browserTabCommands[args.Action]
 	case proto.ToolBrowserInspect:
@@ -214,23 +205,78 @@ func (bridge *browserBridge) acquire(ctx context.Context) error {
 
 func (bridge *browserBridge) release() { <-bridge.lifecycle }
 
-func (bridge *browserBridge) status(key browserSessionKey, desktopErr error) (browserResponse, error) {
-	peer, _ := bridge.peer(key)
-	registered, err := browserRegistered(key)
+func (bridge *browserBridge) manage(ctx context.Context, key browserSessionKey, task, action string) (browserResponse, error) {
+	if err := bridge.acquire(ctx); err != nil {
+		return browserResponse{}, err
+	}
+	defer bridge.release()
+	desktop, desktopErr := browserDesktopNow()
+	key.browserDesktop = desktop
+	status, err := bridge.status(key, desktopErr)
 	if err != nil {
 		return browserResponse{}, err
 	}
-	result := map[string]any{
-		"browser": key.browser, "extension_id": browserExtensionID, "version": browserBundleVersion,
-		"connected": peer != nil, "registered": registered,
+	if action == "install" {
+		if status.Installed {
+			status.AlreadyInstalled = true
+			return browserStatusReply(status, nil)
+		}
+		if bridge.host.snapshot().DesktopState != "unlocked" {
+			return browserResponse{}, errors.New("E_DESKTOP_LOCKED")
+		}
+		if err := errors.Join(bridge.startErr, desktopErr); err != nil {
+			return browserResponse{}, err
+		}
+		if _, err := bridge.ensureLocked(ctx, key, task); err != nil {
+			return browserResponse{}, err
+		}
+	} else {
+		if !status.Installed && !status.Registered && !status.BundlePresent {
+			status.AlreadyUninstalled = true
+			return browserStatusReply(status, nil)
+		}
+		if err := bridge.uninstall(ctx, key, task); err != nil {
+			return browserResponse{}, err
+		}
+	}
+	return browserStatusReply(bridge.status(key, desktopErr))
+}
+
+func browserStatusReply(status proto.BrowserExtensionStatus, err error) (browserResponse, error) {
+	if err != nil {
+		return browserResponse{}, err
+	}
+	data, err := json.Marshal(status)
+	return browserResponse{Data: data}, err
+}
+
+func (bridge *browserBridge) status(key browserSessionKey, desktopErr error) (proto.BrowserExtensionStatus, error) {
+	peer, _ := bridge.peer(key)
+	registered, err := browserRegistered(key)
+	if err != nil {
+		return proto.BrowserExtensionStatus{}, err
+	}
+	present, err := browserBundlePresent()
+	if err != nil {
+		return proto.BrowserExtensionStatus{}, err
+	}
+	installed := peer != nil
+	if !installed && desktopErr == nil {
+		installed, err = browserInstalled(key)
+		if err != nil {
+			return proto.BrowserExtensionStatus{}, err
+		}
+	}
+	result := proto.BrowserExtensionStatus{
+		Browser: key.browser, ExtensionID: browserExtensionID, Version: browserBundleVersion,
+		Connected: peer != nil, Installed: installed, Registered: registered, BundlePresent: present,
 	}
 	if bridge.startErr != nil {
-		result["error"] = browserErrorText(bridge.startErr)
+		result.Error = browserErrorText(bridge.startErr)
 	} else if desktopErr != nil {
-		result["error"] = browserErrorText(desktopErr)
+		result.Error = browserErrorText(desktopErr)
 	}
-	data, err := json.Marshal(result)
-	return browserResponse{Data: data}, err
+	return result, nil
 }
 
 func (bridge *browserBridge) ensure(ctx context.Context, key browserSessionKey, task string) (*browserPeer, error) {
@@ -241,6 +287,10 @@ func (bridge *browserBridge) ensure(ctx context.Context, key browserSessionKey, 
 		return nil, err
 	}
 	defer bridge.release()
+	return bridge.ensureLocked(ctx, key, task)
+}
+
+func (bridge *browserBridge) ensureLocked(ctx context.Context, key browserSessionKey, task string) (*browserPeer, error) {
 	if peer, _ := bridge.peer(key); peer != nil {
 		return peer, nil
 	}
@@ -299,7 +349,7 @@ func (bridge *browserBridge) callInstaller(ctx context.Context, task, method, br
 }
 
 func (bridge *browserBridge) uninstall(ctx context.Context, key browserSessionKey, task string) error {
-	registered, registryErr := browserRegistered(key)
+	var uiErr error
 	peers := bridge.connectedPeers(key)
 	removed := len(peers) > 0
 	detach, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -315,15 +365,18 @@ func (bridge *browserBridge) uninstall(ctx context.Context, key browserSessionKe
 		}
 	}
 	cancel()
-	var uiErr error
-	if !removed && (registered || len(peers) > 0) && key.session != 0 && bridge.host.snapshot().DesktopState == "unlocked" {
-		token, err := proto.NewID()
-		if err == nil {
-			fallback, cancel := context.WithTimeout(ctx, 13*time.Second)
-			_, uiErr = bridge.callInstaller(fallback, task, "browser.ext_remove_uia", key.browser, "", "", token)
-			cancel()
-		} else {
-			uiErr = err
+	if !removed && key.session != 0 && bridge.host.snapshot().DesktopState == "unlocked" {
+		var installed bool
+		installed, uiErr = browserInstalled(key)
+		if installed || len(peers) > 0 {
+			token, err := proto.NewID()
+			if err == nil {
+				fallback, cancel := context.WithTimeout(ctx, 13*time.Second)
+				_, uiErr = bridge.callInstaller(fallback, task, "browser.ext_remove_uia", key.browser, "", "", token)
+				cancel()
+			} else {
+				uiErr = err
+			}
 		}
 	}
 	removeErr := removeBrowserRegistration(key)
@@ -333,7 +386,7 @@ func (bridge *browserBridge) uninstall(ctx context.Context, key browserSessionKe
 		delete(bridge.preferred, key.browserDesktop)
 	}
 	bridge.mu.Unlock()
-	return errors.Join(registryErr, uiErr, removeErr, bundleErr)
+	return errors.Join(uiErr, removeErr, bundleErr)
 }
 
 func (bridge *browserBridge) cleanup(ctx context.Context) error {

@@ -1,0 +1,284 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	_ "embed"
+	"encoding/hex"
+	"encoding/json"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"golang.org/x/sys/windows"
+
+	"ghosthand/proto"
+)
+
+//go:embed rdp_preflight_windows.ps1
+var rdpPreflightScript string
+
+type rdpNetwork struct {
+	Fingerprint string `json:"fingerprint"`
+	InboundOpen *bool  `json:"inbound_open"`
+}
+
+func rdpNetworkPolicy(ctx context.Context, port int, probeFirewall bool) rdpNetwork {
+	var result rdpNetwork
+	system, err := windows.GetSystemDirectory()
+	if err != nil {
+		return result
+	}
+	path := filepath.Join(system, "WindowsPowerShell", "v1.0", "powershell.exe")
+	command := "$Port = " + strconv.Itoa(port) + "\n$ProbeFirewall = $" + strconv.FormatBool(probeFirewall) + "\n" + rdpPreflightScript
+	ctx, cancel := context.WithTimeout(ctx, 9*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, path, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: windows.CREATE_NO_WINDOW}
+	// The script emits the certificate before the advisory firewall probe.
+	data, _ := cmd.Output()
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if decoder.Decode(&result) != nil {
+		return rdpNetwork{}
+	}
+	if hash, err := hex.DecodeString(result.Fingerprint); err != nil || len(hash) != sha256.Size {
+		result.Fingerprint = ""
+	}
+	if probeFirewall {
+		var firewall rdpNetwork
+		if decoder.Decode(&firewall) == nil {
+			result.InboundOpen = firewall.InboundOpen
+		}
+	}
+	return result
+}
+
+func freeRDPClient() string {
+	dir, err := windows.KnownFolderPath(windows.FOLDERID_ProgramFiles, 0)
+	if err != nil {
+		return ""
+	}
+	client := filepath.Join(dir, "GhostHand", "FreeRDP", "wfreerdp.exe")
+	if info, err := os.Lstat(client); err == nil && info.Mode().IsRegular() {
+		return client
+	}
+	return ""
+}
+
+func (a *agent) rdpCredentials(ctx context.Context, req proto.DesktopRequest) (proto.RDPCredential, proto.ErrorCode) {
+	var credential proto.RDPCredential
+	cfg := a.cfg.Load()
+	if cfg == nil || !strings.HasPrefix(cfg.Server, "https://") || req.Ticket == "" {
+		return credential, proto.ErrRDPConnection
+	}
+	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	r, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.Server+"/api/agent/rdp/"+req.OperationID+"/credential", nil)
+	if err != nil {
+		return credential, proto.ErrRDPConnection
+	}
+	r.Header.Set("Authorization", "Bearer "+req.Ticket)
+	r.Header.Set("X-GhostHand-Device", cfg.DeviceID)
+	r.Header.Set("X-GhostHand-Token", cfg.Token)
+	response, err := a.client.Do(r)
+	if err != nil {
+		return credential, proto.ErrRDPConnection
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusGone {
+		return credential, proto.ErrRDPTicketExpired
+	}
+	if response.StatusCode != http.StatusOK {
+		return credential, proto.ErrRDPConnection
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, 8192))
+	defer clear(body)
+	if err != nil || json.Unmarshal(body, &credential) != nil || credential.Username == "" || credential.Password == nil {
+		clear(credential.Password)
+		return proto.RDPCredential{}, proto.ErrRDPConnection
+	}
+	return credential, ""
+}
+
+func rdpLoginAndTransfer(ctx context.Context, client, fingerprint, account string, password []byte, port int,
+	console proto.RDPConsoleSession, sid *windows.SID, singleSession bool, progress func(string)) (uint32, proto.ErrorCode) {
+	destination := net.JoinHostPort(loopbackRDP, strconv.Itoa(port))
+	clientCtx, cancelClient := context.WithCancel(ctx)
+	defer cancelClient()
+	args := []string{
+		"/v:" + destination, "/u:" + account, "/sec:nla",
+		"/cert:deny,fingerprint:sha256:" + fingerprint, "/proxy:ignore", "/log-level:ERROR",
+		"/size:1024x768", "/bpp:16", "/audio-mode:2", "-clipboard", "-auto-reconnect",
+	}
+	if len(password) == 0 {
+		args = append(args, "/p")
+	} else {
+		args = append(args, "/from-stdin:force")
+	}
+	cmd := exec.CommandContext(clientCtx, client, args...)
+	cmd.Dir = filepath.Dir(client)
+	cmd.WaitDelay = 2 * time.Second
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: windows.CREATE_NO_WINDOW}
+	var logs rdpClientOutput
+	cmd.Stdout, cmd.Stderr = &logs, &logs
+	var stdin io.WriteCloser
+	if len(password) > 0 {
+		var err error
+		stdin, err = cmd.StdinPipe()
+		if err != nil {
+			return 0, proto.ErrRDPClientUnavailable
+		}
+	}
+	if err := cmd.Start(); err != nil {
+		if stdin != nil {
+			_ = stdin.Close()
+		}
+		return 0, proto.ErrRDPClientUnavailable
+	}
+	done := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(done)
+	}()
+	defer func() {
+		cancelClient()
+		<-done
+	}()
+	if stdin != nil {
+		_, writeErr := stdin.Write(password)
+		if writeErr == nil {
+			_, writeErr = io.WriteString(stdin, "\n")
+		}
+		clear(password)
+		_ = stdin.Close()
+		if writeErr != nil {
+			return 0, proto.ErrRDPClientUnavailable
+		}
+	}
+	login, stop := context.WithTimeout(ctx, 20*time.Second)
+	defer stop()
+	tick := time.NewTicker(200 * time.Millisecond)
+	defer tick.Stop()
+	for login.Err() == nil {
+		select {
+		case <-done:
+			return 0, logs.code()
+		case <-login.Done():
+			return 0, proto.ErrRDPTimeout
+		case <-tick.C:
+			session, code := activeRDPUser(console, sid, singleSession)
+			if code != "" {
+				return 0, code
+			}
+			if session == 0 {
+				continue
+			}
+			// A reused session can be detached from the console before tscon.
+			if current := rdpConsole(); current.ID != 0 && current.State != "none" {
+				user, err := rdpSessionSID(current.ID)
+				if err != nil {
+					continue
+				}
+				if !user.Equals(sid) {
+					return 0, proto.ErrRDPUserMismatch
+				}
+			}
+			progress("transfer")
+			if code := transferRDPConsole(ctx, session); code != "" {
+				return 0, code
+			}
+			return session, ""
+		}
+	}
+	return 0, proto.ErrRDPTimeout
+}
+
+func activeRDPUser(console proto.RDPConsoleSession, sid *windows.SID, singleSession bool) (uint32, proto.ErrorCode) {
+	sessions, err := rdpSessions()
+	if err != nil {
+		return 0, proto.ErrRDPConnection
+	}
+	var found uint32
+	for _, session := range sessions {
+		id := session.SessionID
+		if id == 0 || session.State != windows.WTSActive || rdpSessionProtocol(id) != 2 {
+			continue
+		}
+		user, err := rdpSessionSID(id)
+		if err != nil || !user.Equals(sid) {
+			continue
+		}
+		if id == console.ID {
+			return id, ""
+		}
+		if found != 0 {
+			return 0, proto.ErrBusy
+		}
+		found = id
+	}
+	if found != 0 && console.State != "none" {
+		if !singleSession {
+			return 0, proto.ErrRDPAccessDenied
+		}
+		// An existing console user's session must be reused to preserve its windows.
+		return 0, ""
+	}
+	return found, ""
+}
+
+func transferRDPConsole(ctx context.Context, session uint32) proto.ErrorCode {
+	path := tsconPath()
+	if path == "" {
+		return proto.ErrRDPTsconFailed
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, path, strconv.FormatUint(uint64(session), 10), "/dest:console")
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: windows.CREATE_NO_WINDOW}
+	if err := cmd.Run(); err != nil {
+		return proto.ErrRDPTsconFailed
+	}
+	return ""
+}
+
+// FreeRDP output is reduced to known error codes in memory.
+type rdpClientOutput struct {
+	tail   string
+	result proto.ErrorCode
+}
+
+func (out *rdpClientOutput) Write(data []byte) (int, error) {
+	text := out.tail + string(data)
+	out.tail = strings.Clone(text[max(0, len(text)-80):])
+	switch {
+	case strings.Contains(text, "ERRCONNECT_LOGON_FAILURE"), strings.Contains(text, "ERRCONNECT_WRONG_PASSWORD"),
+		strings.Contains(text, "ERRCONNECT_AUTHENTICATION_FAILED"), strings.Contains(text, "STATUS_LOGON_FAILURE"):
+		if out.result == "" {
+			out.result = proto.ErrRDPAuthFailed
+		}
+	case strings.Contains(text, "ERRCONNECT_ACCOUNT_"), strings.Contains(text, "ERRCONNECT_PASSWORD_"),
+		strings.Contains(text, "ERRCONNECT_CLIENT_REVOKED"):
+		out.result = proto.ErrRDPAccountLocked
+	case strings.Contains(text, "ERRCONNECT_LOGON_TYPE_NOT_GRANTED"), strings.Contains(text, "ERRCONNECT_ACCESS_DENIED"),
+		strings.Contains(text, "ERRCONNECT_INSUFFICIENT_PRIVILEGES"):
+		out.result = proto.ErrRDPAccessDenied
+	case strings.Contains(text, "ERRCONNECT_TLS_CONNECT_FAILED"):
+		out.result = proto.ErrRDPCertificate
+	}
+	return len(data), nil
+}
+
+func (out *rdpClientOutput) code() proto.ErrorCode {
+	if out.result != "" {
+		return out.result
+	}
+	return proto.ErrRDPConnection
+}

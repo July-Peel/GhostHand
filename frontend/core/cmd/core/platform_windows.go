@@ -80,7 +80,8 @@ func startPlatform(ctx context.Context, stop context.CancelFunc, helper string, 
 	}
 	p := newHost(desktop, helperState)
 	done := make(chan struct{})
-	sessionEvents := make(chan struct{}, 1)
+	sessionEvents := p.sessionEvents
+	go p.runAwakePolicy(ctx)
 	if service {
 		go func() {
 			reader := json.NewDecoder(os.Stdin)
@@ -198,19 +199,48 @@ func keepAwake() func() {
 
 func interactiveSession() (uint32, windows.Token, bool) {
 	id := windows.WTSGetActiveConsoleSessionId()
-	var token windows.Token
-	if id != 0xffffffff && windows.WTSQueryUserToken(id, &token) == nil {
-		return id, token, true
+	var consoleToken windows.Token
+	if id != 0xffffffff && windows.WTSQueryUserToken(id, &consoleToken) == nil && desktopState(id) == "unlocked" {
+		return id, consoleToken, true
 	}
+	var fallbackID uint32
+	var fallback windows.Token
 	var sessions *windows.WTS_SESSION_INFO
 	var count uint32
 	if windows.WTSEnumerateSessions(0, 0, 1, &sessions, &count) == nil {
 		defer windows.WTSFreeMemory(uintptr(unsafe.Pointer(sessions)))
 		for _, entry := range unsafe.Slice(sessions, int(count)) {
-			if entry.SessionID != 0 && entry.State == windows.WTSActive && windows.WTSQueryUserToken(entry.SessionID, &token) == nil {
+			if entry.SessionID == 0 || entry.SessionID == id || entry.State != windows.WTSActive {
+				continue
+			}
+			var token windows.Token
+			if windows.WTSQueryUserToken(entry.SessionID, &token) != nil {
+				continue
+			}
+			if desktopState(entry.SessionID) == "unlocked" {
+				if fallback != 0 {
+					fallback.Close()
+				}
+				if consoleToken != 0 {
+					consoleToken.Close()
+				}
 				return entry.SessionID, token, true
 			}
+			if fallback == 0 {
+				fallbackID, fallback = entry.SessionID, token
+			} else {
+				token.Close()
+			}
 		}
+	}
+	if consoleToken != 0 {
+		if fallback != 0 {
+			fallback.Close()
+		}
+		return id, consoleToken, true
+	}
+	if fallback != 0 {
+		return fallbackID, fallback, true
 	}
 	return 0, 0, false
 }

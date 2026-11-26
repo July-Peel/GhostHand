@@ -446,6 +446,17 @@ dialog::backdrop { background: var(--scrim); }
 .pairing-qr { width: 168px; height: 168px; border: 1px solid var(--line); border-radius: 8px; }
 .detail-device { padding: 18px 17px; display: flex; align-items: center; gap: 11px; }
 .detail-device p { color: var(--subtle); font-size: 12px; }
+.detail-device-name { min-width: 0; }
+.detail-device-name strong { overflow-wrap: anywhere; }
+.detail-device-name .agent-actions input { max-width: 100%; width: 230px; }
+.rdp-disclosure { border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
+.rdp-disclosure summary { cursor: pointer; font-size: 13px; font-weight: 650; }
+.rdp-disclosure .agent-kv, .rdp-form { margin-top: 10px; }
+.rdp-form, .rdp-form label { display: grid; gap: 6px; }
+.rdp-form { gap: 10px; }
+.rdp-form label { font-size: 13px; }
+.rdp-form input:not([type=checkbox]) { width: 100%; min-width: 0; border: 1px solid var(--line); border-radius: 7px; padding: 7px 8px; background: var(--canvas); color: var(--text); }
+.rdp-form .rdp-option { display: flex; gap: 7px; align-items: center; }
 .details-list { margin: 0 17px 17px; }
 .details-list > div { display: flex; justify-content: space-between; gap: 12px; border-top: 1px solid var(--line); padding: 9px 0; font-size: 13px; }
 .details-list dt { color: var(--subtle); }

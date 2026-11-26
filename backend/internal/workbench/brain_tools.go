@@ -169,8 +169,10 @@ func (s *Service) finishBrain(ctx context.Context, t brainTask, reply string, st
 		if _, err := Enqueue(ctx, tx, t.device, proto.MCPTaskFinish, proto.TaskResultPayload{TaskID: t.id, State: state, ErrorCode: code}); err != nil {
 			return err
 		}
-		if err := addReply(ctx, tx, t.device, t.id, limitText(reply, 5000), now); err != nil {
-			return err
+		if !t.quiet {
+			if err := addReply(ctx, tx, t.device, t.id, limitText(reply, 5000), now); err != nil {
+				return err
+			}
 		}
 		if err := finishTask(ctx, tx, t.id, state, code, now); err != nil {
 			return err

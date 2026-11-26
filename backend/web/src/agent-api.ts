@@ -38,13 +38,92 @@ export type Rollout = { device_id: string } | { group: string } | { all: true }
 
 const devicePath = (id: string) => '/api/devices/' + encodeURIComponent(id)
 export const connectionKey = (id: string) => ['connection', id] as const
+export const browserExtensionKey = (id: string) => ['browser-extension', id] as const
+export const rdpKey = (id: string) => ['rdp', id] as const
 export const releasesKey = ['releases'] as const
+
+export type BrowserExtensionStatus = {
+  browser: 'chrome'
+  extension_id: string
+  version: string
+  connected: boolean
+  installed: boolean
+  registered: boolean
+  bundle_present: boolean
+  error?: string
+  message?: string
+}
+
+export type RDPAction = 'preflight' | 'unlock' | 'lock'
+type RDPPreflight = {
+  edition: string
+  os_version: string
+  rdp_supported: boolean
+  rdp_enabled: boolean
+  termservice_running: boolean
+  nla_required: boolean
+  port_reachable: boolean
+  service_mode: boolean
+  console_session: { id: number; state: 'locked' | 'unlocked' | 'none' | 'unknown'; username: string }
+  sleep_ac_minutes: number | null
+  sleep_dc_minutes: number | null
+  firewall_rdp_inbound_open: boolean | null
+  client_available: boolean
+  certificate_available: boolean
+  single_session: boolean
+  blank_password_restricted?: boolean
+}
+
+export type RDPResult = {
+  operation_id: string
+  kind: `rdp.${RDPAction}`
+  ok: boolean
+  code?: string
+}
+
+export type RDPStatus = {
+  configured: boolean
+  username: string
+  domain: string
+  blank_password: boolean
+  rdp_port: number
+  auto_unlock: boolean
+  auto_relock: boolean
+  keep_system_awake: boolean
+  suspended: boolean
+  last_result: string
+  last_unlock_at: number
+  operation?: RDPResult['kind']
+  stage?: string
+  preflight?: RDPResult & { detail?: RDPPreflight }
+}
+
+type RDPConfig = { clear: true } | {
+  username: string
+  domain: string
+  password: string
+  blank_password: boolean
+  rdp_port: number
+  auto_unlock: boolean
+  auto_relock: boolean
+  keep_system_awake: boolean
+}
 
 export const agentAPI = {
   getPairing: (signal: AbortSignal) => request<Pairing>('/api/pairing', { signal }),
   rotatePairingKey: (csrf: string) => request<Pairing>('/api/pairing/rotate', post({}, csrf)),
   history: (id: string, signal: AbortSignal) =>
     request<ConnectionHistory>(devicePath(id) + '/connection', { signal }),
+  browserExtension: (id: string, signal: AbortSignal) =>
+    request<BrowserExtensionStatus>(devicePath(id) + '/browser-extension?browser=chrome', { signal }),
+  changeBrowserExtension: (id: string, action: 'install' | 'uninstall', csrf: string) =>
+    request<BrowserExtensionStatus>(devicePath(id) + '/browser-extension', post({ action, browser: 'chrome' }, csrf)),
+  rdpStatus: (id: string, signal: AbortSignal) =>
+    request<RDPStatus>(devicePath(id) + '/rdp', { signal }),
+  rdpConfig: (id: string, input: RDPConfig, csrf: string) =>
+    request<void>(devicePath(id) + '/rdp/config', post(input, csrf)),
+  rdpOperate: (id: string, action: RDPAction, confirm: boolean, csrf: string) =>
+    request<RDPResult>(devicePath(id) + '/rdp/' + action, post({ confirm_suspended: confirm }, csrf)),
   operate: (id: string, kind: OperationKind, hours: number | undefined, csrf: string) =>
     request<{ id: string }>(devicePath(id) + '/operations', post({ kind, hours }, csrf)),
   revoke: (id: string, csrf: string) =>

@@ -35,6 +35,7 @@ type agent struct {
 	canUninstall bool
 	welcomed     chan struct{}
 	firstWelcome sync.Once
+	rdpMu        sync.Mutex
 }
 
 var (
@@ -114,7 +115,8 @@ func (a *agent) session(ctx context.Context) error {
 	platform := proto.Platform(runtime.GOOS)
 	hello := proto.HelloPayload{
 		DeviceID: cfg.DeviceID, Token: cfg.Token, Platform: platform, AgentVersion: version,
-		LastAck: lastAck, Fresh: fresh, CapsHash: proto.TaskCapabilitiesHash(platform), RunningTasks: running, State: snapshot,
+		DesktopOperations: platform == proto.Windows,
+		LastAck:           lastAck, Fresh: fresh, CapsHash: proto.TaskCapabilitiesHash(platform), RunningTasks: running, State: snapshot,
 		TaskInventory: true, PendingTaskResults: pendingResults,
 	}
 	if a.canUninstall {
@@ -136,6 +138,11 @@ func (a *agent) session(ctx context.Context) error {
 	if err := a.local.acceptWelcome(welcome.LastAck); err != nil {
 		return err
 	}
+	policy := proto.DesktopPolicy{}
+	if welcome.DesktopPolicy != nil {
+		policy = *welcome.DesktopPolicy
+	}
+	a.platform.applyDesktopPolicy(policy)
 	if welcome.TokenRotate != "" {
 		if _, err := proto.TokenHash(welcome.TokenRotate); err != nil {
 			return err
@@ -210,6 +217,8 @@ func (a *agent) exchange(ctx context.Context, conn *websocket.Conn, interval tim
 	deadline := time.NewTimer(10 * time.Second)
 	defer deadline.Stop()
 	var timeout <-chan time.Time = deadline.C
+	desktopResults := make(chan proto.DesktopResult, 8)
+	desktopSlots := make(chan struct{}, 8)
 	if err := a.sendState(ctx, conn, proto.Ping, inbound); err != nil {
 		return err
 	}
@@ -267,6 +276,17 @@ func (a *agent) exchange(ctx context.Context, conn *websocket.Conn, interval tim
 				}
 			}
 		case <-a.local.changed:
+		case result := <-desktopResults:
+			kind := proto.RDPResult
+			if result.Kind == proto.BrowserExtensionStatusRequest {
+				kind = proto.BrowserExtensionStatusResult
+			}
+			if err := a.sendState(ctx, conn, proto.StateUpdate, inbound); err != nil {
+				return err
+			}
+			if err := write(ctx, conn, kind, result, inbound); err != nil {
+				return err
+			}
 		case <-taskTick:
 			for _, task := range tasks {
 				if task.State == proto.Queued {
@@ -291,8 +311,11 @@ func (a *agent) exchange(ctx context.Context, conn *websocket.Conn, interval tim
 				return result.err
 			}
 			frame := result.frame
+			isDesktop := frame.Seq == 0 && (frame.Type == proto.BrowserExtensionStatusRequest ||
+				frame.Type == proto.RDPPreflight || frame.Type == proto.RDPUnlock || frame.Type == proto.RDPLock)
+			isPolicy := frame.Seq == 0 && frame.Type == proto.ConfigUpdate
 			if frame.Version != proto.Version || !state.IDPattern.MatchString(frame.ID) ||
-				(frame.Seq == 0 && frame.Type != proto.Pong) ||
+				(frame.Seq == 0 && frame.Type != proto.Pong && !isDesktop && !isPolicy) ||
 				(frame.Seq > 0 && !validTaskFrame(frame) && !validOperation(frame)) {
 				return errors.New("invalid controller message")
 			}
@@ -300,7 +323,40 @@ func (a *agent) exchange(ctx context.Context, conn *websocket.Conn, interval tim
 			if err != nil {
 				return err
 			}
-			if frame.Type == proto.Pong {
+			if isPolicy {
+				var policy proto.DesktopPolicy
+				if json.Unmarshal(frame.Payload, &policy) != nil {
+					return errors.New("invalid desktop policy")
+				}
+				a.platform.applyDesktopPolicy(policy)
+			} else if isDesktop {
+				var request proto.DesktopRequest
+				if json.Unmarshal(frame.Payload, &request) != nil || !state.IDPattern.MatchString(request.OperationID) {
+					return errors.New("invalid desktop operation")
+				}
+				select {
+				case desktopSlots <- struct{}{}:
+					go func() {
+						defer func() { <-desktopSlots }()
+						progress := func(stage string) {
+							select {
+							case desktopResults <- proto.DesktopResult{OperationID: request.OperationID, Kind: frame.Type, Stage: stage}:
+							default:
+							}
+						}
+						outcome := a.desktopOperation(ctx, frame.Type, request, progress)
+						select {
+						case desktopResults <- outcome:
+						case <-ctx.Done():
+						}
+					}()
+				default:
+					select {
+					case desktopResults <- proto.DesktopResult{OperationID: request.OperationID, Kind: frame.Type, Code: proto.ErrBusy}:
+					default:
+					}
+				}
+			} else if frame.Type == proto.Pong {
 				deadline.Stop()
 				timeout = nil
 			} else {

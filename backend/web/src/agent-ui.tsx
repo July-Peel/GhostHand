@@ -1,12 +1,80 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { agentAPI, connectionKey, releasesKey } from './agent-api'
+import { LoaderCircle, RefreshCw } from 'lucide-react'
+import { agentAPI, browserExtensionKey, connectionKey, releasesKey } from './agent-api'
 import type { OperationKind, Release, Rollout } from './agent-api'
 import { errorText } from './api'
 import type { Device, Session } from './api'
 import { Panel } from './device-ui'
 
 const formatDate = (time: number) => new Date(time).toLocaleString('zh-CN', { dateStyle: 'short', timeStyle: 'medium' })
+
+export function BrowserExtensionSection({ device, session }: { device: Device; session: Session }) {
+  const client = useQueryClient()
+  const key = browserExtensionKey(device.id)
+  const online = device.conn_state === 'online' || device.conn_state === 'unstable'
+  const [confirm, setConfirm] = useState(false)
+  const status = useQuery({
+    queryKey: key, queryFn: ({ signal }) => agentAPI.browserExtension(device.id, signal),
+    enabled: online, gcTime: 0, retry: false, refetchOnMount: 'always',
+  })
+  const change = useMutation({
+    mutationFn: (action: 'install' | 'uninstall') => agentAPI.changeBrowserExtension(device.id, action, session.csrf_token),
+    onSuccess: data => client.setQueryData(key, data),
+    onSettled: () => {
+      setConfirm(false)
+      return client.invalidateQueries({ queryKey: key })
+    },
+  })
+  const data = status.data
+  const installed = !!(data?.installed || data?.connected)
+  const leftovers = !!(data?.registered || data?.bundle_present)
+  const busy = !online || !data || status.isFetching || status.isError || change.isPending
+  const locked = device.desktop_state !== 'unlocked'
+  const summary = !online ? '设备离线'
+    : status.isFetching ? '正在检测插件状态…'
+    : status.isError || !data ? '插件状态不可用'
+    : data.connected ? `已安装并连接（v${data.version}）`
+    : installed ? '已安装（Chrome 未启动或扩展未连接）'
+    : data.registered ? '存在注册表残留（未挂载扩展）'
+    : data.bundle_present ? '存在扩展文件残留' : '未安装'
+  const tone = online && !status.isFetching && !status.isError
+    ? data?.connected ? 'online' : installed || leftovers ? 'unstable' : 'offline' : 'offline'
+
+  return <section className="agent-section">
+    <h3>Chrome 插件</h3>
+    <div className="agent-actions">
+      <span className={'connection ' + tone} role="status"><span aria-hidden="true" />{summary}</span>
+      <button type="button" className="icon-button" disabled={!online || status.isFetching || change.isPending}
+        onClick={() => void status.refetch()} title="刷新状态" aria-label="刷新 Chrome 插件状态"><RefreshCw size={16} /></button>
+    </div>
+    <div className="agent-actions">
+      <button type="button" className="secondary-button" title={installed ? '插件已安装，无需重复安装' : undefined}
+        disabled={busy || installed || locked || device.helper_state !== 'ready'} onClick={() => change.mutate('install')}>
+        {change.isPending && change.variables === 'install'
+          ? <><LoaderCircle size={15} className="spin" /> 正在自动安装…</> : installed ? '已安装' : '安装 Chrome 插件'}
+      </button>
+      <button type="button" className="danger-outline-button" disabled={busy || (!installed && !leftovers)}
+        onClick={() => setConfirm(true)}>
+        {change.isPending && change.variables === 'uninstall' ? '正在卸载…' : '卸载 Chrome 插件'}
+      </button>
+    </div>
+    {confirm && <div className="agent-confirm">
+      <p>确认卸载该设备上的 GhostHand Chrome 扩展并清理注册表？</p>
+      <div className="agent-actions">
+        <button type="button" className="danger-button" disabled={busy || (!installed && !leftovers)}
+          onClick={() => change.mutate('uninstall')}>确认卸载</button>
+        <button type="button" className="text-button" disabled={change.isPending} onClick={() => setConfirm(false)}>取消</button>
+      </div>
+    </div>}
+    {online && !installed && locked && <p>请先在下方使用远程解锁，或在设备上解锁桌面后再安装。</p>}
+    {online && !installed && !locked && device.helper_state !== 'ready' && <p>Windows 执行器就绪后即可安装。</p>}
+    {online && status.isError && <p role="alert">{errorText(status.error)}</p>}
+    {data?.error && online && !status.isFetching && !status.isError && <p>{data.error}</p>}
+    {change.isError && <p role="alert">{errorText(change.error)}</p>}
+    {change.isSuccess && <p role="status">{change.data.message}</p>}
+  </section>
+}
 
 export function PairingPanel({ session, close }: { session: Session; close: () => void }) {
   const client = useQueryClient()

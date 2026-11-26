@@ -20,6 +20,7 @@ const eligibleTasks = `
 		(t.state IN ('queued','dispatched') AND t.expires_at<=?)
 		OR (t.state='queued' AND d.task_protocol>=1 AND (t.source NOT IN ('brain','mcp') OR (d.task_protocol>=2 AND json_array_length(d.mcp_tools)>0))
 			AND d.conn_state IN ('online','unstable')
+			AND NOT EXISTS (SELECT 1 FROM device_rdp_credentials r WHERE r.device_id=d.id AND r.relock_until>?)
 			AND EXISTS (SELECT 1 FROM device_sessions s WHERE s.device_id=d.id AND s.conn_gen=d.conn_gen AND s.disconnected_at IS NULL)
 			AND (t.assign_seq IS NOT NULL OR (
 				SELECT COUNT(*) + CASE WHEN t.lane='bg' THEN EXISTS (
@@ -35,7 +36,7 @@ func (s *Service) RunTasks(ctx context.Context) {
 		changed := s.store.Changed()
 		now := time.Now().UnixMilli()
 		var ready bool
-		err := s.store.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1"+eligibleTasks+")", now).Scan(&ready)
+		err := s.store.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1"+eligibleTasks+")", now, now).Scan(&ready)
 		if err == nil && ready {
 			err = s.dispatchTask(ctx)
 			if err == nil {
@@ -44,8 +45,10 @@ func (s *Service) RunTasks(ctx context.Context) {
 		}
 		var next *int64
 		if err == nil {
-			err = s.store.QueryRowContext(ctx, `SELECT MIN(t.expires_at) FROM tasks t JOIN devices d ON d.id=t.device_id
-				WHERE d.is_demo=0 AND t.state IN ('queued','dispatched')`).Scan(&next)
+			err = s.store.QueryRowContext(ctx, `SELECT MIN(CASE WHEN r.relock_until>? AND t.state='queued'
+				THEN MIN(t.expires_at,r.relock_until) ELSE t.expires_at END)
+				FROM tasks t JOIN devices d ON d.id=t.device_id LEFT JOIN device_rdp_credentials r ON r.device_id=t.device_id
+				WHERE d.is_demo=0 AND t.state IN ('queued','dispatched')`, now).Scan(&next)
 		}
 		if err == nil {
 			var stall *int64
@@ -89,7 +92,7 @@ func (s *Service) dispatchTask(ctx context.Context) error {
 		var device string
 		var seq sql.NullInt64
 		err := tx.QueryRowContext(ctx, `SELECT t.id,t.device_id,t.capability,t.lane,t.expires_at,t.title,t.assign_seq`+
-			eligibleTasks+` ORDER BY t.assign_seq IS NULL,t.created_at,t.id LIMIT 1`, now).
+			eligibleTasks+` ORDER BY t.assign_seq IS NULL,t.created_at,t.id LIMIT 1`, now, now).
 			Scan(&assignment.TaskID, &device, &assignment.Capability, &assignment.Lane, &assignment.ExpiresAt, &assignment.Title, &seq)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil

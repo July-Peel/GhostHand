@@ -12,7 +12,8 @@
         "task.progress", "task.heartbeat", "task.confirm_request", "task.result", "upload.request", "upload.ticket",
         "flow.sync", "agent.update", "agent.restart", "helper.restart", "device.reboot", "log.collect",
         "agent.update_result", "log.ready", "helper.state", "agent.rollback", "agent.uninstall", "operation.result",
-        "mcp.tool_call", "mcp.tool_result", "mcp.task_display", "mcp.task_finish"
+        "mcp.tool_call", "mcp.tool_result", "mcp.task_display", "mcp.task_finish",
+        "browser.ext_status", "browser.ext_status_result", "rdp.preflight", "rdp.unlock", "rdp.lock", "rdp.result"
       ]
     },
     "id": { "type": "string", "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$" },
