@@ -14,14 +14,10 @@ import { connectionKey, rdpKey } from './agent-api'
 
 const useWorkspace = create<{
   selected: string | null
-  live: boolean
   select: (id: string | null) => void
-  setLive: (live: boolean) => void
 }>(set => ({
   selected: null,
-  live: false,
   select: selected => set({ selected }),
-  setLive: live => set({ live }),
 }))
 
 function DeviceRow({ device, active, select }: { device: Device; active: boolean; select: () => void }) {
@@ -45,7 +41,6 @@ function DeviceRow({ device, active, select }: { device: Device; active: boolean
 
 function useEvents() {
   const client = useQueryClient()
-  const setLive = useWorkspace(state => state.setLive)
   useEffect(() => {
     const stream = new EventSource('/api/events')
     const changedDevices = new Set<string>()
@@ -71,9 +66,7 @@ function useEvents() {
         changedDevices.clear()
       }, 60)
     }
-    stream.onopen = () => setLive(true)
     stream.onerror = () => {
-      setLive(false)
       void client.invalidateQueries({ queryKey: sessionKey })
     }
     stream.addEventListener('refresh', () => {
@@ -89,9 +82,8 @@ function useEvents() {
     return () => {
       stream.close()
       clearTimeout(timer)
-      setLive(false)
     }
-  }, [client, setLive])
+  }, [client])
 }
 
 export function Workspace({ session, brand, themeButton, onPasswordChanged }: {
@@ -107,7 +99,6 @@ export function Workspace({ session, brand, themeButton, onPasswordChanged }: {
   const [agentPanel, setAgentPanel] = useState<'pairing' | 'releases' | null>(null)
   const selected = useWorkspace(state => state.selected)
   const select = useWorkspace(state => state.select)
-  const live = useWorkspace(state => state.live)
   const query = useQuery({ queryKey: devicesKey, queryFn: ({ signal }) => api.devices(signal) })
   const devices = query.data?.devices ?? []
   const chosen = devices.find(device => device.id === selected)
@@ -150,9 +141,6 @@ export function Workspace({ session, brand, themeButton, onPasswordChanged }: {
       <header className="topbar">
         <div className="topbar-brand">{brand}<span className="app-section">工作台</span></div>
         <div className="topbar-actions">
-          <span className={'live-indicator' + (live ? ' is-live' : '')} role="status">
-            <span aria-hidden="true" />{live ? '实时同步' : '正在连接'}
-          </span>
           {themeButton}
           <button type="button" className="icon-button" aria-label="接入设备" title="接入设备"
             onClick={() => setAgentPanel('pairing')}><Plus size={18} /></button>

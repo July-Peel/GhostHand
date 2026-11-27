@@ -128,9 +128,7 @@ time, .battery, .device-count, .task-progress { font-variant-numeric: tabular-nu
 .topbar { grid-row: 1; }
 .topbar-brand, .topbar-actions { display: flex; align-items: center; gap: 12px; min-width: 0; }
 .app-section { color: var(--subtle); border-left: 1px solid var(--line); padding-left: 14px; font-size: 13px; }
-.live-indicator { display: flex; align-items: center; gap: 7px; color: var(--subtle); font-size: 12px; white-space: nowrap; }
-.live-indicator > span, .connection > span { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
-.live-indicator.is-live { color: var(--success); }
+.connection > span { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
 .user-name { max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .global-error { grid-row: 2; padding: 8px 20px; background: var(--danger-bg); color: var(--danger); }
 .workspace-grid { grid-row: 3; min-height: 0; display: grid; grid-template-columns: 280px minmax(0, 1fr); }
@@ -484,7 +482,6 @@ dialog::backdrop { background: var(--scrim); }
   .topbar-actions { gap: 4px; }
   .topbar-actions .icon-button { width: 32px; }
   .app-section, .user-name { display: none; }
-  .live-indicator { margin-right: 4px; font-size: 11px; }
   .workspace-grid { grid-template-columns: minmax(0, 1fr); }
   .sidebar { border-right: 0; }
   .workspace-grid:not(.show-chat) .chat-pane, .workspace-grid.show-chat .sidebar { display: none; }
