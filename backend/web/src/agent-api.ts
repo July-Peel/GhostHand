@@ -1,6 +1,11 @@
 import { post, request } from './api'
 
-export type Pairing = { server: string; key: string; fingerprint: string; managed_by_env: boolean; qr_png: string }
+export type Pairing = {
+  server: string; key: string; fingerprint: string; managed_by_env: boolean; qr_png: string; windows_install_command: string
+}
+export const windowsInstallerNames = ['GhostHand.Helper.exe', 'ghosthand-core.exe', 'ghosthand-launcher.exe'] as const
+export type WindowsInstallerName = typeof windowsInstallerNames[number]
+type WindowsInstallerFile = { name: WindowsInstallerName; size: number }
 export type OperationKind = 'log.collect' | 'agent.restart' | 'helper.restart' | 'agent.update' | 'agent.rollback' | 'agent.uninstall'
 export type ConnectionHistory = {
   version: string
@@ -112,6 +117,16 @@ type RDPConfig = { clear: true } | {
 export const agentAPI = {
   getPairing: (signal: AbortSignal) => request<Pairing>('/api/pairing', { signal }),
   rotatePairingKey: (csrf: string) => request<Pairing>('/api/pairing/rotate', post({}, csrf)),
+  windowsInstallerFiles: (signal: AbortSignal) => request<WindowsInstallerFile[]>('/api/pairing/windows/files', { signal }),
+  uploadWindowsInstallerFile: (name: WindowsInstallerName, file: File, csrf: string) => {
+    if (file.name.toLowerCase() !== name.toLowerCase()) throw new Error(`请选择 ${name}。`)
+    if (file.size > 256 * 1024 * 1024) throw new Error('单个 EXE 不能超过 256 MiB。')
+    return request<WindowsInstallerFile>('/api/pairing/windows/files/' + encodeURIComponent(name), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream', 'X-CSRF-Token': csrf },
+      body: file,
+    })
+  },
   history: (id: string, signal: AbortSignal) =>
     request<ConnectionHistory>(devicePath(id) + '/connection', { signal }),
   browserExtension: (id: string, signal: AbortSignal) =>

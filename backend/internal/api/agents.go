@@ -19,6 +19,7 @@ import (
 func (s *Server) agentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/pairing", s.require(s.getPairing))
 	mux.HandleFunc("POST /api/pairing/rotate", s.require(s.rotatePairingKey))
+	s.windowsInstallerRoutes(mux)
 	mux.HandleFunc("POST /api/agent/pair", s.redeemPairing)
 	mux.HandleFunc("GET "+proto.AgentSocketPath, s.agents.Connect)
 	mux.HandleFunc("GET /api/devices/{device}/connection", s.require(s.connectionHistory))
@@ -86,8 +87,9 @@ func (s *Server) pairingResponse(w http.ResponseWriter, r *http.Request, key str
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"server": origin, "key": key, "fingerprint": fingerprint,
-		"managed_by_env": s.agents.NodeKeyManagedByEnv(),
-		"qr_png":         base64.StdEncoding.EncodeToString(png),
+		"managed_by_env":          s.agents.NodeKeyManagedByEnv(),
+		"qr_png":                  base64.StdEncoding.EncodeToString(png),
+		"windows_install_command": windowsInstallCommand(origin, key, fingerprint),
 	})
 }
 

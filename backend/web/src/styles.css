@@ -412,7 +412,7 @@ dialog::backdrop { background: var(--scrim); }
 .settings-nav { display: flex; gap: 6px; padding: 11px 15px; border-bottom: 1px solid var(--line); }
 .settings-section-button { display: inline-flex; gap: 6px; align-items: center; padding: 7px 9px; border-radius: 7px; color: var(--dim); white-space: nowrap; }
 .settings-section-button:hover { background: var(--muted); }
-.settings-section-button[aria-pressed="true"] { background: var(--accent-bg); color: var(--accent); font-weight: 600; }
+.settings-section-button[aria-pressed="true"], .settings-section-button[aria-selected="true"] { background: var(--accent-bg); color: var(--accent); font-weight: 600; }
 .settings-content { padding: 17px; }
 .settings-form { display: grid; gap: 12px; }
 .settings-form h3 { font-size: 15px; font-weight: 650; }
@@ -444,6 +444,14 @@ dialog::backdrop { background: var(--scrim); }
 .agent-code { padding: 10px; background: var(--muted); border-radius: 8px; overflow-x: auto; font-size: 12px; }
 .pairing-code { font-size: 32px; font-weight: 650; letter-spacing: .14em; font-variant-numeric: tabular-nums; }
 .pairing-qr { width: 168px; height: 168px; border: 1px solid var(--line); border-radius: 8px; }
+.pairing-install { border-top: 0; }
+.pairing-files { display: grid; gap: 6px; }
+.pairing-files li { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 6px 10px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; }
+.pairing-files li > div { display: grid; gap: 2px; overflow-wrap: anywhere; }
+.pairing-files strong { font-size: 13px; }
+.pairing-files span, .pairing-key-label { color: var(--dim); font-size: 13px; }
+.pairing-files [role="alert"] { grid-column: 1 / -1; }
+.pairing-empty { min-height: 96px; }
 .detail-device { padding: 18px 17px; display: flex; align-items: center; gap: 11px; }
 .detail-device p { color: var(--subtle); font-size: 12px; }
 .detail-device-name { min-width: 0; }

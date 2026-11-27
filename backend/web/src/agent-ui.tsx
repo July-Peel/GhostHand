@@ -1,8 +1,8 @@
-import { useState } from 'react'
+import { useId, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { LoaderCircle, RefreshCw } from 'lucide-react'
-import { agentAPI, browserExtensionKey, connectionKey, releasesKey } from './agent-api'
-import type { OperationKind, Release, Rollout } from './agent-api'
+import { agentAPI, browserExtensionKey, connectionKey, releasesKey, windowsInstallerNames } from './agent-api'
+import type { OperationKind, Release, Rollout, WindowsInstallerName } from './agent-api'
 import { errorText } from './api'
 import type { Device, Session } from './api'
 import { Panel } from './device-ui'
@@ -76,12 +76,23 @@ export function BrowserExtensionSection({ device, session }: { device: Device; s
   </section>
 }
 
+const pairingPlatforms = ['Windows', 'Linux', 'Android'] as const
+
 export function PairingPanel({ session, close }: { session: Session; close: () => void }) {
   const client = useQueryClient()
+  const panelId = useId()
+  const [platform, setPlatform] = useState<typeof pairingPlatforms[number]>('Windows')
   const keyQuery = ['pairing'] as const
+  const filesQuery = ['pairing', 'windows-files'] as const
   const pairing = useQuery({ queryKey: keyQuery, queryFn: ({ signal }) => agentAPI.getPairing(signal), gcTime: 0 })
+  const files = useQuery({ queryKey: filesQuery, queryFn: ({ signal }) => agentAPI.windowsInstallerFiles(signal) })
+  const upload = useMutation({
+    mutationFn: async ({ name, file }: { name: WindowsInstallerName; file: File }) =>
+      agentAPI.uploadWindowsInstallerFile(name, file, session.csrf_token),
+    onSuccess: () => client.invalidateQueries({ queryKey: filesQuery }),
+  })
   const [confirmRotate, setConfirmRotate] = useState(false)
-  const [copied, setCopied] = useState<'key' | 'core' | 'svc' | null>(null)
+  const [copied, setCopied] = useState<'key' | 'svc' | null>(null)
   const rotate = useMutation({
     mutationFn: () => agentAPI.rotatePairingKey(session.csrf_token),
     onSuccess: data => {
@@ -90,11 +101,10 @@ export function PairingPanel({ session, close }: { session: Session; close: () =
     },
   })
   const details = pairing.data
-  const fpArg = details?.fingerprint ? ' --fingerprint ' + details.fingerprint : ''
-  const coreCmd = details ? `& "$env:ProgramFiles\\GhostHand\\ghosthand-core.exe" --server "${details.server}" --key "${details.key}"${fpArg}` : ''
-  const svcCmd = details ? `& "$env:ProgramFiles\\GhostHand\\ghosthand-launcher.exe" install --server "${details.server}" --key "${details.key}"${fpArg}` : ''
+  const svcCmd = details?.windows_install_command
+  const installerReady = files.isSuccess && windowsInstallerNames.every(name => files.data.some(file => file.name === name))
 
-  async function copyText(kind: 'key' | 'core' | 'svc', text: string) {
+  async function copyText(kind: 'key' | 'svc', text: string) {
     try {
       await navigator.clipboard.writeText(text)
       setCopied(kind)
@@ -106,58 +116,101 @@ export function PairingPanel({ session, close }: { session: Session; close: () =
 
   return (
     <Panel title="接入设备" className="settings-panel" close={close}>
-      <section className="agent-section">
-        <p>多个设备均可使用下面的服务端固定密钥接入。节点会根据硬件机器码生成唯一设备识别码，更新或手动重新执行时使用同一密钥即可自动关联原设备上线；节点端不保存任何日志或配置文件。</p>
-        {pairing.isPending && <p role="status">正在读取服务端接入密钥…</p>}
-        {pairing.isError && <p role="alert">{errorText(pairing.error)} <button type="button" className="text-button" onClick={() => void pairing.refetch()}>重试</button></p>}
-        {details && <>
-          <label className="agent-kv">
-            <dt>服务端固定接入密钥</dt>
-            <div className="settings-model-row">
-              <input value={details.key} readOnly spellCheck={false} onFocus={event => event.currentTarget.select()} />
-              <button type="button" className="secondary-button" onClick={() => void copyText('key', details.key)}>
-                {copied === 'key' ? '已复制' : '复制密钥'}
-              </button>
-            </div>
-          </label>
-          <img className="pairing-qr" alt="设备接入二维码" src={'data:image/png;base64,' + details.qr_png} />
-          <dl className="agent-kv">
-            <dt>控制端地址</dt><dd><code>{details.server}</code></dd>
-            {details.fingerprint && <><dt>证书指纹</dt><dd><code>{details.fingerprint}</code></dd></>}
-          </dl>
-          <div className="agent-actions">
-            <strong>直接运行（无服务、不产生任何本地文件）</strong>
-            <button type="button" className="text-button" onClick={() => void copyText('core', coreCmd)}>
-              {copied === 'core' ? '已复制' : '复制命令'}
-            </button>
-          </div>
-          <pre className="agent-code">{coreCmd}</pre>
-          <div className="agent-actions">
-            <strong>安装为 Windows 服务（无配置文件/日志文件）</strong>
-            <button type="button" className="text-button" onClick={() => void copyText('svc', svcCmd)}>
-              {copied === 'svc' ? '已复制' : '复制命令'}
-            </button>
-          </div>
-          <pre className="agent-code">{svcCmd}</pre>
-          {!details.managed_by_env && (
-            confirmRotate ? (
-              <div className="agent-confirm">
-                <p>重置固定密钥后，旧密钥将无法用于新设备接入或手动重连（已在线连接会保持至下次重启）。确定重置？</p>
-                <div className="agent-actions">
-                  <button type="button" className="secondary-button" disabled={rotate.isPending} onClick={() => rotate.mutate()}>
-                    {rotate.isPending ? '正在重置…' : '确认重置'}
-                  </button>
-                  <button type="button" className="text-button" disabled={rotate.isPending} onClick={() => setConfirmRotate(false)}>取消</button>
+      <div className="settings-nav" role="tablist" aria-label="设备平台">
+        {pairingPlatforms.map((name, index) => <button key={name} type="button" role="tab"
+          className="settings-section-button" id={panelId + '-tab-' + name} aria-controls={panelId + '-' + name}
+          aria-selected={platform === name} tabIndex={platform === name ? 0 : -1} onClick={() => setPlatform(name)}
+          onKeyDown={event => {
+            const last = pairingPlatforms.length - 1
+            const next = event.key === 'ArrowRight' ? (index + 1) % pairingPlatforms.length
+              : event.key === 'ArrowLeft' ? (index + last) % pairingPlatforms.length
+              : event.key === 'Home' ? 0 : event.key === 'End' ? last : -1
+            if (next < 0) return
+            event.preventDefault()
+            setPlatform(pairingPlatforms[next])
+            document.getElementById(panelId + '-tab-' + pairingPlatforms[next])?.focus()
+          }}>{name}</button>)}
+      </div>
+      <div role="tabpanel" id={panelId + '-Windows'} aria-labelledby={panelId + '-tab-Windows'} hidden={platform !== 'Windows'}>
+        <section className="agent-section pairing-install">
+          <h3>Windows 安装文件</h3>
+          <p>分别上传三个 Windows x64 EXE。Helper 请使用自包含版本。</p>
+          {files.isPending && <p role="status">正在读取上传状态…</p>}
+          {files.isError && <p role="alert">{errorText(files.error)} <button type="button" className="text-button" onClick={() => void files.refetch()}>重试</button></p>}
+          <ul className="pairing-files">
+            {windowsInstallerNames.map(name => {
+              const saved = files.data?.find(file => file.name === name)
+              const current = upload.variables?.name === name
+              const inputId = panelId + '-' + name
+              return <li key={name}>
+                <div><strong>{name}</strong>
+                  <span aria-live="polite">{saved ? `已上传 · ${(saved.size / (1024 * 1024)).toFixed(1)} MiB` : files.isSuccess ? '未上传' : '—'}</span>
                 </div>
+                <input type="file" id={inputId} accept=".exe" hidden onChange={event => {
+                  const file = event.currentTarget.files?.[0]
+                  event.currentTarget.value = ''
+                  if (file) upload.mutate({ name, file })
+                }} />
+                <button type="button" className="secondary-button" disabled={upload.isPending}
+                  aria-label={(saved ? '替换 ' : '上传 ') + name} onClick={() => document.getElementById(inputId)?.click()}>
+                  {current && upload.isPending ? '正在上传…' : saved ? '替换' : '上传'}
+                </button>
+                {current && upload.isError && <p role="alert">{errorText(upload.error)}</p>}
+              </li>
+            })}
+          </ul>
+          {pairing.isPending && <p role="status">正在读取服务端接入密钥…</p>}
+          {pairing.isError && <p role="alert">{errorText(pairing.error)} <button type="button" className="text-button" onClick={() => void pairing.refetch()}>重试</button></p>}
+          <div className="agent-actions">
+            <h3>安装为 Windows 服务</h3>
+            {installerReady && svcCmd && <button type="button" className="text-button" onClick={() => void copyText('svc', svcCmd)}>
+              {copied === 'svc' ? '已复制' : '复制命令'}
+            </button>}
+          </div>
+          {installerReady && svcCmd ? <>
+            <p>在新设备上以管理员身份打开 64 位 PowerShell，粘贴并运行这一条命令。</p>
+            <pre className="agent-code">{svcCmd}</pre>
+          </> : details && !svcCmd ? <p>请将控制端地址配置为 HTTPS，以生成 Windows 安装命令。</p>
+            : files.isSuccess && <p>上传全部三个文件后即可复制安装命令。</p>}
+        </section>
+        <section className="agent-section">
+          {details && <>
+            <div className="agent-kv">
+              <label htmlFor={panelId + '-key'} className="pairing-key-label">服务端固定接入密钥</label>
+              <div className="settings-model-row">
+                <input id={panelId + '-key'} value={details.key} readOnly spellCheck={false} onFocus={event => event.currentTarget.select()} />
+                <button type="button" className="secondary-button" onClick={() => void copyText('key', details.key)}>
+                  {copied === 'key' ? '已复制' : '复制密钥'}
+                </button>
               </div>
-            ) : (
-              <button type="button" className="secondary-button" onClick={() => setConfirmRotate(true)}>重置固定密钥</button>
-            )
-          )}
-          {details.managed_by_env && <p>当前固定密钥由环境变量 GH_NODE_KEY 管理。</p>}
-          {rotate.isError && <p role="alert">{errorText(rotate.error)}</p>}
-        </>}
-      </section>
+            </div>
+            <img className="pairing-qr" alt="设备接入二维码" src={'data:image/png;base64,' + details.qr_png} />
+            <dl className="agent-kv">
+              <dt>控制端地址</dt><dd><code>{details.server}</code></dd>
+              {details.fingerprint && <><dt>证书指纹</dt><dd><code>{details.fingerprint}</code></dd></>}
+            </dl>
+            {!details.managed_by_env && (
+              confirmRotate ? (
+                <div className="agent-confirm">
+                  <p>重置固定密钥后，旧密钥将无法用于新设备接入或手动重连（已在线连接会保持至下次重启）。确定重置？</p>
+                  <div className="agent-actions">
+                    <button type="button" className="secondary-button" disabled={rotate.isPending} onClick={() => rotate.mutate()}>
+                      {rotate.isPending ? '正在重置…' : '确认重置'}
+                    </button>
+                    <button type="button" className="text-button" disabled={rotate.isPending} onClick={() => setConfirmRotate(false)}>取消</button>
+                  </div>
+                </div>
+              ) : (
+                <button type="button" className="secondary-button" onClick={() => setConfirmRotate(true)}>重置固定密钥</button>
+              )
+            )}
+            {details.managed_by_env && <p>当前固定密钥由环境变量 GH_NODE_KEY 管理。</p>}
+            {rotate.isError && <p role="alert">{errorText(rotate.error)}</p>}
+          </>}
+        </section>
+      </div>
+      {pairingPlatforms.slice(1).map(name => <div key={name} className="pairing-empty" role="tabpanel"
+        id={panelId + '-' + name} aria-labelledby={panelId + '-tab-' + name} hidden={platform !== name} tabIndex={0} />)}
     </Panel>
   )
 }
