@@ -39,6 +39,7 @@ const (
 const (
 	MaxToolArgsSize = 128 << 10
 	MaxToolDataSize = 256 << 10
+	maxElementID    = 1<<31 - 1
 )
 
 type MCPTool struct {
@@ -85,8 +86,8 @@ var DeviceTools = append([]MCPTool{
 	{ToolStatus, "读取设备电量、桌面、Core/Helper 权限级别、CPU、内存、磁盘、网络和显示器状态。", toolSchema(`"include_disks":{"type":"boolean"},"include_network":{"type":"boolean"}`, ""), "read_only"},
 	{ToolInspect, "首选观察工具：通过 Microsoft UI Automation 提取前台窗口、指定 window_id、桌面(desktop)或任务栏(taskbar)的结构化控件树与文本，并赋予 element_id。", toolSchema(`"max_depth":{"type":"integer","minimum":1,"maximum":12},"interactive_only":{"type":"boolean"},"window_id":{"type":"string","maxLength":24},"filter_text":{"type":"string","maxLength":120}`, ""), "read_only"},
 	{ToolObserve, "视觉兜底截图工具：仅在 ui_inspect 无法识别自绘界面或用户明确要求截图时调用，截取屏幕或窗口画面；annotate 可绘制 SoM 编号框。", toolSchema(`"annotate":{"type":"boolean"},"window_only":{"type":"boolean"},"window_id":{"type":"string","maxLength":24},"monitor":{"type":"integer","minimum":0,"maximum":31}`, ""), "read_only"},
-	{ToolClick, "按 element_id 或虚拟桌面像素坐标 (x,y) 点击、右击、中击、双击或悬停，支持跨窗口、右键菜单、桌面和任务栏。", toolSchema(`"element_id":{"type":"integer","minimum":1},"x":{"type":"integer","minimum":-32768,"maximum":32767},"y":{"type":"integer","minimum":-32768,"maximum":32767},"button":{"type":"string","enum":["left","right","middle"]},"double":{"type":"boolean"},"hover_only":{"type":"boolean"},"modifiers":{"type":"array","items":{"type":"string","enum":["Ctrl","Control","Alt","Shift","Win","LWin","RWin"]},"maxItems":4}`, ""), "interactive"},
-	{ToolInput, "在指定控件或当前焦点位置输入文本，支持 auto/paste/type 模式、清空后输入与回车提交。", toolSchema(`"element_id":{"type":"integer","minimum":1},"text":{"type":"string","maxLength":20000},"mode":{"type":"string","enum":["auto","paste","type"]},"clear_first":{"type":"boolean"},"submit":{"type":"boolean"}`, `"text"`), "interactive"},
+	{ToolClick, "按 element_id 或虚拟桌面像素坐标 (x,y) 点击、右击、中击、双击或悬停，支持跨窗口、右键菜单、桌面和任务栏。", toolSchema(`"element_id":{"type":"integer","minimum":1,"maximum":2147483647},"x":{"type":"integer","minimum":-32768,"maximum":32767},"y":{"type":"integer","minimum":-32768,"maximum":32767},"button":{"type":"string","enum":["left","right","middle"]},"double":{"type":"boolean"},"hover_only":{"type":"boolean"},"modifiers":{"type":"array","items":{"type":"string","enum":["Ctrl","Control","Alt","Shift","Win","LWin","RWin"]},"maxItems":4}`, ""), "interactive"},
+	{ToolInput, "在指定控件或当前焦点位置输入文本，支持 auto/paste/type 模式、清空后输入与回车提交。", toolSchema(`"element_id":{"type":"integer","minimum":1,"maximum":2147483647},"text":{"type":"string","maxLength":20000},"mode":{"type":"string","enum":["auto","paste","type"]},"clear_first":{"type":"boolean"},"submit":{"type":"boolean"}`, `"text"`), "interactive"},
 	{ToolKey, "发送单个按键或组合快捷键（如 Win+R、Ctrl+Shift+Esc、Alt+F4、Enter），支持重复次数。", toolSchema(`"keys":{"type":"array","items":{"type":"string","maxLength":24},"minItems":1,"maxItems":5},"repeat":{"type":"integer","minimum":1,"maximum":50}`, `"keys"`), "interactive"},
 	{ToolScroll, "在当前窗口或指定坐标处滚动滚轮，或使用 from_xy 与 to_xy 跨坐标拖拽。", toolSchema(`"direction":{"type":"string","enum":["up","down","left","right"]},"distance":{"type":"integer","minimum":1,"maximum":5000},"x":{"type":"integer","minimum":-32768,"maximum":32767},"y":{"type":"integer","minimum":-32768,"maximum":32767},"from_xy":{"type":"array","items":{"type":"integer"},"minItems":2,"maxItems":2},"to_xy":{"type":"array","items":{"type":"integer"},"minItems":2,"maxItems":2}`, ""), "interactive"},
 	{ToolLaunch, "全能应用、系统工具、绝对路径、快捷方式、文件夹与 URI 启动器，支持启动参数和管理员提权。", toolSchema(`"name_or_path":{"type":"string","maxLength":512},"args":{"type":"string","maxLength":2000},"cwd":{"type":"string","maxLength":512},"run_as_admin":{"type":"boolean"}`, `"name_or_path"`), "interactive"},
@@ -248,7 +249,7 @@ func ValidateTool(name string, data json.RawMessage) (GUIArgs, error) {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&args) != nil || decoder.Decode(new(any)) != io.EOF ||
-		(args.ElementID != nil && (*args.ElementID < 1 || *args.ElementID > 400)) ||
+		(args.ElementID != nil && (*args.ElementID < 1 || *args.ElementID > maxElementID)) ||
 		(args.X != nil && !validCoordinate(*args.X)) || (args.Y != nil && !validCoordinate(*args.Y)) {
 		return args, ErrToolArguments
 	}

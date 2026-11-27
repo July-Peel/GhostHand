@@ -79,7 +79,7 @@ func New(ctx context.Context, store *db.Store, dataDir string, cloudflare bool) 
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE devices SET conn_state='offline'
-			WHERE is_demo=0 AND conn_state IN ('online','unstable')`); err != nil {
+			WHERE id<>? AND is_demo=0 AND conn_state IN ('online','unstable')`, workbench.FreeChatDeviceID); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET state='queued' WHERE state='dispatched' AND
@@ -283,7 +283,7 @@ func (s *Service) Enroll(ctx context.Context, input proto.Enrollment, ip string)
 		var revoked bool
 		err := tx.QueryRowContext(ctx, `SELECT d.id, COALESCE(c.revoked_at IS NOT NULL, 0)
 			FROM devices d LEFT JOIN device_credentials c ON c.device_id=d.id
-			WHERE d.machine_id=? OR d.id=? LIMIT 1`, input.MachineID, deviceID).Scan(&existingID, &revoked)
+			WHERE d.id<>? AND (d.machine_id=? OR d.id=?) LIMIT 1`, workbench.FreeChatDeviceID, input.MachineID, deviceID).Scan(&existingID, &revoked)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}

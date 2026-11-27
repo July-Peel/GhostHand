@@ -121,7 +121,7 @@ func (s *Service) attach(ctx context.Context, conn *websocket.Conn, hello proto.
 		var capsHash string
 		var serverSeq, serverAck uint64
 		err = tx.QueryRowContext(ctx, `SELECT platform,caps_hash,conn_gen,agent_ack,controller_seq,controller_ack
-			FROM devices WHERE id=?`, p.id).Scan(&platform, &capsHash, &p.gen, &welcome.LastAck, &serverSeq, &serverAck)
+			FROM devices WHERE id=? AND id<>?`, p.id, workbench.FreeChatDeviceID).Scan(&platform, &capsHash, &p.gen, &welcome.LastAck, &serverSeq, &serverAck)
 		if err != nil {
 			return err
 		}

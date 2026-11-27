@@ -17,6 +17,7 @@ internal sealed class WindowsTools
     private readonly Dictionary<int, AutomationElement> elements = new();
     private IntPtr inspectedWindow;
     private DateTimeOffset inspectedAt;
+    private int nextElementId = Random.Shared.Next(1, int.MaxValue);
     private string? owningTask;
     private (IntPtr Handle, int ProcessId)? approvedEditor;
     private static readonly HashSet<string> NavigationKeys = new(StringComparer.OrdinalIgnoreCase)
@@ -35,7 +36,6 @@ internal sealed class WindowsTools
         {
             owningTask = task;
             approvedEditor = null;
-            Invalidate();
         }
         if (!DesktopCapture.IsDefaultDesktop())
         {
@@ -109,8 +109,7 @@ internal sealed class WindowsTools
         {
             approvedEditor = null;
         }
-        var usesElementId = args.TryGetProperty("element_id", out _);
-        if (usesElementId && !string.IsNullOrEmpty(expectedWindow) && expectedWindow != WindowId(target.Handle))
+        if (args.TryGetProperty("element_id", out _) && expectedWindow != WindowId(target.Handle))
         {
             throw new CaptureException("E_UI_INSPECT_AGAIN");
         }
@@ -176,8 +175,11 @@ internal sealed class WindowsTools
                 throw new CaptureException("E_CAP_UNSUPPORTED");
         }
 
-        Invalidate();
         var after = TryForeground() ?? target;
+        if (inspectedWindow != after.Handle)
+        {
+            Invalidate();
+        }
         return new
         {
             data = new
@@ -232,7 +234,9 @@ internal sealed class WindowsTools
                         if (filter.Length == 0 || info.Name.Contains(filter, StringComparison.OrdinalIgnoreCase) ||
                             role.Contains(filter, StringComparison.OrdinalIgnoreCase) || value.Contains(filter, StringComparison.OrdinalIgnoreCase))
                         {
-                            var id = items.Count + 1;
+                            // Keep IDs distinct across inspections so stale IDs cannot select new elements.
+                            var id = nextElementId;
+                            nextElementId = nextElementId == int.MaxValue ? 1 : nextElementId + 1;
                             var region = ScreenRegion.FromRect(Rect.Intersect(bounds, screen));
                             elements[id] = element;
                             items.Add(new

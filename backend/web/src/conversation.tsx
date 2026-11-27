@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { ClipboardEvent, DragEvent, FormEvent, KeyboardEvent } from 'react'
 import { useInfiniteQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Activity, ArrowLeft, ArrowUp, BatteryCharging, Camera, Check, ChevronDown, CircleAlert, Copy, Download, ImagePlus, Info, LoaderCircle, Send, Shield, Terminal, Trash2, X, Zap } from 'lucide-react'
-import { api, devicesKey, errorText, messagesKey } from './api'
+import { api, devicesKey, errorText, FREE_CHAT_ID, messagesKey } from './api'
 import type { Command, ConfirmCard, Device, MediaCard, Message, Session, StatusCard, TaskAction, TaskCard } from './api'
 import { Battery, Connection, Details, DeviceIcon, Panel, desktops } from './device-ui'
 import { BrowserExtensionSection, DeviceOperations } from './agent-ui'
@@ -39,6 +39,8 @@ export function Conversation({ device, commands, session, opened, back }: {
   opened: boolean
   back: () => void
 }) {
+  const isFreeChat = device.id === FREE_CHAT_ID
+  const chatBusy = isFreeChat && device.task_state !== 'idle'
   const [details, setDetails] = useState(false)
   const [confirmClear, setConfirmClear] = useState(false)
   const [draft, setDraft] = useState('')
@@ -64,7 +66,7 @@ export function Conversation({ device, commands, session, opened, back }: {
     getNextPageParam: page => page.has_older ? page.messages[0]?.id : undefined,
   })
   const messages = (history.data?.pages ?? []).slice().reverse().flatMap(page => page.messages)
-  const availableCommands = commands.filter(command => {
+  const availableCommands = isFreeChat ? [] : commands.filter(command => {
     if (device.is_demo) return command.capability !== 'screen.capture'
     return device.platform === 'windows' || command.capability === 'device.info'
   })
@@ -76,11 +78,12 @@ export function Conversation({ device, commands, session, opened, back }: {
   const send = useMutation({
     mutationFn: ({ text, images }: { text: string; images: PendingAttachment[] }) =>
       api.send(device.id, text, session.csrf_token, images.map(image => image.file)),
-    onSuccess: (_, { text, images }) => {
+    onSuccess: async (_, { text, images }) => {
       setDraft(current => current.trim() === text ? '' : current)
       setPendingImages(current => current.filter(image => !images.includes(image)))
       pinned.current = true
       void client.invalidateQueries({ queryKey: key })
+      if (isFreeChat) await client.invalidateQueries({ queryKey: devicesKey })
     },
   })
 
@@ -94,8 +97,16 @@ export function Conversation({ device, commands, session, opened, back }: {
 
   const clear = useMutation({
     mutationFn: () => api.clearMessages(device.id, session.csrf_token),
-    onSuccess: () => {
+    onSuccess: async () => {
       setConfirmClear(false)
+      if (isFreeChat) {
+        setDraft('')
+        setPendingImages([])
+        setImagePreview(null)
+        setImageError('')
+        send.reset()
+      }
+      await client.cancelQueries({ queryKey: key })
       client.setQueryData(key, { pages: [{ messages: [], has_older: false }], pageParams: [0] })
       void client.invalidateQueries({ queryKey: key })
       void client.invalidateQueries({ queryKey: devicesKey })
@@ -134,8 +145,8 @@ export function Conversation({ device, commands, session, opened, back }: {
 
   function submit(text: string) {
     const value = text.trim()
-    if ((!value && pendingImages.length === 0) || send.isPending || preparingRef.current) return
-    if (pendingImages.length > 0 && (value.startsWith('/') || commands.some(command => command.title === value))) {
+    if ((!value && pendingImages.length === 0) || send.isPending || clear.isPending || chatBusy || preparingRef.current) return
+    if (!isFreeChat && pendingImages.length > 0 && (value.startsWith('/') || commands.some(command => command.title === value))) {
       setImageError('快捷指令不支持携带图片，请直接发送文字指令或移除图片。')
       return
     }
@@ -145,7 +156,7 @@ export function Conversation({ device, commands, session, opened, back }: {
   }
 
   async function addImages(files: File[]) {
-    if (files.length === 0 || send.isPending) return
+    if (files.length === 0 || send.isPending || clear.isPending) return
     if (preparingRef.current) {
       setImageError('正在处理图片，请稍后再添加。')
       return
@@ -196,7 +207,7 @@ export function Conversation({ device, commands, session, opened, back }: {
   function dragImages(event: DragEvent<HTMLDivElement>) {
     if (!event.dataTransfer.types.includes('Files')) return
     event.preventDefault()
-    const blocked = send.isPending || preparing
+    const blocked = send.isPending || clear.isPending || preparing
     event.dataTransfer.dropEffect = blocked ? 'none' : 'copy'
     setDragging(!blocked)
   }
@@ -235,11 +246,12 @@ export function Conversation({ device, commands, session, opened, back }: {
         <DeviceIcon device={device} />
         <div className="chat-title">
           <div><h1>{device.name}</h1>{device.is_demo && <span className="demo-label">模拟设备</span>}</div>
-          <p><Connection state={device.conn_state} /><span className="title-divider" />{desktops[device.desktop_state]}</p>
+          {isFreeChat ? <p className="chat-model" title={device.os_version}>直连大模型 · {device.os_version}</p>
+            : <p><Connection state={device.conn_state} /><span className="title-divider" />{desktops[device.desktop_state]}</p>}
         </div>
         <div className="chat-header-actions">
-          {device.task_state === 'running' && <span className="active-task"><LoaderCircle size={14} className="spin" /> 执行中</span>}
-          {!device.is_demo && device.platform === 'windows' && (
+          {device.task_state === 'running' && <span className="active-task"><LoaderCircle size={14} className="spin" /> {isFreeChat ? '思考中' : '执行中'}</span>}
+          {!isFreeChat && !device.is_demo && device.platform === 'windows' && (
             <button
               type="button"
               className={'policy-toggle' + (device.auto_approve ? ' is-auto' : '')}
@@ -253,11 +265,11 @@ export function Conversation({ device, commands, session, opened, back }: {
               <span>{device.auto_approve ? '免确认' : '需确认'}</span>
             </button>
           )}
-          <Battery device={device} />
+          {!isFreeChat && <Battery device={device} />}
           <button
             type="button"
             className="header-clear-button"
-            title="清空当前设备的所有聊天记录并删除对应大模型会话"
+            title={isFreeChat ? '清空闲聊记录和图片，停止当前回复' : '清空当前设备的所有聊天记录并删除对应大模型会话'}
             aria-label="清空记录"
             disabled={clear.isPending}
             onClick={() => { clear.reset(); setConfirmClear(true) }}
@@ -265,7 +277,7 @@ export function Conversation({ device, commands, session, opened, back }: {
             <Trash2 size={14} />
             <span>清空记录</span>
           </button>
-          <button type="button" className="icon-button" title="设备详情" aria-label="设备详情" onClick={() => setDetails(true)}><Info size={19} /></button>
+          {!isFreeChat && <button type="button" className="icon-button" title="设备详情" aria-label="设备详情" onClick={() => setDetails(true)}><Info size={19} /></button>}
         </div>
       </header>
       <div
@@ -347,7 +359,7 @@ export function Conversation({ device, commands, session, opened, back }: {
                 }}
               />
               <button
-                type="button" className="icon-button attach-button" disabled={send.isPending || preparing}
+                type="button" className="icon-button attach-button" disabled={send.isPending || clear.isPending || preparing}
                 title="添加图片（也支持直接 Ctrl+V 粘贴）" aria-label="添加图片" onClick={() => fileInputRef.current?.click()}
               >
                 {preparing ? <LoaderCircle size={19} className="spin" /> : <ImagePlus size={19} />}
@@ -355,14 +367,14 @@ export function Conversation({ device, commands, session, opened, back }: {
               <textarea
                 ref={composerRef}
                 aria-label="消息内容" rows={2} maxLength={2000} value={draft}
-                placeholder="描述想在设备上完成的任务，或键入 / 查看指令"
+                placeholder={isFreeChat ? '输入想和大模型聊的内容，支持粘贴或上传图片…' : '描述想在设备上完成的任务，或键入 / 查看指令'}
                 onChange={event => { setDraft(event.target.value); dismissSlash(false); setImageError('') }}
                 onKeyDown={composerKey}
                 onPaste={pasteImages}
               />
               <button
                 type="submit" className="primary-button send-button" aria-label="发送消息"
-                disabled={(!draft.trim() && pendingImages.length === 0) || send.isPending || preparing}
+                disabled={(!draft.trim() && pendingImages.length === 0) || send.isPending || clear.isPending || chatBusy || preparing}
               >
                 {send.isPending ? <LoaderCircle size={18} className="spin" /> : <Send size={18} />}
               </button>
@@ -380,18 +392,20 @@ export function Conversation({ device, commands, session, opened, back }: {
         >
           <div className="confirm-panel-body">
             <p>确定要清空「{device.name}」的所有聊天记录吗？</p>
-            <p className="confirm-panel-note">对应的大模型会话也会被一并删除（进行中的 AI 任务会立即停止），此操作无法恢复。</p>
+            <p className="confirm-panel-note">{isFreeChat
+              ? '图片附件会一并删除，进行中的回复会停止。清空后无法恢复。'
+              : '对应的大模型会话也会被一并删除（进行中的 AI 任务会立即停止），此操作无法恢复。'}</p>
             {clear.isError && <p className="inline-error" role="alert"><CircleAlert size={15} />{errorText(clear.error)}</p>}
             <div className="confirm-panel-actions">
               <button type="button" className="secondary-button" disabled={clear.isPending} onClick={() => setConfirmClear(false)}>取消</button>
-              <button type="button" className="danger-button" disabled={clear.isPending} onClick={() => clear.mutate()}>
+              <button type="button" className="danger-button" disabled={clear.isPending || (isFreeChat && (send.isPending || preparing))} onClick={() => clear.mutate()}>
                 {clear.isPending ? <><LoaderCircle size={15} className="spin" /> 正在清空…</> : <><Trash2 size={15} /> 确认清空</>}
               </button>
             </div>
           </div>
         </Panel>
       )}
-      {details && <Details
+      {!isFreeChat && details && <Details
         key={device.id}
         device={device}
         csrf={session.csrf_token}

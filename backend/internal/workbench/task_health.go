@@ -212,13 +212,13 @@ func ApplyTaskHeartbeat(ctx context.Context, tx *sql.Tx, device string, payload 
 func (s *Service) nextStall(ctx context.Context) (*int64, error) {
 	var next *int64
 	err := s.store.QueryRowContext(ctx, `SELECT MIN(t.last_heartbeat_at+MAX(30000,t.step_timeout_ms)) FROM tasks t
-		JOIN devices d ON d.id=t.device_id WHERE d.is_demo=0 AND t.stalled=0 AND t.state IN `+runningTaskStates).Scan(&next)
+		JOIN devices d ON d.id=t.device_id WHERE d.is_demo=0 AND t.source<>'chat' AND t.stalled=0 AND t.state IN `+runningTaskStates).Scan(&next)
 	return next, err
 }
 
 func (s *Service) markStalled(ctx context.Context) error {
 	return s.store.Write(ctx, func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, `UPDATE tasks SET stalled=1 WHERE stalled=0 AND state IN `+runningTaskStates+`
+		rows, err := tx.QueryContext(ctx, `UPDATE tasks SET stalled=1 WHERE source<>'chat' AND stalled=0 AND state IN `+runningTaskStates+`
 			AND last_heartbeat_at+MAX(30000,step_timeout_ms)<=? AND device_id IN (SELECT id FROM devices WHERE is_demo=0)
 			RETURNING device_id`, time.Now().UnixMilli())
 		if err != nil {

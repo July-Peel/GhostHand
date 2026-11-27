@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Command } from 'cmdk'
 import { ChevronRight, LoaderCircle, LogOut, Monitor, Plus, Search, Settings } from 'lucide-react'
 import { create } from 'zustand'
-import { api, devicesKey, errorText, messagesKey, sessionKey } from './api'
+import { api, devicesKey, errorText, FREE_CHAT_ID, messagesKey, sessionKey } from './api'
 import type { Device, Session } from './api'
 import { Conversation } from './conversation'
 import { Battery, Connection, DeviceIcon, Panel } from './device-ui'
@@ -43,6 +43,7 @@ const useWorkspace = create<{
 }))
 
 function DeviceRow({ device, active, select }: { device: Device; active: boolean; select: () => void }) {
+  const isFreeChat = device.id === FREE_CHAT_ID
   return (
     <button
       className={'device-row' + (active ? ' is-active' : '')}
@@ -55,7 +56,7 @@ function DeviceRow({ device, active, select }: { device: Device; active: boolean
         <strong>{device.name}</strong>
         <span>{device.os_version}</span>
       </span>
-      <span className="device-row-state"><Connection state={device.conn_state} /><Battery device={device} /></span>
+      {!isFreeChat && <span className="device-row-state"><Connection state={device.conn_state} /><Battery device={device} /></span>}
       <ChevronRight className="row-chevron" size={15} aria-hidden="true" />
     </button>
   )
@@ -123,8 +124,15 @@ export function Workspace({ session, brand, themeButton, onPasswordChanged }: {
   const select = useWorkspace(state => state.select)
   const query = useQuery({ queryKey: devicesKey, queryFn: ({ signal }) => api.devices(signal) })
   const devices = query.data?.devices ?? []
-  const chosen = devices.find(device => device.id === selected)
-  const active = chosen ?? devices[0]
+  const freeChatStatus = query.data?.free_chat
+  const freeChat: Device | undefined = freeChatStatus?.enabled ? {
+    id: FREE_CHAT_ID, name: '随意闲聊', platform: 'chat', arch: '', os_version: freeChatStatus.model, group: '',
+    conn_state: 'offline', helper_state: 'none', desktop_state: 'headless', task_state: freeChatStatus.task_state,
+    battery_pct: null, charging: null, last_seen_at: 0, task_protocol: false, is_demo: false, auto_approve: false,
+  } : undefined
+  const firstDevice = devices[0]?.id
+  const chosen = selected === FREE_CHAT_ID ? freeChat : devices.find(device => device.id === selected)
+  const active = chosen ?? devices[0] ?? freeChat
   const online = devices.filter(device => device.conn_state === 'online').length
   const needle = filter.trim().toLowerCase()
   const groups = new Map<string, Device[]>()
@@ -147,6 +155,12 @@ export function Workspace({ session, brand, themeButton, onPasswordChanged }: {
   })
 
   useEvents()
+  useEffect(() => {
+    if (selected === FREE_CHAT_ID && freeChatStatus?.enabled === false) {
+      select(firstDevice ?? null)
+      if (firstDevice === undefined) saveLastDevice(null)
+    }
+  }, [selected, freeChatStatus?.enabled, firstDevice, select])
   useEffect(() => {
     function openPalette(event: KeyboardEvent) {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
@@ -196,7 +210,14 @@ export function Workspace({ session, brand, themeButton, onPasswordChanged }: {
           <div className="device-groups">
             {query.isPending && <p role="status" className="sidebar-note"><LoaderCircle size={16} className="spin" /> 正在加载设备</p>}
             {query.isError && <p className="sidebar-note" role="alert">{errorText(query.error)} <button className="text-button" onClick={() => void query.refetch()}>重试</button></p>}
-            {query.isSuccess && groups.size === 0 && <p className="sidebar-note">{devices.length ? '没有匹配的设备。' : '暂无设备。'}</p>}
+            {freeChat && (
+              <section className="device-group">
+                <DeviceRow device={freeChat} active={active?.id === FREE_CHAT_ID} select={() => select(FREE_CHAT_ID)} />
+              </section>
+            )}
+            {query.isSuccess && groups.size === 0 && (devices.length > 0 || !freeChat) && (
+              <p className="sidebar-note">{devices.length ? '没有匹配的设备。' : '暂无设备。'}</p>
+            )}
             {[...groups].map(([group, items]) => (
               <section key={group} className="device-group">
                 <h2>{group}</h2>

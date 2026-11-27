@@ -18,9 +18,11 @@ type webDAVSettings struct {
 }
 
 type llmSettings struct {
-	BaseURL string `json:"base_url"`
-	Model   string `json:"model"`
-	APIKey  string `json:"api_key"`
+	BaseURL             string `json:"base_url"`
+	Model               string `json:"model"`
+	APIKey              string `json:"api_key"`
+	Instructions        string `json:"instructions"`
+	DefaultInstructions string `json:"default_instructions"`
 }
 
 func (s *Server) getSettings(w http.ResponseWriter, r *http.Request, _ auth.Session, _ string) {
@@ -36,7 +38,10 @@ func (s *Server) getSettings(w http.ResponseWriter, r *http.Request, _ auth.Sess
 		LLM    llmSettings    `json:"llm"`
 	}{
 		WebDAV: webDAVSettings{URL: dav.Endpoint, Username: dav.Label, Password: dav.Secret},
-		LLM:    llmSettings{BaseURL: llm.Endpoint, Model: llm.Label, APIKey: llm.Secret},
+		LLM: llmSettings{
+			BaseURL: llm.Endpoint, Model: llm.Label, APIKey: llm.Secret,
+			Instructions: brain.ResolveInstructions(llm.Instructions), DefaultInstructions: brain.DefaultInstructions,
+		},
 	})
 }
 
@@ -55,13 +60,14 @@ func (s *Server) saveWebDAV(w http.ResponseWriter, r *http.Request, session auth
 
 func (s *Server) saveLLM(w http.ResponseWriter, r *http.Request, session auth.Session, _ string) {
 	var input struct {
-		BaseURL string  `json:"base_url"`
-		Model   string  `json:"model"`
-		APIKey  *string `json:"api_key"`
+		BaseURL      string  `json:"base_url"`
+		Model        string  `json:"model"`
+		APIKey       *string `json:"api_key"`
+		Instructions *string `json:"instructions"`
 	}
-	if readJSON(w, r, &input) {
+	if readJSONLimited(w, r, &input, 256<<10) {
 		s.saveSettings(w, r, session.UserID, settings.LLM, settings.Update{
-			Endpoint: input.BaseURL, Label: input.Model, Secret: input.APIKey,
+			Endpoint: input.BaseURL, Label: input.Model, Secret: input.APIKey, Instructions: input.Instructions,
 		})
 	}
 }
@@ -106,6 +112,9 @@ func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request, userID int
 	case err != nil:
 		internalError(w, r, err)
 	default:
+		if kind == settings.LLM {
+			s.workbench.MarkRefresh()
+		}
 		w.WriteHeader(http.StatusNoContent)
 	}
 }

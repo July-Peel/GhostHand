@@ -272,12 +272,25 @@ func (s *Service) deleteAttachmentFiles(ctx context.Context, files AttachmentFil
 	}
 }
 
+func (s *Service) deletePendingChatAttachment(ctx context.Context, files AttachmentFiles) error {
+	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 8*time.Second)
+	defer cancel()
+	if err := s.removeAttachmentFiles(cleanup, files); err != nil {
+		return err
+	}
+	return s.store.Write(cleanup, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(cleanup, "DELETE FROM chat_attachment_deletions WHERE id=?", files.ID)
+		return err
+	})
+}
+
 func (s *Service) Attachment(ctx context.Context, id string, thumb bool) (io.ReadCloser, string, error) {
 	var name, kind, key, thumbKey string
 	var ref []byte
 	err := s.store.QueryRowContext(ctx, `SELECT a.name,a.storage_backend,a.storage_key,a.thumb_key,a.storage_ref
 		FROM attachments a JOIN tasks t ON t.id=a.task_id WHERE a.id=? AND
-		(a.upload_id`+userUploadIDs+` OR t.state='succeeded' OR EXISTS(SELECT 1 FROM brain_calls b WHERE b.id=a.upload_id AND b.task_id=t.id
+		(a.upload_id`+userUploadIDs+` OR (t.source='chat' AND a.upload_id GLOB 'chat_*')
+		OR t.state='succeeded' OR EXISTS(SELECT 1 FROM brain_calls b WHERE b.id=a.upload_id AND b.task_id=t.id
 			AND json_extract(b.result_json,'$.attachment_id')=a.id))`, id).Scan(&name, &kind, &key, &thumbKey, &ref)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, "", ErrTaskNotFound

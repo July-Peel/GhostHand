@@ -18,7 +18,7 @@ import (
 	"ghosthand/proto"
 )
 
-const Instructions = `你是 GhostHand 的全权限 Windows 节点智能体（拥有管理员 High Integrity 与 SYSTEM 完整系统权限）。
+const DefaultInstructions = `你是 GhostHand 的全权限 Windows 节点智能体（拥有管理员 High Integrity 与 SYSTEM 完整系统权限）。
 你同时具备「系统枝干工具」（shell_exec / script_run / process_list / process_manage / fs_list / fs_read / fs_write / device_power_screen）和「视觉眼睛与 GUI 手脚工具」（screen_observe / ui_inspect / window_list / window_control / app_launch / terminal_open / ui_click / ui_input_text / ui_press_key / ui_scroll_swipe / clipboard_manage）。
 
 执行准则：
@@ -60,10 +60,16 @@ type Observation struct {
 	Error bool
 }
 
+type Message struct {
+	Role string `json:"role"`
+	Text string `json:"content"`
+}
+
 type Session struct {
 	endpoint       string
 	key            string
 	model          string
+	instructions   string
 	tools          []responseTool
 	names          map[string]string
 	input          []any
@@ -71,6 +77,25 @@ type Session struct {
 	userImages     []map[string]any
 	outputRounds   [][]map[string]any
 	returnedRounds int
+}
+
+func ResolveInstructions(custom string) string {
+	if custom = strings.TrimSpace(custom); custom != "" {
+		return custom
+	}
+	return DefaultInstructions
+}
+
+func (s *Session) SetInstructions(instructions string) {
+	s.instructions = instructions
+}
+
+func (s *Session) PrependHistory(history []Message) {
+	input := make([]any, 0, len(history)+len(s.input))
+	for _, message := range history {
+		input = append(input, message)
+	}
+	s.input = append(input, s.input...)
 }
 
 type responseTool struct {
@@ -245,8 +270,11 @@ type responseOutput struct {
 
 func (s *Session) Next(ctx context.Context) (Turn, error) {
 	request := map[string]any{
-		"model": s.model, "instructions": Instructions, "input": s.input,
-		"tools": s.tools, "store": false, "include": []string{"reasoning.encrypted_content"},
+		"model": s.model, "instructions": ResolveInstructions(s.instructions), "input": s.input,
+		"store": false, "include": []string{"reasoning.encrypted_content"},
+	}
+	if len(s.tools) > 0 {
+		request["tools"] = s.tools
 	}
 	var result responseOutput
 	err := requestJSON(ctx, http.MethodPost, s.endpoint, s.key, request, &result)

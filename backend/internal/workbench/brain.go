@@ -27,6 +27,7 @@ const imageAnalysisPrompt = "请分析用户上传的图片，并根据图片内
 
 type brainTask struct {
 	id, device, prompt, title, source string
+	user                              int64
 	quiet                             bool
 }
 
@@ -91,27 +92,36 @@ func (s *Service) RunBrain(ctx context.Context) {
 		slog.Error("recover AI tasks", "error", err)
 	}
 	slots := make(chan struct{}, 8)
+	// A server-side chat can wait on an MCP task that needs a device worker.
+	chatSlot := make(chan struct{}, 1)
 	slotFreed := make(chan struct{}, 1)
 	for ctx.Err() == nil {
 		changed := s.store.Changed()
 		retry := false
-		if len(slots) < cap(slots) {
+		deviceReady, chatReady := len(slots) < cap(slots), len(chatSlot) == 0
+		if deviceReady || chatReady {
 			var task brainTask
-			err := s.store.QueryRowContext(ctx, `SELECT id,device_id,prompt,title,source FROM tasks
-				WHERE source IN ('brain','mcp') AND state='running' AND control='' AND brain_started_at IS NULL
-				ORDER BY created_at,id LIMIT 1`).Scan(&task.id, &task.device, &task.prompt, &task.title, &task.source)
+			err := s.store.QueryRowContext(ctx, `SELECT id,device_id,prompt,title,source,created_by FROM tasks
+				WHERE ((source IN ('brain','mcp') AND ?) OR (source='chat' AND ?))
+				AND state='running' AND control='' AND brain_started_at IS NULL
+				ORDER BY created_at,id LIMIT 1`, deviceReady, chatReady).
+				Scan(&task.id, &task.device, &task.prompt, &task.title, &task.source, &task.user)
 			if err == nil {
 				claimed, err := s.claimBrain(ctx, task.id)
 				if err != nil {
 					slog.Error("claim AI task", "error", err)
 					retry = true
 				} else if claimed {
-					slots <- struct{}{}
+					pool := slots
+					if task.source == "chat" {
+						pool = chatSlot
+					}
+					pool <- struct{}{}
 					workers.Add(1)
 					go func() {
 						defer workers.Done()
 						defer func() {
-							<-slots
+							<-pool
 							select {
 							case slotFreed <- struct{}{}:
 							default:
@@ -165,18 +175,14 @@ func (s *Service) claimBrain(ctx context.Context, id string) (bool, error) {
 
 func (s *Service) recoverBrain(ctx context.Context) error {
 	rows, err := s.store.QueryContext(ctx, `SELECT id,device_id,source,created_by FROM tasks
-		WHERE (source='brain' AND brain_started_at IS NOT NULL AND state IN ('running','paused','waiting_user'))
+		WHERE (source IN ('brain','chat') AND brain_started_at IS NOT NULL AND state IN ('running','paused','waiting_user'))
 		OR (source='mcp' AND state IN ('queued','dispatched','running','paused','waiting_user') AND created_at<?)`, time.Now().UnixMilli())
 	if err != nil {
 		return err
 	}
-	type recoveryTask struct {
-		brainTask
-		user int64
-	}
-	var tasks []recoveryTask
+	var tasks []brainTask
 	for rows.Next() {
-		var t recoveryTask
+		var t brainTask
 		if err := rows.Scan(&t.id, &t.device, &t.source, &t.user); err != nil {
 			rows.Close()
 			return err
@@ -194,7 +200,11 @@ func (s *Service) recoverBrain(ctx context.Context) error {
 			}
 			continue
 		}
-		if err := s.finishBrain(ctx, t.brainTask, "控制端重启，任务已停止。请核对设备上的实际结果。", proto.Failed); err != nil {
+		message := "控制端重启，任务已停止。请核对设备上的实际结果。"
+		if t.source == "chat" {
+			message = "服务重启，上一轮回复已中断。"
+		}
+		if err := s.finishBrain(ctx, t, message, proto.Failed); err != nil {
 			return err
 		}
 	}
@@ -251,9 +261,15 @@ func (s *Service) runBrain(parent context.Context, task brainTask) {
 	s.registerBrainSession(task.device, task.id, cancel)
 	defer s.unregisterBrainSession(task.device, task.id)
 	go s.watchBrain(ctx, cancel, task.id)
-	unlock := taskUnlock{service: s, task: task}
-	defer unlock.finish(parent)
-	reply, err := s.runLoop(ctx, task, &unlock)
+	var reply string
+	var err error
+	if task.source == "chat" {
+		reply, err = s.runFreeChat(ctx, task)
+	} else {
+		unlock := taskUnlock{service: s, task: task}
+		defer unlock.finish(parent)
+		reply, err = s.runLoop(ctx, task, &unlock)
+	}
 	if parent.Err() != nil {
 		return
 	}
@@ -268,6 +284,9 @@ func (s *Service) runBrain(parent context.Context, task brainTask) {
 		}
 		if errors.Is(err, context.DeadlineExceeded) {
 			reply = "AI 任务超时。请核对设备上的实际结果。"
+			if task.source == "chat" {
+				reply = "等待回复或确认超时，请重试。"
+			}
 		}
 	}
 	if strings.TrimSpace(reply) == "" {
@@ -306,8 +325,8 @@ func checkBrainReady(ctx context.Context, q brainStateQuery, id string) error {
 	var state proto.TaskState
 	var control string
 	var ready bool
-	err := q.QueryRowContext(ctx, `SELECT t.state,t.control,t.stalled=0 AND d.task_protocol>=2 AND d.conn_state IN ('online','unstable')
-		AND EXISTS(SELECT 1 FROM device_sessions x WHERE x.device_id=d.id AND x.conn_gen=d.conn_gen AND x.disconnected_at IS NULL)
+	err := q.QueryRowContext(ctx, `SELECT t.state,t.control,t.source='chat' OR (t.stalled=0 AND d.task_protocol>=2 AND d.conn_state IN ('online','unstable')
+		AND EXISTS(SELECT 1 FROM device_sessions x WHERE x.device_id=d.id AND x.conn_gen=d.conn_gen AND x.disconnected_at IS NULL))
 		FROM tasks t JOIN devices d ON d.id=t.device_id WHERE t.id=?`, id).Scan(&state, &control, &ready)
 	if errors.Is(err, sql.ErrNoRows) || (err == nil && !brainActive(state)) {
 		return errBrainInactive
@@ -397,6 +416,7 @@ func (s *Service) runLoop(ctx context.Context, task brainTask, unlock *taskUnloc
 		return "", err
 	}
 	defer session.Clear()
+	session.SetInstructions(config.Instructions)
 	step, attempts := 0, 0
 	var observedWindow toolWindow
 	for round := 0; round <= brain.MaxSteps; round++ {

@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"ghosthand/proto"
 )
@@ -22,15 +24,74 @@ func mcpTTL(tool string, args json.RawMessage, quiet bool) time.Duration {
 }
 
 type MCPDevice struct {
-	ID    string          `json:"id"`
-	Name  string          `json:"name"`
-	State proto.ConnState `json:"conn_state"`
+	Device
+	MCPReady bool `json:"mcp_ready"`
+}
+
+type mcpWindow struct {
+	toolWindow
+	generation int64
 }
 
 type mcpCommand struct {
-	Tool  string          `json:"tool"`
-	Args  json.RawMessage `json:"arguments"`
-	Quiet bool            `json:"quiet,omitempty"`
+	Tool     string          `json:"tool"`
+	Args     json.RawMessage `json:"arguments"`
+	Quiet    bool            `json:"quiet,omitempty"`
+	FromChat bool            `json:"from_chat,omitempty"`
+	Approved bool            `json:"approved,omitempty"`
+}
+
+var MCPDevicesTool = proto.MCPTool{
+	Name: "devices_list", Description: "列出所有已接入服务端的设备及其在线状态、系统版本、桌面锁屏状态与可执行能力。",
+	InputSchema: json.RawMessage(`{"type":"object","additionalProperties":false}`), RiskLevel: "read_only",
+}
+
+// AddressedMCPTool adds the server's routing field to the node's tool schema.
+func AddressedMCPTool(tool proto.MCPTool, requireDevice bool) proto.MCPTool {
+	var schema struct {
+		Type                 string                     `json:"type"`
+		Properties           map[string]json.RawMessage `json:"properties"`
+		Required             []string                   `json:"required,omitempty"`
+		AdditionalProperties bool                       `json:"additionalProperties"`
+	}
+	if err := json.Unmarshal(tool.InputSchema, &schema); err != nil {
+		panic(err) // DeviceTools schemas are defined in the local protocol.
+	}
+	if schema.Properties == nil {
+		schema.Properties = make(map[string]json.RawMessage)
+	}
+	schema.Properties["device_id"] = json.RawMessage(`{"type":"string","minLength":1,"maxLength":80,"description":"设备 ID 或唯一设备名称"}`)
+	if requireDevice {
+		schema.Required = append(schema.Required, "device_id")
+	}
+	tool.InputSchema, _ = json.Marshal(schema)
+	return tool
+}
+
+var ErrMCPDeviceAmbiguous = errors.New("设备名称不唯一，请改用设备 ID。")
+var errMCPDeviceArgument = errors.New("请填写有效的 device_id。")
+
+func MCPArguments(raw json.RawMessage, defaultDevice string) (string, json.RawMessage, error) {
+	if len(raw) == 0 {
+		raw = json.RawMessage(`{}`)
+	}
+	var args map[string]json.RawMessage
+	if len(raw) > proto.MaxToolArgsSize+1024 || json.Unmarshal(raw, &args) != nil || args == nil {
+		return "", nil, proto.ErrToolArguments
+	}
+	device := defaultDevice
+	if value, exists := args["device_id"]; exists {
+		device = ""
+		if json.Unmarshal(value, &device) != nil {
+			return "", nil, errMCPDeviceArgument
+		}
+		delete(args, "device_id")
+	}
+	if strings.TrimSpace(device) == "" || utf8.RuneCountInString(device) > 80 {
+		return "", nil, errMCPDeviceArgument
+	}
+	argsJSON, err := json.Marshal(args)
+	return device, argsJSON, err
 }
 
 func IsMCPToolAllowed(tool string) bool {
@@ -50,11 +111,13 @@ func IsMCPReadTool(tool string) bool {
 }
 
 func (s *Service) MCPDevices(ctx context.Context) ([]MCPDevice, error) {
-	rows, err := s.store.QueryContext(ctx, `SELECT d.id,d.name,d.conn_state FROM devices d
+	rows, err := s.store.QueryContext(ctx, `SELECT `+deviceFields+`,
+		d.task_protocol>=2 AND d.conn_state IN ('online','unstable') AND json_array_length(d.mcp_tools)>0
+		FROM devices d
 		JOIN device_credentials c ON c.device_id=d.id
-		WHERE d.is_demo=0 AND d.task_protocol>=2 AND c.revoked_at IS NULL
-		AND d.conn_state IN ('online','unstable') AND json_array_length(d.mcp_tools)>0
-		ORDER BY d.name,d.id`)
+		WHERE d.is_demo=0 AND d.id<>? AND c.revoked_at IS NULL
+		ORDER BY CASE d.conn_state WHEN 'online' THEN 0 WHEN 'unstable' THEN 1 WHEN 'sleeping' THEN 2 ELSE 3 END,
+			d.group_name,d.name,d.id`, FreeChatDeviceID)
 	if err != nil {
 		return nil, err
 	}
@@ -62,7 +125,7 @@ func (s *Service) MCPDevices(ctx context.Context) ([]MCPDevice, error) {
 	devices := []MCPDevice{}
 	for rows.Next() {
 		var device MCPDevice
-		if err := rows.Scan(&device.ID, &device.Name, &device.State); err != nil {
+		if err := scanDeviceFields(rows, &device.Device, &device.MCPReady); err != nil {
 			return nil, err
 		}
 		devices = append(devices, device)
@@ -74,7 +137,7 @@ func (s *Service) MCPCapabilities(ctx context.Context, device string) ([]proto.M
 	var toolsJSON, resourcesJSON string
 	err := s.store.QueryRowContext(ctx, `SELECT d.mcp_tools,d.mcp_resources FROM devices d
 		JOIN device_credentials c ON c.device_id=d.id
-		WHERE d.id=? AND d.is_demo=0 AND c.revoked_at IS NULL`, device).Scan(&toolsJSON, &resourcesJSON)
+		WHERE d.id=? AND d.id<>? AND d.is_demo=0 AND c.revoked_at IS NULL`, device, FreeChatDeviceID).Scan(&toolsJSON, &resourcesJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil, ErrDeviceNotFound
 	}
@@ -94,7 +157,7 @@ func (s *Service) MCPCapabilities(ctx context.Context, device string) ([]proto.M
 
 // CallMCP uses the same serialized desktop lane, local stop controls and audit trail as chat.
 func (s *Service) CallMCP(ctx context.Context, user int64, device, tool string, args json.RawMessage) (proto.MCPResult, error) {
-	return s.callMCP(ctx, user, device, tool, args, "")
+	return s.callMCP(ctx, user, device, mcpCommand{Tool: tool, Args: args}, "")
 }
 
 func (s *Service) CallBrowserExtension(ctx context.Context, user int64, device, action string) (proto.MCPResult, error) {
@@ -102,28 +165,60 @@ func (s *Service) CallBrowserExtension(ctx context.Context, user int64, device, 
 		return proto.MCPResult{}, ErrUnsupported
 	}
 	args, _ := json.Marshal(map[string]string{"action": action, "browser": "chrome"})
-	return s.callMCP(ctx, user, device, proto.ToolBrowserManage, args, "browser_ext."+action)
+	return s.callMCP(ctx, user, device, mcpCommand{Tool: proto.ToolBrowserManage, Args: args, Quiet: true}, "browser_ext."+action)
 }
 
-func (s *Service) callMCP(ctx context.Context, user int64, device, tool string, args json.RawMessage, auditAction string) (proto.MCPResult, error) {
+func resolveMCPDevice(ctx context.Context, q brainStateQuery, target string) (string, error) {
+	var device string
+	var matches int
+	err := q.QueryRowContext(ctx, `SELECT d.id,COUNT(*) OVER () FROM devices d
+		JOIN device_credentials c ON c.device_id=d.id
+		WHERE d.id<>? AND d.is_demo=0 AND c.revoked_at IS NULL
+		AND (d.id=? OR (d.name=? AND NOT EXISTS(SELECT 1 FROM devices WHERE id=?)))
+		ORDER BY d.id LIMIT 1`, FreeChatDeviceID, target, target, target).Scan(&device, &matches)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrDeviceNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	if matches > 1 {
+		return "", ErrMCPDeviceAmbiguous
+	}
+	return device, nil
+}
+
+func (s *Service) MCPDeviceID(ctx context.Context, target string) (string, error) {
+	return resolveMCPDevice(ctx, s.store, target)
+}
+
+func (s *Service) callMCP(ctx context.Context, user int64, target string, command mcpCommand, auditAction string) (proto.MCPResult, error) {
 	var result proto.MCPResult
+	tool, args, quiet := command.Tool, command.Args, command.Quiet
 	if !IsMCPToolAllowed(tool) {
 		return result, ErrUnsupported
 	}
 	if _, err := proto.ValidateTool(tool, args); err != nil {
 		return result, err
 	}
-	quiet := auditAction != ""
 	ttl := mcpTTL(tool, args, quiet)
+	device := target
 	var taskID string
 	err := s.store.Write(ctx, func(tx *sql.Tx) error {
+		var err error
+		if !command.FromChat && !quiet {
+			device, err = resolveMCPDevice(ctx, tx, target)
+			if err != nil {
+				return err
+			}
+		}
 		var available, busy bool
-		err := tx.QueryRowContext(ctx, `SELECT d.task_protocol>=2 AND d.conn_state IN ('online','unstable')
+		err = tx.QueryRowContext(ctx, `SELECT d.task_protocol>=2 AND d.conn_state IN ('online','unstable')
 			AND EXISTS (SELECT 1 FROM json_each(d.mcp_tools) WHERE json_extract(value,'$.name')=?),
 			EXISTS (SELECT 1 FROM tasks WHERE device_id=d.id AND (source='mcp' OR (? AND lane='ui'))
 				AND state IN ('queued','dispatched','running','paused','waiting_user','cancelling'))
 			FROM devices d JOIN device_credentials c ON c.device_id=d.id
-			WHERE d.id=? AND d.is_demo=0 AND c.revoked_at IS NULL`, tool, quiet, device).Scan(&available, &busy)
+			WHERE d.id=? AND d.id<>? AND d.is_demo=0 AND c.revoked_at IS NULL`, tool, quiet, device, FreeChatDeviceID).Scan(&available, &busy)
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrDeviceNotFound
 		}
@@ -136,11 +231,11 @@ func (s *Service) callMCP(ctx context.Context, user int64, device, tool string, 
 		if busy {
 			return ErrTaskControl
 		}
-		command, err := json.Marshal(mcpCommand{Tool: tool, Args: args, Quiet: quiet})
+		body, err := json.Marshal(command)
 		if err != nil {
 			return err
 		}
-		taskID, err = insertTask(ctx, tx, user, Device{ID: device}, brainCommand, string(command), "mcp",
+		taskID, err = insertTask(ctx, tx, user, Device{ID: device}, brainCommand, string(body), "mcp",
 			"MCP · "+toolLabel(tool), time.Now(), ttl, quiet)
 		if err != nil {
 			return err
@@ -205,14 +300,39 @@ func (s *Service) runMCP(parent context.Context, task brainTask) {
 	defer s.unregisterBrainSession(task.device, task.id)
 	go s.watchBrain(ctx, cancel, task.id)
 	state, message := proto.Failed, "外部 MCP 调用失败。"
-	if valid && IsMCPToolAllowed(command.Tool) {
-		attempt := 1
-		result, err := s.callDevice(ctx, task, 1, attempt, command.Tool, command.Args, toolLabel(command.Tool), "", true)
-		if err == nil {
-			result, err = unlock.retry(ctx, result, 1, &attempt, command.Tool, command.Args, toolLabel(command.Tool), "", true)
+	args, argsErr := proto.ValidateTool(command.Tool, command.Args)
+	if valid && argsErr == nil && IsMCPToolAllowed(command.Tool) {
+		window := s.mcpObservedWindow(ctx, task.device)
+		expected := ""
+		if (command.Tool == proto.ToolClick || command.Tool == proto.ToolInput) && args.ElementID != nil {
+			expected = window.ID
+			if expected == "" {
+				// An element ID without an observation must never match a helper's cached elements.
+				expected = "unobserved"
+			}
 		}
-		if err == nil && result.Error == "" {
-			state, message = proto.Succeeded, "外部 MCP 调用已完成。"
+		approved := !command.FromChat || command.Approved || s.deviceAutoApprove(ctx, task.device)
+		attempt := 1
+		label := toolLabel(command.Tool)
+		result, err := s.callDevice(ctx, task, 1, attempt, command.Tool, command.Args, label, expected, approved)
+		if err == nil {
+			result, err = unlock.retry(ctx, result, 1, &attempt, command.Tool, command.Args, label, expected, approved)
+		}
+		if err == nil {
+			window.toolWindow = nextToolWindow(window.toolWindow, command.Tool, result)
+			s.mcpWindowMu.Lock()
+			if window.ID == "" {
+				delete(s.mcpWindows, task.device)
+			} else {
+				if s.mcpWindows == nil {
+					s.mcpWindows = make(map[string]mcpWindow)
+				}
+				s.mcpWindows[task.device] = window
+			}
+			s.mcpWindowMu.Unlock()
+			if result.Error == "" {
+				state, message = proto.Succeeded, "外部 MCP 调用已完成。"
+			}
 		}
 	}
 	if parent.Err() != nil {
@@ -221,6 +341,19 @@ func (s *Service) runMCP(parent context.Context, task brainTask) {
 	if err := s.completeBrain(ctx, parent, task, message, state); err != nil {
 		slog.Error("finish MCP task", "task", task.id, "error", err)
 	}
+}
+
+func (s *Service) mcpObservedWindow(ctx context.Context, device string) mcpWindow {
+	var generation int64
+	if err := s.store.QueryRowContext(ctx, "SELECT conn_gen FROM devices WHERE id=?", device).Scan(&generation); err != nil {
+		return mcpWindow{}
+	}
+	s.mcpWindowMu.Lock()
+	defer s.mcpWindowMu.Unlock()
+	if window := s.mcpWindows[device]; window.generation == generation {
+		return window
+	}
+	return mcpWindow{generation: generation}
 }
 
 func (s *Service) MCPImage(ctx context.Context, attachmentID string) ([]byte, error) {

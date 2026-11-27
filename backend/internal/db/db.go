@@ -42,6 +42,9 @@ var m47Schema string
 //go:embed m48.sql
 var m48Schema string
 
+//go:embed m49.sql
+var m49Schema string
+
 type Mutation func(*sql.Tx) error
 
 type writeRequest struct {
@@ -121,7 +124,7 @@ func migrate(ctx context.Context, writer *sql.DB) error {
 	if err := tx.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
-	if version < 0 || version > 9 {
+	if version < 0 || version > 10 {
 		return fmt.Errorf("unsupported SQLite schema version %d", version)
 	}
 	if version == 0 {
@@ -193,6 +196,14 @@ func migrate(ctx context.Context, writer *sql.DB) error {
 			return err
 		}
 	}
+	if version < 10 {
+		if _, err := tx.ExecContext(ctx, m49Schema); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, "PRAGMA user_version=10"); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 
@@ -227,6 +238,13 @@ func (s *Store) Changed() <-chan struct{} {
 	return s.changed
 }
 
+func (s *Store) Notify() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	close(s.changed)
+	s.changed = make(chan struct{})
+}
+
 func (s *Store) writeLoop() {
 	defer close(s.done)
 	for {
@@ -236,10 +254,7 @@ func (s *Store) writeLoop() {
 		case request := <-s.writes:
 			err := s.apply(request)
 			if err == nil {
-				s.mu.Lock()
-				close(s.changed)
-				s.changed = make(chan struct{})
-				s.mu.Unlock()
+				s.Notify()
 			}
 			request.result <- err
 		}

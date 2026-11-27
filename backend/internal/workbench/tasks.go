@@ -17,7 +17,7 @@ const ForceCancelDelay = 5 * time.Second
 const eligibleTasks = `
 	FROM tasks t
 	JOIN devices d ON d.id=t.device_id
-	WHERE d.is_demo=0 AND (
+	WHERE d.is_demo=0 AND t.source<>'chat' AND (
 		(t.state IN ('queued','dispatched') AND t.expires_at<=?)
 		OR (t.state='queued' AND d.task_protocol>=1 AND (t.source NOT IN ('brain','mcp') OR (d.task_protocol>=2 AND json_array_length(d.mcp_tools)>0))
 			AND d.conn_state IN ('online','unstable')
@@ -49,7 +49,7 @@ func (s *Service) RunTasks(ctx context.Context) {
 			err = s.store.QueryRowContext(ctx, `SELECT MIN(CASE WHEN r.relock_until>? AND t.state='queued'
 				THEN MIN(t.expires_at,r.relock_until) ELSE t.expires_at END)
 				FROM tasks t JOIN devices d ON d.id=t.device_id LEFT JOIN device_rdp_credentials r ON r.device_id=t.device_id
-				WHERE d.is_demo=0 AND t.state IN ('queued','dispatched')`, now).Scan(&next)
+				WHERE d.is_demo=0 AND t.source<>'chat' AND t.state IN ('queued','dispatched')`, now).Scan(&next)
 		}
 		if err == nil {
 			var stall *int64
@@ -156,6 +156,9 @@ func RequeueUnacknowledged(ctx context.Context, tx *sql.Tx, device string) error
 }
 
 func (s *Service) Control(ctx context.Context, userID int64, device, task, action string) error {
+	if device == FreeChatDeviceID {
+		return ErrTaskControl
+	}
 	var images []storedImage
 	if action == "retry" {
 		var err error

@@ -79,8 +79,8 @@ func TestMCPGatewayExposesAllToolsAndResources(t *testing.T) {
 
 	toolsResp := callMCP("tools/list")
 	toolsList := toolsResp["result"].(map[string]any)["tools"].([]any)
-	if len(toolsList) != len(proto.DeviceTools) {
-		t.Fatalf("exposed MCP tools = %d, want %d", len(toolsList), len(proto.DeviceTools))
+	if len(toolsList) != len(proto.DeviceTools)+1 {
+		t.Fatalf("exposed MCP tools = %d, want %d including devices_list", len(toolsList), len(proto.DeviceTools)+1)
 	}
 
 	resResp := callMCP("resources/list")

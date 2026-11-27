@@ -2,7 +2,7 @@ import { useState } from 'react'
 import type { FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Bot, HardDrive, KeyRound, Plug } from 'lucide-react'
-import { api, errorText, settingsKey } from './api'
+import { api, devicesKey, errorText, settingsKey } from './api'
 import type { Session, SystemSettings } from './api'
 import { Panel } from './device-ui'
 
@@ -85,7 +85,7 @@ function MCPForm({ csrf }: { csrf: string }) {
       <h3>MCP 访问令牌</h3>
       <p className="settings-hint">外部 MCP 客户端可通过此令牌调用设备工具（包括状态读取、屏幕截图、键鼠控制、Shell/脚本执行及文件读写）。</p>
       <label>Streamable HTTP 地址<input readOnly value={new URL('/api/mcp', window.location.origin).href} /></label>
-      <p className="settings-hint">在客户端设置 Authorization 请求头，值为 Bearer 加空格和令牌。加上 ?device=设备ID 可直连一台设备。</p>
+      <p className="settings-hint">在客户端设置 Authorization 请求头，值为 Bearer 加空格和令牌。用 devices_list 查看设备，调用时传入 device_id，或在地址中加上 ?device=设备ID 指定默认设备。</p>
       {status.isPending && <p className="settings-hint" role="status">正在读取令牌状态…</p>}
       {status.isError && <p className="inline-error" role="alert">{errorText(status.error)} <button type="button" className="text-button" onClick={() => void status.refetch()}>重试</button></p>}
       {status.isSuccess && <p className="settings-hint" role="status">{active ? '令牌已启用。重新生成会使旧令牌失效。' : '尚未生成令牌。'}</p>}
@@ -197,9 +197,11 @@ function WebDAVForm({ initial, token }: { initial: SystemSettings['webdav']; tok
 }
 
 function ModelForm({ initial, token }: { initial: SystemSettings['llm']; token: string }) {
+  const client = useQueryClient()
   const [url, setURL] = useState(initial.base_url)
   const [key, setKey] = useState(initial.api_key)
   const [model, setModel] = useState(initial.model)
+  const [instructions, setInstructions] = useState(initial.instructions)
   const [models, setModels] = useState<string[] | null>(null)
   const [pending, setPending] = useState<'list' | 'save' | null>(null)
   const [feedback, setFeedback] = useState<Feedback | null>(null)
@@ -230,13 +232,17 @@ function ModelForm({ initial, token }: { initial: SystemSettings['llm']; token: 
     setPending('save')
     setFeedback(null)
     try {
-      await api.saveLLM(endpoint, endpoint ? model : '', endpoint ? key : '', token)
+      const custom = instructions.trim()
+      await api.saveLLM(endpoint, endpoint ? model : '', endpoint ? key : '', custom === initial.default_instructions ? '' : custom, token)
       setURL(endpoint)
+      setInstructions(custom || initial.default_instructions)
       if (!endpoint) {
         setKey('')
         setModel('')
         setModels(null)
       }
+      void client.invalidateQueries({ queryKey: settingsKey })
+      void client.invalidateQueries({ queryKey: devicesKey })
       setFeedback({ ok: true, text: '设置已保存。' })
     } catch (failure) {
       setFeedback({ ok: false, text: errorText(failure) })
@@ -273,6 +279,15 @@ function ModelForm({ initial, token }: { initial: SystemSettings['llm']; token: 
             {pending === 'list' ? '获取中…' : '获取模型'}
           </button>
         </div>
+        <label>
+          系统提示词（Instructions）
+          <textarea rows={8} maxLength={16000} value={instructions} spellCheck={false}
+            onChange={event => { setInstructions(event.target.value); setFeedback(null) }} />
+        </label>
+        <button type="button" className="secondary-button settings-reset-prompt"
+          onClick={() => { setInstructions(initial.default_instructions); setFeedback(null) }}>
+          恢复默认提示词
+        </button>
       </fieldset>
       <p className="settings-hint">获取模型后选定一个并保存。清空地址后保存可移除配置。</p>
       {feedback && <p className={feedback.ok ? 'settings-saved' : 'inline-error'} role={feedback.ok ? 'status' : 'alert'}>{feedback.text}</p>}

@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"ghosthand/backend/internal/db"
 	"ghosthand/backend/internal/storage"
@@ -39,15 +40,21 @@ func (e WebDAVSetupError) Unwrap() error { return e.err }
 
 // Configuration is internal. The authenticated settings API opts in to returning credentials.
 type Configuration struct {
-	Endpoint string
-	Label    string // WebDAV username or LLM model.
-	Secret   string `json:"-"`
+	Endpoint     string
+	Label        string // WebDAV username or LLM model.
+	Secret       string `json:"-"`
+	Instructions string
+}
+
+func (c Configuration) FreeChatEnabled() bool {
+	return c.Endpoint != "" && c.Label != "" && strings.TrimSpace(c.Secret) != ""
 }
 
 type Update struct {
-	Endpoint string
-	Label    string
-	Secret   *string // nil keeps the credential, an empty string removes it.
+	Endpoint     string
+	Label        string
+	Secret       *string // nil keeps the credential, an empty string removes it.
+	Instructions *string // nil keeps the saved prompt, an empty string uses the default.
 }
 
 type Service struct {
@@ -82,6 +89,7 @@ func loadKey(ctx context.Context, store *db.Store, path string) ([]byte, error) 
 	var hasCredentials bool
 	if err := store.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM integration_settings WHERE secret IS NOT NULL)
 		OR EXISTS(SELECT 1 FROM attachments WHERE storage_ref IS NOT NULL)
+		OR EXISTS(SELECT 1 FROM chat_attachment_deletions WHERE storage_ref IS NOT NULL)
 		OR EXISTS(SELECT 1 FROM device_rdp_credentials)`).
 		Scan(&hasCredentials); err != nil {
 		return nil, err
@@ -135,7 +143,7 @@ func (s *Service) Open(aad, sealed []byte) ([]byte, error) {
 }
 
 func (s *Service) Read(ctx context.Context) (map[Kind]Configuration, error) {
-	rows, err := s.store.QueryContext(ctx, "SELECT kind, endpoint, label, secret FROM integration_settings")
+	rows, err := s.store.QueryContext(ctx, "SELECT kind, endpoint, label, secret, instructions FROM integration_settings")
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +153,7 @@ func (s *Service) Read(ctx context.Context) (map[Kind]Configuration, error) {
 		var kind Kind
 		var config Configuration
 		var sealed []byte
-		if err := rows.Scan(&kind, &config.Endpoint, &config.Label, &sealed); err != nil {
+		if err := rows.Scan(&kind, &config.Endpoint, &config.Label, &sealed, &config.Instructions); err != nil {
 			return nil, err
 		}
 		config.Secret, err = s.openSecret(kind, sealed)
@@ -175,6 +183,10 @@ func (s *Service) openSecret(kind Kind, sealed []byte) (string, error) {
 func (s *Service) Save(ctx context.Context, userID int64, kind Kind, input Update) error {
 	input.Endpoint = strings.TrimSpace(input.Endpoint)
 	input.Label = strings.TrimSpace(input.Label)
+	if input.Instructions != nil {
+		instructions := strings.TrimSpace(*input.Instructions)
+		input.Instructions = &instructions
+	}
 	destination, err := validate(kind, input)
 	if err != nil {
 		return err
@@ -188,7 +200,12 @@ func (s *Service) Save(ctx context.Context, userID int64, kind Kind, input Updat
 		}
 	}
 	return s.store.Write(ctx, func(tx *sql.Tx) error {
-		if destination == nil {
+		if destination == nil && kind == LLM {
+			// A prompt remains editable even when the model endpoint is disabled.
+			if err := writeConfig(ctx, tx, kind, "", "", nil, input.Instructions); err != nil {
+				return err
+			}
+		} else if destination == nil {
 			if _, err := tx.ExecContext(ctx, "DELETE FROM integration_settings WHERE kind=?", kind); err != nil {
 				return err
 			}
@@ -304,15 +321,23 @@ func (s *Service) saveConfig(ctx context.Context, tx *sql.Tx, kind Kind, input U
 	if len(sealed) != 0 {
 		credential = sealed
 	}
+	return writeConfig(ctx, tx, kind, destination.String(), input.Label, credential, input.Instructions)
+}
+
+func writeConfig(ctx context.Context, tx *sql.Tx, kind Kind, endpoint, label string, credential any, instructions *string) error {
 	_, err := tx.ExecContext(ctx, `
-		INSERT INTO integration_settings(kind, endpoint, label, secret, updated_at) VALUES (?, ?, ?, ?, ?)
+		INSERT INTO integration_settings(kind, endpoint, label, secret, updated_at, instructions)
+		VALUES (?, ?, ?, ?, ?, COALESCE(?, ''))
 		ON CONFLICT(kind) DO UPDATE SET endpoint=excluded.endpoint, label=excluded.label,
-		    secret=excluded.secret, updated_at=excluded.updated_at
-	`, kind, destination.String(), input.Label, credential, time.Now().UnixMilli())
+		    secret=excluded.secret, updated_at=excluded.updated_at, instructions=COALESCE(?, integration_settings.instructions)
+	`, kind, endpoint, label, credential, time.Now().UnixMilli(), instructions, instructions)
 	return err
 }
 
 func validate(kind Kind, input Update) (*url.URL, error) {
+	if input.Instructions != nil && (utf8.RuneCountInString(*input.Instructions) > 16000 || strings.ContainsRune(*input.Instructions, '\x00')) {
+		return nil, ValidationError("系统提示词最多 16000 个字符，且不能包含空字节。")
+	}
 	if len(input.Label) > 256 || strings.ContainsAny(input.Label, "\r\n\x00") {
 		return nil, ValidationError("用户名或模型名格式无效。")
 	}

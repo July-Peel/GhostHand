@@ -15,6 +15,9 @@ import (
 func (s *Service) RunMaintenance(ctx context.Context) {
 	for ctx.Err() == nil {
 		now := time.Now().UTC()
+		if err := s.retryChatAttachmentDeletes(ctx); err != nil && ctx.Err() == nil {
+			slog.Error("retry chat attachment deletion", "error", err)
+		}
 		if err := s.backup(ctx, now); err != nil && ctx.Err() == nil {
 			slog.Error("database backup", "error", err)
 		}
@@ -29,6 +32,36 @@ func (s *Service) RunMaintenance(ctx context.Context) {
 		}
 		timer.Stop()
 	}
+}
+
+func (s *Service) retryChatAttachmentDeletes(ctx context.Context) error {
+	rows, err := s.store.QueryContext(ctx, `SELECT id,storage_backend,storage_key,thumb_key,storage_ref
+		FROM chat_attachment_deletions ORDER BY id`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var files []AttachmentFiles
+	for rows.Next() {
+		var file AttachmentFiles
+		if err := rows.Scan(&file.ID, &file.Kind, &file.Key, &file.Thumb, &file.Ref); err != nil {
+			return err
+		}
+		files = append(files, file)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	var cleanupErr error
+	for _, file := range files {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err := s.deletePendingChatAttachment(ctx, file); err != nil {
+			cleanupErr = err
+		}
+	}
+	return cleanupErr
 }
 
 func (s *Service) backup(ctx context.Context, now time.Time) error {

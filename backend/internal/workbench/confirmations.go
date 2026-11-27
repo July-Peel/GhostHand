@@ -47,10 +47,12 @@ func (s *Service) requestConfirmation(ctx context.Context, t brainTask, summary,
 			VALUES (?,'agent','confirm_card',?,?,?)`, t.device, t.id, string(raw), now); err != nil {
 			return err
 		}
-		if _, err := Enqueue(ctx, tx, t.device, proto.MCPTaskDisplay, proto.TaskDisplay{
-			TaskID: t.id, Title: t.title, StepIndex: step, StepTotal: step, StepName: "等待管理员确认", State: proto.WaitingUser,
-		}); err != nil {
-			return err
+		if t.source != "chat" {
+			if _, err := Enqueue(ctx, tx, t.device, proto.MCPTaskDisplay, proto.TaskDisplay{
+				TaskID: t.id, Title: t.title, StepIndex: step, StepTotal: step, StepName: "等待管理员确认", State: proto.WaitingUser,
+			}); err != nil {
+				return err
+			}
 		}
 		return RecordChange(ctx, tx, t.device)
 	})
@@ -106,8 +108,10 @@ func (s *Service) Decide(ctx context.Context, user int64, device, id string, app
 			return err
 		}
 		if !approve {
-			if err := enqueueTaskCancel(ctx, tx, device, task, false, false); err != nil {
-				return err
+			if device != FreeChatDeviceID {
+				if err := enqueueTaskCancel(ctx, tx, device, task, false, false); err != nil {
+					return err
+				}
 			}
 			if err := addReply(ctx, tx, device, task, errBrainDenied.Error(), now); err != nil {
 				return err

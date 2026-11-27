@@ -192,7 +192,12 @@ func (s *Server) devices(w http.ResponseWriter, r *http.Request, _ auth.Session,
 		internalError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"devices": devices, "commands": workbench.Commands()})
+	freeChat, err := s.workbench.FreeChatStatus(r.Context())
+	if err != nil {
+		internalError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"devices": devices, "commands": workbench.Commands(), "free_chat": freeChat})
 }
 
 func (s *Server) messages(w http.ResponseWriter, r *http.Request, _ auth.Session, _ string) {
@@ -331,12 +336,16 @@ func (s *Server) static(w http.ResponseWriter, r *http.Request) {
 }
 
 func readJSON(w http.ResponseWriter, r *http.Request, target any) bool {
+	return readJSONLimited(w, r, target, 16<<10)
+}
+
+func readJSONLimited(w http.ResponseWriter, r *http.Request, target any, limit int64) bool {
 	contentType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil || contentType != "application/json" {
 		fail(w, http.StatusUnsupportedMediaType, "请求内容必须为 JSON。")
 		return false
 	}
-	body := http.MaxBytesReader(w, r.Body, 16<<10)
+	body := http.MaxBytesReader(w, r.Body, limit)
 	defer body.Close()
 	decoder := json.NewDecoder(body)
 	decoder.DisallowUnknownFields()
@@ -364,6 +373,8 @@ func workbenchError(w http.ResponseWriter, r *http.Request, err error) {
 		fail(w, http.StatusNotFound, "任务不存在。")
 	case errors.Is(err, workbench.ErrTaskControl):
 		fail(w, http.StatusConflict, "任务当前无法执行此操作。")
+	case errors.Is(err, workbench.ErrFreeChatDisabled), errors.Is(err, workbench.ErrFreeChatBusy):
+		fail(w, http.StatusConflict, err.Error())
 	case errors.Is(err, workbench.ErrChatImagesExpired):
 		fail(w, http.StatusConflict, err.Error())
 	case errors.Is(err, workbench.ErrUnknownCommand):

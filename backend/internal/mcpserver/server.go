@@ -31,25 +31,25 @@ func New(desk *workbench.Service) Gateway {
 			return nil
 		}
 		device := r.URL.Query().Get("device")
-		tools, resources := proto.DeviceTools, proto.DeviceResources
-		if device != "" {
-			var err error
-			tools, resources, err = desk.MCPCapabilities(r.Context(), device)
-			if err != nil {
-				return nil
-			}
-		}
 		server := mcp.NewServer(&mcp.Implementation{Name: "ghosthand", Version: "0.4.5"}, nil)
-		if device == "" {
-			addDevicesTool(server, desk)
-		}
-		for _, tool := range tools {
+		addDevicesTool(server, desk)
+		for _, tool := range proto.DeviceTools {
 			if workbench.IsMCPToolAllowed(tool.Name) {
 				addTool(server, desk, user, device, tool)
 			}
 		}
-		for _, resource := range resources {
-			addResource(server, desk, user, device, resource)
+		for _, resource := range proto.DeviceResources {
+			addResource(server, desk, user, "", resource)
+		}
+		if device != "" {
+			if id, err := desk.MCPDeviceID(r.Context(), device); err == nil {
+				_, resources, err := desk.MCPCapabilities(r.Context(), id)
+				if err == nil {
+					for _, resource := range resources {
+						addResource(server, desk, user, id, resource)
+					}
+				}
+			}
 		}
 		return server
 	}
@@ -69,9 +69,9 @@ func New(desk *workbench.Service) Gateway {
 }
 
 func addDevicesTool(server *mcp.Server, desk *workbench.Service) {
+	tool := workbench.MCPDevicesTool
 	server.AddTool(&mcp.Tool{
-		Name: "devices_list", Description: "列出当前在线且支持 MCP 的 Windows 节点。",
-		InputSchema: json.RawMessage(`{"type":"object","additionalProperties":false}`),
+		Name: tool.Name, Description: tool.Description, InputSchema: tool.InputSchema,
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		var args map[string]json.RawMessage
@@ -81,7 +81,7 @@ func addDevicesTool(server *mcp.Server, desk *workbench.Service) {
 		}
 		devices, err := desk.MCPDevices(ctx)
 		if err != nil {
-			return toolError("暂时无法获取在线设备。"), nil
+			return toolError("暂时无法获取设备列表。"), nil
 		}
 		data, err := json.Marshal(map[string]any{"devices": devices})
 		if err != nil {
@@ -92,41 +92,14 @@ func addDevicesTool(server *mcp.Server, desk *workbench.Service) {
 }
 
 func addTool(server *mcp.Server, desk *workbench.Service, user int64, device string, tool proto.MCPTool) {
-	schema := tool.InputSchema
-	if device == "" {
-		var input struct {
-			Type                 string                     `json:"type"`
-			Properties           map[string]json.RawMessage `json:"properties"`
-			Required             []string                   `json:"required"`
-			AdditionalProperties bool                       `json:"additionalProperties"`
-		}
-		// InputSchema comes from the local protocol definitions.
-		if err := json.Unmarshal(schema, &input); err != nil {
-			panic(err)
-		}
-		if input.Properties == nil {
-			input.Properties = make(map[string]json.RawMessage)
-		}
-		input.Properties["device_id"] = json.RawMessage(`{"type":"string","minLength":1,"maxLength":64}`)
-		input.Required = append(input.Required, "device_id")
-		schema, _ = json.Marshal(input)
-	}
+	tool = workbench.AddressedMCPTool(tool, device == "")
 	server.AddTool(&mcp.Tool{
-		Name: strings.ReplaceAll(tool.Name, ".", "_"), Description: tool.Description, InputSchema: schema,
+		Name: strings.ReplaceAll(tool.Name, ".", "_"), Description: tool.Description, InputSchema: tool.InputSchema,
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: tool.RiskLevel == "read_only"},
 	}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		target := device
-		raw := req.Params.Arguments
-		if len(raw) == 0 {
-			raw = json.RawMessage(`{}`)
-		}
-		if target == "" {
-			var args map[string]json.RawMessage
-			if json.Unmarshal(raw, &args) != nil || json.Unmarshal(args["device_id"], &target) != nil || target == "" || len(target) > 64 {
-				return toolError("请选择有效的 device_id。"), nil
-			}
-			delete(args, "device_id")
-			raw, _ = json.Marshal(args)
+		target, raw, err := workbench.MCPArguments(req.Params.Arguments, device)
+		if err != nil {
+			return toolError(err.Error()), nil
 		}
 		result, image, err := read(ctx, desk, user, target, tool.Name, raw)
 		if err != nil {
@@ -217,7 +190,7 @@ func read(ctx context.Context, desk *workbench.Service, user int64, device, tool
 		return nil, nil, errors.New("设备离线或尚未提供此工具。")
 	case errors.Is(err, workbench.ErrTaskControl):
 		return nil, nil, errors.New("此设备已有一项 MCP 诊断在执行。")
-	case errors.Is(err, proto.ErrToolArguments):
+	case errors.Is(err, proto.ErrToolArguments), errors.Is(err, workbench.ErrMCPDeviceAmbiguous):
 		return nil, nil, err
 	case errors.Is(err, context.DeadlineExceeded):
 		return nil, nil, errors.New("等待设备诊断结果超时。")

@@ -219,11 +219,16 @@ func (s *Service) finishBrain(ctx context.Context, t brainTask, reply string, st
 		case proto.Cancelled:
 			code = proto.ErrCancelled
 		}
-		if _, err := Enqueue(ctx, tx, t.device, proto.MCPTaskFinish, proto.TaskResultPayload{TaskID: t.id, State: state, ErrorCode: code}); err != nil {
-			return err
+		if t.source != "chat" {
+			if _, err := Enqueue(ctx, tx, t.device, proto.MCPTaskFinish, proto.TaskResultPayload{TaskID: t.id, State: state, ErrorCode: code}); err != nil {
+				return err
+			}
 		}
 		if !t.quiet {
-			if err := addReply(ctx, tx, t.device, t.id, limitText(reply, 5000), now); err != nil {
+			if t.source != "chat" {
+				reply = limitText(reply, 5000)
+			}
+			if err := addReply(ctx, tx, t.device, t.id, reply, now); err != nil {
 				return err
 			}
 		}

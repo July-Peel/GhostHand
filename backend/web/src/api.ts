@@ -1,14 +1,16 @@
 export type Session = { username: string; csrf_token: string; expires_at: number }
 export type SystemSettings = {
   webdav: { url: string; username: string; password: string }
-  llm: { base_url: string; model: string; api_key: string }
+  llm: { base_url: string; model: string; api_key: string; instructions: string; default_instructions: string }
 }
+
+export const FREE_CHAT_ID = '__chat__'
 
 export type Command = { slash: string; title: string; capability: 'device.info' | 'device.battery' | 'screen.capture' }
 export type Device = {
   id: string
   name: string
-  platform: 'windows' | 'android' | 'linux'
+  platform: 'windows' | 'android' | 'linux' | 'chat'
   arch: string
   os_version: string
   group: string
@@ -70,7 +72,11 @@ export type Message = MessageBase & (
   | { type: 'confirm_card'; payload: ConfirmCard }
 )
 export type MessagePage = { messages: Message[]; has_older: boolean }
-type DevicesResponse = { devices: Device[]; commands: Command[] }
+type DevicesResponse = {
+  devices: Device[]
+  commands: Command[]
+  free_chat: { enabled: boolean; model: string; task_state: Device['task_state'] }
+}
 
 export class ApiError extends Error {
   constructor(public status: number, message: string) {
@@ -135,8 +141,8 @@ export const api = {
   saveWebDAV: (url: string, username: string, password: string, csrf: string) => request<void>(
     '/api/settings/webdav', post({ url, username, password }, csrf),
   ),
-  saveLLM: (baseURL: string, model: string, key: string, csrf: string) => request<void>(
-    '/api/settings/llm', post({ base_url: baseURL, model, api_key: key }, csrf),
+  saveLLM: (baseURL: string, model: string, key: string, instructions: string, csrf: string) => request<void>(
+    '/api/settings/llm', post({ base_url: baseURL, model, api_key: key, instructions }, csrf),
   ),
   listModels: (baseURL: string, key: string, csrf: string) => request<{ models: string[] }>(
     '/api/settings/llm/models', post({ base_url: baseURL, api_key: key }, csrf),

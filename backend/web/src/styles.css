@@ -151,7 +151,7 @@ kbd { color: var(--subtle); font: 11px/1.1 Inter, system-ui, sans-serif; border:
 .device-row:hover { background: var(--muted); }
 .device-row.is-active { background: var(--accent-bg); border-color: var(--accent-line); }
 .device-icon { width: 36px; height: 36px; border: 1px solid var(--line); background: var(--surface); border-radius: 9px; display: grid; place-items: center; color: var(--dim); flex: none; }
-.device-icon.windows { color: var(--blue); background: var(--blue-bg); border-color: transparent; }
+.device-icon.windows, .device-icon.chat { color: var(--blue); background: var(--blue-bg); border-color: transparent; }
 .device-icon.android { color: var(--success); background: var(--success-bg); border-color: transparent; }
 .device-row-text { display: grid; min-width: 0; flex: 1; gap: 2px; }
 .device-row-text strong { font-size: 13px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -174,6 +174,7 @@ kbd { color: var(--subtle); font: 11px/1.1 Inter, system-ui, sans-serif; border:
 .chat-title > div, .chat-title p, .chat-header-actions { display: flex; align-items: center; gap: 8px; }
 .chat-title h1 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 16px; font-weight: 670; }
 .chat-title p { margin-top: 3px; color: var(--subtle); font-size: 12px; }
+.chat-title .chat-model { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .title-divider { height: 10px; width: 1px; background: var(--line); }
 .demo-label { font-size: 10px; font-weight: 570; border-radius: 5px; background: var(--muted); color: var(--dim); padding: 2px 5px; white-space: nowrap; }
 .chat-header-actions { gap: 10px; }
@@ -435,8 +436,10 @@ dialog::backdrop { background: var(--scrim); }
 .settings-form h3 { font-size: 15px; font-weight: 650; }
 .settings-form fieldset { display: grid; gap: 10px; min-width: 0; }
 .settings-form label { display: grid; gap: 5px; color: var(--dim); font-weight: 550; }
-.settings-form input, .settings-form select { width: 100%; min-height: 39px; padding: 6px 9px; color: var(--text); background: var(--canvas); border: 1px solid var(--line); border-radius: 8px; font-weight: 400; }
-.settings-form input:disabled, .settings-form select:disabled { opacity: .6; }
+.settings-form input, .settings-form select, .settings-form textarea { width: 100%; min-height: 39px; padding: 6px 9px; color: var(--text); background: var(--canvas); border: 1px solid var(--line); border-radius: 8px; font-weight: 400; }
+.settings-form textarea { resize: vertical; min-height: 8rem; line-height: 1.5; }
+.settings-form input:disabled, .settings-form select:disabled, .settings-form textarea:disabled { opacity: .6; }
+.settings-reset-prompt { justify-self: start; }
 .settings-model-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 8px; }
 .settings-model-row button { min-height: 39px; white-space: nowrap; }
 .settings-hint, .settings-saved { font-size: 13px; }
@@ -506,7 +509,7 @@ dialog::backdrop { background: var(--scrim); }
   .sidebar { border-right: 0; }
   .workspace-grid:not(.show-chat) .chat-pane, .workspace-grid.show-chat .sidebar { display: none; }
   .device-search { margin: 0 14px 14px; }
-  .device-search input, .composer-field textarea, .login-card input, .command-search input, .settings-form input, .settings-form select { font-size: 16px; }
+  .device-search input, .composer-field textarea, .login-card input, .command-search input, .settings-form input, .settings-form select, .settings-form textarea { font-size: 16px; }
   .device-search button { display: none; }
   .row-chevron { display: block; }
   .device-row.is-active { background: var(--surface); border-color: transparent; }

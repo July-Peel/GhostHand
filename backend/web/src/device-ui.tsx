@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { BatteryCharging, LoaderCircle, Monitor, Pencil, Server, Smartphone, Trash2, X } from 'lucide-react'
+import { BatteryCharging, Bot, LoaderCircle, Monitor, Pencil, Server, Smartphone, Trash2, X } from 'lucide-react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import type { Device } from './api'
 import { api, devicesKey, errorText } from './api'
@@ -11,7 +11,7 @@ const helpers = { ready: '就绪', restarting: '恢复中', unavailable: '不可
 const dateFormat = new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'short' })
 
 export function DeviceIcon({ device }: { device: Device }) {
-  const Icon = { windows: Monitor, android: Smartphone, linux: Server }[device.platform]
+  const Icon = { windows: Monitor, android: Smartphone, linux: Server, chat: Bot }[device.platform]
   return <span className={'device-icon ' + device.platform}><Icon size={19} aria-hidden="true" /></span>
 }
 

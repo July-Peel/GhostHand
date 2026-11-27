@@ -14,6 +14,9 @@ import (
 )
 
 func (s *Service) RenameDevice(ctx context.Context, user int64, device, raw string, includeDemo bool) (string, error) {
+	if device == workbench.FreeChatDeviceID {
+		return "", ErrMissing
+	}
 	name := strings.TrimSpace(raw)
 	if name == "" || utf8.RuneCountInString(name) > 80 ||
 		strings.ContainsFunc(raw, func(r rune) bool { return unicode.IsControl(r) || unicode.In(r, unicode.Zl, unicode.Zp) }) {

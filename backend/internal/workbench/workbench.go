@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -148,6 +149,8 @@ type Service struct {
 	dataDir         string
 	brainMu         sync.Mutex
 	brainSessions   map[string]map[string]context.CancelFunc
+	mcpWindowMu     sync.Mutex
+	mcpWindows      map[string]mcpWindow
 	refreshSeq      atomic.Int64
 }
 
@@ -175,12 +178,20 @@ type scanner interface {
 
 func scanDevice(row scanner) (Device, error) {
 	var d Device
-	err := row.Scan(&d.ID, &d.Name, &d.Platform, &d.Arch, &d.OSVersion, &d.Group, &d.ConnState,
-		&d.HelperState, &d.DesktopState, &d.TaskState, &d.BatteryPct, &d.Charging, &d.LastSeenAt, &d.TaskProtocol, &d.Demo, &d.AutoApprove)
+	err := scanDeviceFields(row, &d)
 	return d, err
 }
 
+func scanDeviceFields(row scanner, d *Device, extra ...any) error {
+	fields := []any{&d.ID, &d.Name, &d.Platform, &d.Arch, &d.OSVersion, &d.Group, &d.ConnState,
+		&d.HelperState, &d.DesktopState, &d.TaskState, &d.BatteryPct, &d.Charging, &d.LastSeenAt, &d.TaskProtocol, &d.Demo, &d.AutoApprove}
+	return row.Scan(append(fields, extra...)...)
+}
+
 func (s *Service) SetAutoApprove(ctx context.Context, userID int64, deviceID string, enabled bool) error {
+	if deviceID == FreeChatDeviceID {
+		return ErrDeviceNotFound
+	}
 	return s.store.Write(ctx, func(tx *sql.Tx) error {
 		var exists bool
 		if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM devices WHERE id=? AND (is_demo=0 OR ?))", deviceID, s.demo).Scan(&exists); err != nil {
@@ -216,10 +227,10 @@ func (s *Service) SetAutoApprove(ctx context.Context, userID int64, deviceID str
 
 func (s *Service) Devices(ctx context.Context) ([]Device, error) {
 	rows, err := s.store.QueryContext(ctx, `SELECT `+deviceFields+`
-		FROM devices d WHERE d.is_demo=0 OR ?
+		FROM devices d WHERE (d.is_demo=0 OR ?) AND d.id<>?
 		ORDER BY CASE d.conn_state WHEN 'online' THEN 0 WHEN 'unstable' THEN 1 WHEN 'sleeping' THEN 2 ELSE 3 END,
 		         d.group_name, d.name, d.id
-	`, s.demo)
+	`, s.demo, FreeChatDeviceID)
 	if err != nil {
 		return nil, err
 	}
@@ -325,12 +336,16 @@ func (s *Service) Send(ctx context.Context, userID int64, deviceID, text string,
 	if len(images) > MaxChatImages {
 		return ErrChatImageCount
 	}
-	command, err := findCommand(text)
-	if len(images) > 0 && (command.Capability != "" || errors.Is(err, ErrUnknownCommand)) {
-		return ErrCommandImages
-	}
-	if err != nil {
-		return err
+	var command Command
+	var err error
+	if deviceID != FreeChatDeviceID {
+		command, err = findCommand(text)
+		if len(images) > 0 && (command.Capability != "" || errors.Is(err, ErrUnknownCommand)) {
+			return ErrCommandImages
+		}
+		if err != nil {
+			return err
+		}
 	}
 	var configs map[settings.Kind]settings.Configuration
 	if command.Capability == "" {
@@ -338,6 +353,9 @@ func (s *Service) Send(ctx context.Context, userID int64, deviceID, text string,
 		if err != nil {
 			return err
 		}
+	}
+	if deviceID == FreeChatDeviceID && !configs[settings.LLM].FreeChatEnabled() {
+		return ErrFreeChatDisabled
 	}
 	var stored []storedImage
 	if len(images) > 0 {
@@ -355,6 +373,10 @@ func (s *Service) Send(ctx context.Context, userID int64, deviceID, text string,
 		}
 	}
 	err = s.store.Write(ctx, func(tx *sql.Tx) error {
+		now := time.Now()
+		if deviceID == FreeChatDeviceID {
+			return insertFreeChat(ctx, tx, userID, text, stored, now)
+		}
 		device, err := scanDevice(tx.QueryRowContext(ctx, "SELECT "+deviceFields+
 			" FROM devices d WHERE d.id=? AND (d.is_demo=0 OR ?)", deviceID, s.demo))
 		if errors.Is(err, sql.ErrNoRows) {
@@ -363,7 +385,6 @@ func (s *Service) Send(ctx context.Context, userID int64, deviceID, text string,
 		if err != nil {
 			return err
 		}
-		now := time.Now()
 		if len(stored) > 0 {
 			if err := insertChatImageTask(ctx, tx, device, userID, text, stored, brainUnavailable(device, configs[settings.LLM]), now); err != nil {
 				return err
@@ -430,19 +451,7 @@ func insertChatImageTask(ctx context.Context, tx *sql.Tx, device Device, user in
 	if err != nil {
 		return err
 	}
-	cards := make([]imageCard, 0, len(images))
-	for i, image := range images {
-		if err := image.insert(ctx, tx, task, fmt.Sprintf("user_%d", i), now); err != nil {
-			return err
-		}
-		cards = append(cards, imageCard{ID: image.ID, Name: image.name, Size: image.size})
-	}
-	payload, err := json.Marshal(userMediaPayload{Attachments: cards})
-	if err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO chat_messages(device_id,sender,type,text,task_id,payload_json,created_at)
-		VALUES (?,'user','text',?,?,?,?)`, device.ID, prompt, task, string(payload), now.UnixMilli()); err != nil {
+	if err := insertUserMessage(ctx, tx, device.ID, task, prompt, images, now); err != nil {
 		return err
 	}
 	if unavailable != "" {
@@ -452,6 +461,27 @@ func insertChatImageTask(ctx context.Context, tx *sql.Tx, device Device, user in
 		return addReply(ctx, tx, device.ID, task, unavailable, now.UnixMilli())
 	}
 	return addTaskCard(ctx, tx, device.ID, task, now)
+}
+
+func insertUserMessage(ctx context.Context, tx *sql.Tx, device, task, text string, images []storedImage, now time.Time) error {
+	cards := make([]imageCard, 0, len(images))
+	for i, image := range images {
+		if err := image.insert(ctx, tx, task, fmt.Sprintf("user_%d", i), now); err != nil {
+			return err
+		}
+		cards = append(cards, imageCard{ID: image.ID, Name: image.name, Size: image.size})
+	}
+	var payload any
+	if len(cards) > 0 {
+		raw, err := json.Marshal(userMediaPayload{Attachments: cards})
+		if err != nil {
+			return err
+		}
+		payload = string(raw)
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO chat_messages(device_id,sender,type,text,task_id,payload_json,created_at)
+		VALUES (?,'user','text',?,?,?,?)`, device, text, task, payload, now.UnixMilli())
+	return err
 }
 
 // ClearMessages deletes all chat history, tasks, and active LLM sessions for a device.
@@ -468,21 +498,21 @@ func (s *Service) ClearMessages(ctx context.Context, userID int64, deviceID stri
 			return ErrDeviceNotFound
 		}
 
-		rows, err := tx.QueryContext(ctx, `SELECT t.id, t.control='force'
+		rows, err := tx.QueryContext(ctx, `SELECT t.id, t.control='force', t.assign_seq IS NOT NULL
 			FROM tasks t JOIN devices d ON d.id=t.device_id
-			WHERE t.device_id=? AND d.is_demo=0 AND t.assign_seq IS NOT NULL
+			WHERE t.device_id=? AND d.is_demo=0 AND (t.assign_seq IS NOT NULL OR t.source='chat')
 			AND t.state IN ('queued','dispatched','running','paused','waiting_user','cancelling')`, deviceID)
 		if err != nil {
 			return err
 		}
 		type activeAssign struct {
-			id    string
-			force bool
+			id              string
+			force, assigned bool
 		}
 		var active []activeAssign
 		for rows.Next() {
 			var item activeAssign
-			if err := rows.Scan(&item.id, &item.force); err != nil {
+			if err := rows.Scan(&item.id, &item.force, &item.assigned); err != nil {
 				rows.Close()
 				return err
 			}
@@ -493,8 +523,10 @@ func (s *Service) ClearMessages(ctx context.Context, userID int64, deviceID stri
 			return err
 		}
 		for _, item := range active {
-			if err := enqueueTaskCancel(ctx, tx, deviceID, item.id, item.force, true); err != nil {
-				return err
+			if item.assigned {
+				if err := enqueueTaskCancel(ctx, tx, deviceID, item.id, item.force, true); err != nil {
+					return err
+				}
 			}
 			stopped = append(stopped, item.id)
 		}
@@ -502,6 +534,15 @@ func (s *Service) ClearMessages(ctx context.Context, userID int64, deviceID stri
 		files, err = DeviceAttachmentFiles(ctx, tx, deviceID)
 		if err != nil {
 			return err
+		}
+		if deviceID == FreeChatDeviceID {
+			for _, file := range files {
+				if _, err := tx.ExecContext(ctx, `INSERT INTO chat_attachment_deletions
+					(id,storage_backend,storage_key,thumb_key,storage_ref) VALUES (?,?,?,?,?)`,
+					file.ID, file.Kind, file.Key, file.Thumb, file.Ref); err != nil {
+					return err
+				}
+			}
 		}
 
 		if _, err := tx.ExecContext(ctx, "DELETE FROM chat_messages WHERE device_id=?", deviceID); err != nil {
@@ -523,13 +564,20 @@ func (s *Service) ClearMessages(ctx context.Context, userID int64, deviceID stri
 		s.cancelBrainSession(deviceID, task)
 	}
 	for _, file := range files {
-		s.deleteAttachmentFiles(ctx, file)
+		if deviceID == FreeChatDeviceID {
+			if err := s.deletePendingChatAttachment(ctx, file); err != nil {
+				slog.Error("delete chat attachment files", "id", file.ID, "error", err)
+			}
+		} else {
+			s.deleteAttachmentFiles(ctx, file)
+		}
 	}
 	return nil
 }
 
 func (s *Service) MarkRefresh() {
 	s.refreshSeq.Add(1)
+	s.store.Notify()
 }
 
 func (s *Service) RefreshSeq() int64 {
@@ -539,6 +587,9 @@ func (s *Service) RefreshSeq() int64 {
 // CleanupDeviceState cancels active LLM sessions, deletes attachment files, and notifies browsers to refresh.
 func (s *Service) CleanupDeviceState(ctx context.Context, deviceID string, files []AttachmentFiles) {
 	s.cancelDeviceBrainSessions(deviceID)
+	s.mcpWindowMu.Lock()
+	delete(s.mcpWindows, deviceID)
+	s.mcpWindowMu.Unlock()
 	for _, file := range files {
 		s.deleteAttachmentFiles(ctx, file)
 	}
@@ -578,10 +629,15 @@ func insertTask(ctx context.Context, tx *sql.Tx, userID int64, device Device, co
 	if command.Capability == proto.BrainTask {
 		total = 1
 	}
+	state := proto.Queued
+	var startedAt any
+	if source == "chat" {
+		state, startedAt = proto.Running, now.UnixMilli()
+	}
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO tasks(id, device_id, created_by, capability, state, created_at, expires_at, next_at, lane, step_total, source, prompt, title)
-		VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)
-	`, id, device.ID, userID, command.Capability, now.UnixMilli(), expires.UnixMilli(), due, command.Lane, total, source, prompt, title); err != nil {
+		INSERT INTO tasks(id, device_id, created_by, capability, state, created_at, expires_at, next_at, lane, step_total, source, prompt, title, started_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, id, device.ID, userID, command.Capability, state, now.UnixMilli(), expires.UnixMilli(), due, command.Lane, total, source, prompt, title, startedAt); err != nil {
 		return "", err
 	}
 	if !quiet {
@@ -589,8 +645,10 @@ func insertTask(ctx context.Context, tx *sql.Tx, userID int64, device Device, co
 			return "", err
 		}
 	}
-	if err := addTaskEvent(ctx, tx, id, "queue", "queued", "任务已入队", now.UnixMilli()); err != nil {
-		return "", err
+	if source != "chat" {
+		if err := addTaskEvent(ctx, tx, id, "queue", "queued", "任务已入队", now.UnixMilli()); err != nil {
+			return "", err
+		}
 	}
 	return id, auditTask(ctx, tx, userID, device.ID, id, "task.create", now.UnixMilli())
 }

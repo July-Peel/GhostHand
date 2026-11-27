@@ -132,6 +132,9 @@ func (s *Service) Restore(ctx context.Context, user int64, id string) error {
 
 // DeleteDevice removes an offline device and all its associated records and agent logs.
 func (s *Service) DeleteDevice(ctx context.Context, user int64, id string) ([]workbench.AttachmentFiles, error) {
+	if id == workbench.FreeChatDeviceID {
+		return nil, ErrMissing
+	}
 	s.connectionMu.Lock()
 	defer s.connectionMu.Unlock()
 	if s.connections[id] != nil {
