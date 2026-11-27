@@ -1,7 +1,7 @@
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { ClipboardEvent, DragEvent, FormEvent, KeyboardEvent, ReactNode } from 'react'
 import { useInfiniteQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Activity, ArrowLeft, ArrowUp, BatteryCharging, Camera, Check, ChevronDown, CircleAlert, Copy, Download, ImagePlus, Info, LoaderCircle, Send, Shield, Terminal, Trash2, X, Zap } from 'lucide-react'
+import { Activity, ArrowLeft, ArrowUp, BatteryCharging, Camera, Check, ChevronDown, CircleAlert, Copy, Download, Info, LoaderCircle, Plus, Send, Shield, Terminal, Trash2, X, Zap } from 'lucide-react'
 import { api, devicesKey, errorText, FREE_CHAT_ID, messagesKey } from './api'
 import type { Command, ConfirmCard, Device, MediaCard, Message, Session, StatusCard, TaskAction, TaskCard } from './api'
 import { Battery, Connection, Details, DeviceIcon, Panel, desktops } from './device-ui'
@@ -488,20 +488,6 @@ export function Conversation({ device, devices, commands, session, opened, back 
               </div>
             )}
             <div className="composer-controls">
-              <input
-                ref={fileInputRef} type="file" accept={acceptedChatImages} multiple hidden
-                onChange={event => {
-                  const files = Array.from(event.currentTarget.files ?? [])
-                  event.currentTarget.value = ''
-                  void addImages(files)
-                }}
-              />
-              <button
-                type="button" className="icon-button attach-button" disabled={send.isPending || clear.isPending || preparing}
-                title="添加图片（也支持直接 Ctrl+V 粘贴）" aria-label="添加图片" onClick={() => fileInputRef.current?.click()}
-              >
-                {preparing ? <LoaderCircle size={19} className="spin" /> : <ImagePlus size={19} />}
-              </button>
               <textarea
                 ref={composerRef}
                 aria-label="消息内容" rows={2} maxLength={2000} value={draft}
@@ -515,12 +501,28 @@ export function Conversation({ device, devices, commands, session, opened, back 
                 onKeyDown={composerKey}
                 onPaste={pasteImages}
               />
-              <button
-                type="submit" className="primary-button send-button" aria-label="发送消息"
-                disabled={(!draft.trim() && pendingImages.length === 0) || send.isPending || clear.isPending || chatBusy || preparing}
-              >
-                {send.isPending ? <LoaderCircle size={18} className="spin" /> : <Send size={18} />}
-              </button>
+              <div className="composer-toolbar">
+                <input
+                  ref={fileInputRef} type="file" accept={acceptedChatImages} multiple hidden
+                  onChange={event => {
+                    const files = Array.from(event.currentTarget.files ?? [])
+                    event.currentTarget.value = ''
+                    void addImages(files)
+                  }}
+                />
+                <button
+                  type="button" className="icon-button attach-button" disabled={send.isPending || clear.isPending || preparing}
+                  title="添加图片（也支持直接 Ctrl+V 粘贴）" aria-label="添加图片" onClick={() => fileInputRef.current?.click()}
+                >
+                  {preparing ? <LoaderCircle size={17} className="spin" /> : <Plus size={18} />}
+                </button>
+                <button
+                  type="submit" className="primary-button send-button" aria-label="发送消息"
+                  disabled={(!draft.trim() && pendingImages.length === 0) || send.isPending || clear.isPending || chatBusy || preparing}
+                >
+                  {send.isPending ? <LoaderCircle size={16} className="spin" /> : <Send size={16} />}
+                </button>
+              </div>
             </div>
           </div>
           <p className="composer-hint">Enter 发送 · Shift + Enter 换行</p>
