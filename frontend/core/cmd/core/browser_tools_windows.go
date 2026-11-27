@@ -379,8 +379,11 @@ func (bridge *browserBridge) uninstall(ctx context.Context, key browserSessionKe
 			}
 		}
 	}
-	removeErr := removeBrowserRegistration(key)
-	bundleErr := removeBrowserBundleIfUnused(key.browserDesktop)
+	var removeErr, bundleErr error
+	if uiErr == nil {
+		removeErr = removeBrowserRegistration(key)
+		bundleErr = removeBrowserBundleIfUnused(key.browserDesktop)
+	}
 	bridge.mu.Lock()
 	if bridge.preferred[key.browserDesktop] == key.browser {
 		delete(bridge.preferred, key.browserDesktop)

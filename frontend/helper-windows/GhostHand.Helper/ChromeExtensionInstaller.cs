@@ -13,6 +13,8 @@ internal static class ChromeExtensionInstaller
     private const string ExtensionId = "mfbgehccogcjllkhnmhdkhfmbfbgjjnh";
     private const string HostName = "com.ghosthand.nativemessage";
     private const uint WM_GETOBJECT = 0x003d, WM_SETTEXT = 0x000c, BM_CLICK = 0x00f5, WM_CLOSE = 0x0010;
+    private const uint WM_KEYDOWN = 0x0100, WM_KEYUP = 0x0101;
+    private const int VK_RETURN = 0x0D;
     private const uint SMTO_ABORTIFHUNG = 2, GW_OWNER = 4;
     private const int IDOK = 1;
     private static readonly int DesktopSession = Process.GetCurrentProcess().SessionId;
@@ -121,7 +123,21 @@ internal static class ChromeExtensionInstaller
             var window = OpenManagement(browser, token, cancellation);
             try
             {
-                var card = FindCard(window);
+                AutomationElement? card = null;
+                Stopwatch? pageReady = null;
+                Until(() =>
+                {
+                    WakeAccessibility(window);
+                    card = FindCard(window);
+                    if (card is not null) return card;
+                    if (FindLoadButton(window) is not null || FindDevModeToggle(window) is not null)
+                    {
+                        pageReady ??= Stopwatch.StartNew();
+                        if (pageReady.ElapsedMilliseconds >= 450) return new object();
+                    }
+                    return null;
+                }, TimeSpan.FromSeconds(4), cancellation, "E_BROWSER_EXTENSIONS_PAGE_NOT_FOUND");
+                card ??= FindCard(window);
                 if (card is null) return new { data = new { removed = false, browser_running = true } };
                 var remove = FindCardControl(card, "removeButton", ["Remove", "移除", "删除", "移除擴充功能"])
                     ?? throw new CaptureException("E_BROWSER_REMOVE_BUTTON_NOT_FOUND");
@@ -244,24 +260,131 @@ internal static class ChromeExtensionInstaller
     {
         ValidateToken(token);
         var alreadyRunning = BrowserProcesses(browser).Count > 0;
-        var arguments = (alreadyRunning ? "" : "--force-renderer-accessibility ") + browser.Page(token);
+        // Chromium blocks chrome:// and edge:// URLs passed via command line and opens a New Tab Page instead.
+        // Launch about:blank (which Chromium allows on the command line) and navigate the address bar via UIA.
+        var arguments = (alreadyRunning ? "" : "--force-renderer-accessibility ") + "about:blank";
         cancellation.ThrowIfCancellationRequested();
         StartInDesktop(FindExecutable(browser), arguments);
-        var window = UntilHandle(() => ManagementWindow(browser, token, wake: true), TimeSpan.FromSeconds(7),
-            cancellation, "E_BROWSER_EXTENSIONS_PAGE_NOT_FOUND");
-        WindowsTools.ForceForeground(window);
-        WakeAccessibility(window);
-        return window;
+        var navigated = false;
+        var lastNavigate = Stopwatch.StartNew();
+        var openedBlank = IntPtr.Zero;
+        try
+        {
+            var window = UntilHandle(() =>
+            {
+                var found = ManagementWindow(browser, token, wake: true);
+                if (found != IntPtr.Zero) return found;
+                if (!navigated || lastNavigate.ElapsedMilliseconds >= 1200)
+                {
+                    var blank = BlankWindow(browser);
+                    if (blank != IntPtr.Zero && NavigateAddress(blank, browser.Page(token)))
+                    {
+                        openedBlank = blank;
+                        navigated = true;
+                        lastNavigate.Restart();
+                    }
+                }
+                return IntPtr.Zero;
+            }, TimeSpan.FromSeconds(8), cancellation, "E_BROWSER_EXTENSIONS_PAGE_NOT_FOUND");
+            WindowsTools.ForceForeground(window);
+            WakeAccessibility(window);
+            return window;
+        }
+        catch
+        {
+            if (openedBlank != IntPtr.Zero && ManagementWindow(browser, token, wake: false) == IntPtr.Zero)
+            {
+                CloseBlank(openedBlank, CancellationToken.None);
+            }
+            throw;
+        }
     }
 
     private static bool CloseManagement(Browser browser, string token, CancellationToken cancellation)
     {
         ValidateToken(token);
         var window = ManagementWindow(browser, token, wake: false);
-        if (window == IntPtr.Zero) return false;
+        if (window == IntPtr.Zero)
+        {
+            var blank = BlankWindow(browser);
+            return blank != IntPtr.Zero && CloseBlank(blank, cancellation);
+        }
         if (!WindowsTools.ForceForeground(window) || !MatchesAddress(window, token)) return false;
         WindowsInput.Keys(["Ctrl", "W"], cancellation);
         return true;
+    }
+
+    private static bool CloseBlank(IntPtr window, CancellationToken cancellation)
+    {
+        if (window == IntPtr.Zero || !WindowsTools.ForceForeground(window) || !MatchesBlank(window)) return false;
+        WindowsInput.Keys(["Ctrl", "W"], cancellation);
+        return true;
+    }
+
+    private static IntPtr BlankWindow(Browser browser)
+    {
+        var processes = BrowserProcesses(browser);
+        if (processes.Count == 0) return IntPtr.Zero;
+        var foreground = GetForegroundWindow();
+        var windows = TopWindows().Where(handle => ClassName(handle) == "Chrome_WidgetWin_1" &&
+            processes.Contains(ProcessId(handle))).OrderByDescending(handle => handle == foreground);
+        foreach (var window in windows)
+        {
+            if (MatchesBlank(window)) return window;
+        }
+        return IntPtr.Zero;
+    }
+
+    private static bool MatchesBlank(IntPtr window)
+    {
+        if (WindowTitle(window).StartsWith("about:blank", StringComparison.OrdinalIgnoreCase)) return true;
+        try
+        {
+            var edit = FindAddressEdit(window);
+            if (edit is not null && edit.TryGetCurrentPattern(ValuePattern.Pattern, out var pattern))
+            {
+                var value = ((ValuePattern)pattern).Current.Value?.Trim() ?? "";
+                if (value.Equals("about:blank", StringComparison.OrdinalIgnoreCase)) return true;
+            }
+        }
+        catch (Exception ex) when (ex is ElementNotAvailableException or COMException)
+        {
+        }
+        return false;
+    }
+
+    private static AutomationElement? FindAddressEdit(IntPtr window)
+    {
+        var root = AutomationElement.FromHandle(window);
+        var edits = root.FindAll(TreeScope.Descendants,
+            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit));
+        AutomationElement? fallback = null;
+        foreach (AutomationElement edit in edits)
+        {
+            if (!edit.Current.IsEnabled || edit.Current.IsOffscreen) continue;
+            if (edit.Current.ClassName == "OmniboxViewViews") return edit;
+            fallback ??= edit;
+        }
+        return fallback;
+    }
+
+    private static bool NavigateAddress(IntPtr window, string url)
+    {
+        try
+        {
+            var edit = FindAddressEdit(window);
+            if (edit is null || !edit.TryGetCurrentPattern(ValuePattern.Pattern, out var pattern)) return false;
+            WindowsTools.ForceForeground(window);
+            try { edit.SetFocus(); } catch { }
+            ((ValuePattern)pattern).SetValue(url);
+            PostMessage(window, WM_KEYDOWN, new IntPtr(VK_RETURN), new IntPtr(0x001C0001));
+            PostMessage(window, WM_KEYUP, new IntPtr(VK_RETURN), new IntPtr(0xC01C0001));
+            return true;
+        }
+        catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or COMException)
+        {
+            return false;
+        }
     }
 
     private static IntPtr ManagementWindow(Browser browser, string token, bool wake)
@@ -281,6 +404,7 @@ internal static class ChromeExtensionInstaller
 
     private static bool MatchesAddress(IntPtr window, string token)
     {
+        if (WindowTitle(window).StartsWith("about:blank", StringComparison.OrdinalIgnoreCase)) return false;
         try
         {
             var root = AutomationElement.FromHandle(window);
@@ -314,6 +438,17 @@ internal static class ChromeExtensionInstaller
         var iid = new Guid("618736e0-3c3d-11cf-810c-00aa00389b71");
         SendMessageTimeout(window, WM_GETOBJECT, IntPtr.Zero, new IntPtr(-4), SMTO_ABORTIFHUNG, 75, out _);
         _ = AccessibleObjectFromWindow(window, unchecked((uint)-4), ref iid, out _);
+        try
+        {
+            using (RawView())
+            {
+                _ = AutomationElement.FromHandle(window).FindFirst(TreeScope.Descendants,
+                    new PropertyCondition(AutomationElement.ClassNameProperty, "Chrome_RenderWidgetHostHWND"));
+            }
+        }
+        catch (Exception ex) when (ex is ElementNotAvailableException or COMException)
+        {
+        }
         EnumChildWindows(window, (child, unused) =>
         {
             if (ClassName(child) == "Chrome_RenderWidgetHostHWND")
@@ -325,8 +460,14 @@ internal static class ChromeExtensionInstaller
         }, IntPtr.Zero);
     }
 
+    private static IDisposable RawView()
+    {
+        var request = new CacheRequest { TreeFilter = Automation.RawViewCondition };
+        return request.Activate();
+    }
+
     private static AutomationElement? FindLoadButton(IntPtr window) =>
-        Find(window, "loadUnpacked", ["Load unpacked", "加载已解压的扩展程序", "載入未封裝項目", "載入未封裝擴充功能"], preferButton: true);
+        Find(window, "loadUnpacked", ["Load unpacked", "加载未打包的扩展程序", "加载已解压的扩展程序", "載入未封裝項目", "載入未封裝擴充功能"], preferButton: true);
 
     private static AutomationElement? FindDevModeToggle(IntPtr window)
     {
@@ -377,22 +518,41 @@ internal static class ChromeExtensionInstaller
         try
         {
             var root = AutomationElement.FromHandle(window);
-            return root.FindFirst(TreeScope.Descendants, new PropertyCondition(AutomationElement.AutomationIdProperty, ExtensionId))
-                ?? root.FindFirst(TreeScope.Descendants, new AndCondition(
+            using (RawView())
+            {
+                var byId = root.FindFirst(TreeScope.Descendants,
+                    new PropertyCondition(AutomationElement.AutomationIdProperty, ExtensionId));
+                if (byId is not null) return byId;
+            }
+            foreach (var raw in new[] { false, true })
+            {
+                using var scope = raw ? RawView() : null;
+                var matches = root.FindAll(TreeScope.Descendants, new AndCondition(
                     new PropertyCondition(AutomationElement.NameProperty, ExtensionName),
                     new NotCondition(new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.TabItem))));
+                foreach (AutomationElement match in matches)
+                {
+                    if (match.Current.ClassName == "ToolbarActionView" ||
+                        match.Current.AutomationId.StartsWith("view_", StringComparison.Ordinal))
+                        continue;
+                    return match;
+                }
+            }
         }
         catch (Exception ex) when (ex is ElementNotAvailableException or COMException)
         {
-            return null;
         }
+        return null;
     }
 
     private static AutomationElement? FindCardControl(AutomationElement card, string id, string[] labels)
     {
-        for (var depth = 0; card is not null && depth < 6; depth++, card = TreeWalker.ControlViewWalker.GetParent(card))
+        for (var depth = 0; card is not null && depth < 10; depth++, card = TreeWalker.RawViewWalker.GetParent(card))
         {
-            if (card.Current.ControlType == ControlType.Document) break;
+            if (card.Current.ControlType == ControlType.Document ||
+                card.Current.AutomationId == "RootWebArea" ||
+                card.Current.ClassName is "Chrome_RenderWidgetHostHWND" or "BrowserView" or "BrowserRootView")
+                break;
             var named = card.FindAll(TreeScope.Descendants, new PropertyCondition(AutomationElement.AutomationIdProperty, id))
                 .Cast<AutomationElement>().Where(el => el.Current.IsEnabled && !el.Current.IsOffscreen).ToArray();
             if (named.Length == 1) return named[0];
@@ -438,13 +598,20 @@ internal static class ChromeExtensionInstaller
     private static bool HasDialogAncestor(AutomationElement button)
     {
         var walker = TreeWalker.RawViewWalker;
-        for (var item = walker.GetParent(button); item is not null; item = walker.GetParent(item))
+        var depth = 0;
+        for (var item = walker.GetParent(button); item is not null && depth < 10; item = walker.GetParent(item), depth++)
         {
-            var localized = item.Current.LocalizedControlType;
-            if (localized is "dialog" or "对话框" or "對話框" ||
-                item.TryGetCurrentPattern(WindowPattern.Pattern, out var pattern) && ((WindowPattern)pattern).Current.IsModal)
+            var cls = item.Current.ClassName;
+            if (cls is "DialogClientView" or "BubbleFrameView" or "DialogClientView::ButtonRowContainer")
                 return true;
-            if (item.Current.ControlType == ControlType.Document) break;
+            var localized = item.Current.LocalizedControlType;
+            if (localized is "dialog" or "对话框" or "對話框" or "alert" or "警报" or "警示" ||
+                (item.Current.ControlType == ControlType.Window &&
+                    item.Current.Name.Contains(ExtensionName, StringComparison.OrdinalIgnoreCase)) ||
+                (item.TryGetCurrentPattern(WindowPattern.Pattern, out var pattern) && ((WindowPattern)pattern).Current.IsModal))
+                return true;
+            if (item.Current.ControlType == ControlType.Document || cls is "BrowserRootView" or "#32769")
+                break;
         }
         return false;
     }
@@ -582,6 +749,13 @@ internal static class ChromeExtensionInstaller
         return value.ToString();
     }
 
+    private static string WindowTitle(IntPtr window)
+    {
+        var value = new System.Text.StringBuilder(256);
+        GetWindowText(window, value, value.Capacity);
+        return value.ToString();
+    }
+
     private static T Until<T>(Func<T?> find, TimeSpan timeout, CancellationToken cancellation, string error) where T : class
     {
         var elapsed = Stopwatch.StartNew();
@@ -614,6 +788,7 @@ internal static class ChromeExtensionInstaller
     [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr window, System.Text.StringBuilder name, int size);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowText(IntPtr window, System.Text.StringBuilder text, int size);
     [DllImport("user32.dll")] private static extern IntPtr GetDlgItem(IntPtr dialog, int id);
     [DllImport("user32.dll")] private static extern IntPtr GetParent(IntPtr window);
     [DllImport("user32.dll")] private static extern int GetDlgCtrlID(IntPtr window);

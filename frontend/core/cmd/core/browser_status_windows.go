@@ -102,14 +102,30 @@ func browserPreferencesContain(name string) (bool, error) {
 	}
 	var prefs struct {
 		Extensions struct {
-			Settings map[string]json.RawMessage
+			Settings map[string]struct {
+				Path     string          `json:"path"`
+				Location int             `json:"location"`
+				Manifest json.RawMessage `json:"manifest"`
+			}
 		}
 	}
 	if err := json.NewDecoder(io.LimitReader(f, 16<<20)).Decode(&prefs); err != nil {
 		return false, err
 	}
-	_, installed := prefs.Extensions.Settings[browserExtensionID]
-	return installed, nil
+	setting, installed := prefs.Extensions.Settings[browserExtensionID]
+	if !installed || (setting.Path == "" && len(setting.Manifest) == 0) {
+		return false, nil
+	}
+	if setting.Path != "" {
+		manifest, err := os.Stat(filepath.Join(setting.Path, "manifest.json"))
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		if err == nil && !manifest.Mode().IsRegular() {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func (a *agent) desktopOperation(ctx context.Context, kind proto.MessageType, req proto.DesktopRequest, progress func(string)) proto.DesktopResult {
