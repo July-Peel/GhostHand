@@ -159,12 +159,12 @@ func (s *Server) restoreDevice(w http.ResponseWriter, r *http.Request, session a
 
 func (s *Server) deleteDevice(w http.ResponseWriter, r *http.Request, session auth.Session, _ string) {
 	id := r.PathValue("device")
-	localFiles, err := s.agents.DeleteDevice(r.Context(), session.UserID, id)
+	files, err := s.agents.DeleteDevice(r.Context(), session.UserID, id)
 	if err != nil {
 		agentError(w, r, err)
 		return
 	}
-	s.workbench.CleanupDeviceState(r.Context(), id, localFiles)
+	s.workbench.CleanupDeviceState(r.Context(), id, files)
 	w.WriteHeader(http.StatusNoContent)
 }
 

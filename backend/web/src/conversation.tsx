@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
-import type { FormEvent, KeyboardEvent } from 'react'
+import type { ClipboardEvent, DragEvent, FormEvent, KeyboardEvent } from 'react'
 import { useInfiniteQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Activity, ArrowLeft, ArrowUp, BatteryCharging, Camera, Check, ChevronDown, CircleAlert, Copy, Download, Info, LoaderCircle, Send, Shield, Terminal, Trash2, Zap } from 'lucide-react'
+import { Activity, ArrowLeft, ArrowUp, BatteryCharging, Camera, Check, ChevronDown, CircleAlert, Copy, Download, ImagePlus, Info, LoaderCircle, Send, Shield, Terminal, Trash2, X, Zap } from 'lucide-react'
 import { api, devicesKey, errorText, messagesKey } from './api'
 import type { Command, ConfirmCard, Device, MediaCard, Message, Session, StatusCard, TaskAction, TaskCard } from './api'
 import { Battery, Connection, Details, DeviceIcon, Panel, desktops } from './device-ui'
@@ -9,6 +9,8 @@ import { BrowserExtensionSection, DeviceOperations } from './agent-ui'
 import { agentAPI, connectionKey } from './agent-api'
 import { RDPSection } from './rdp-ui'
 import { MarkdownContent } from './markdown'
+import { acceptedChatImages, maxChatImages, prepareChatImage } from './chat-images'
+import type { PendingImage } from './chat-images'
 
 const timeFormat = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
 const stateText: Record<TaskCard['state'], string> = {
@@ -28,6 +30,7 @@ const taskErrors: Record<string, string> = {
   E_INTERNAL: '任务执行时发生错误。',
 }
 const commandIcons = { 'device.battery': Zap, 'device.info': Info, 'screen.capture': Camera }
+type PendingAttachment = PendingImage & { id: number }
 
 export function Conversation({ device, commands, session, opened, back }: {
   device: Device
@@ -40,8 +43,16 @@ export function Conversation({ device, commands, session, opened, back }: {
   const [confirmClear, setConfirmClear] = useState(false)
   const [draft, setDraft] = useState('')
   const [slashDismissed, dismissSlash] = useState(false)
+  const [pendingImages, setPendingImages] = useState<PendingAttachment[]>([])
+  const nextImageID = useRef(0)
+  const [imagePreview, setImagePreview] = useState<PendingImage | null>(null)
+  const [imageError, setImageError] = useState('')
+  const [preparing, setPreparing] = useState(false)
+  const preparingRef = useRef(false)
+  const [dragging, setDragging] = useState(false)
   const scroller = useRef<HTMLDivElement>(null)
   const composerRef = useRef<HTMLTextAreaElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const pinned = useRef(true)
   const olderPosition = useRef<{ height: number; top: number } | null>(null)
   const client = useQueryClient()
@@ -63,9 +74,11 @@ export function Conversation({ device, commands, session, opened, back }: {
     : []
 
   const send = useMutation({
-    mutationFn: (text: string) => api.send(device.id, text, session.csrf_token),
-    onSuccess: (_, text) => {
+    mutationFn: ({ text, images }: { text: string; images: PendingAttachment[] }) =>
+      api.send(device.id, text, session.csrf_token, images.map(image => image.file)),
+    onSuccess: (_, { text, images }) => {
       setDraft(current => current.trim() === text ? '' : current)
+      setPendingImages(current => current.filter(image => !images.includes(image)))
       pinned.current = true
       void client.invalidateQueries({ queryKey: key })
     },
@@ -117,13 +130,82 @@ export function Conversation({ device, commands, session, opened, back }: {
     } else if (pinned.current) {
       node.scrollTop = node.scrollHeight
     }
-  }, [history.data, history.isFetchingNextPage, opened])
+  }, [history.data, history.isFetchingNextPage, opened, pendingImages.length])
 
   function submit(text: string) {
     const value = text.trim()
-    if (!value || send.isPending) return
+    if ((!value && pendingImages.length === 0) || send.isPending || preparingRef.current) return
+    if (pendingImages.length > 0 && (value.startsWith('/') || commands.some(command => command.title === value))) {
+      setImageError('快捷指令不支持携带图片，请直接发送文字指令或移除图片。')
+      return
+    }
+    setImageError('')
     dismissSlash(true)
-    send.mutate(value)
+    send.mutate({ text: value, images: pendingImages })
+  }
+
+  async function addImages(files: File[]) {
+    if (files.length === 0 || send.isPending) return
+    if (preparingRef.current) {
+      setImageError('正在处理图片，请稍后再添加。')
+      return
+    }
+    preparingRef.current = true
+    setPreparing(true)
+    setImageError('')
+    const added: PendingAttachment[] = []
+    const errors = new Set<string>()
+    try {
+      for (const file of files) {
+        if (pendingImages.length + added.length >= maxChatImages) {
+          errors.add('单条消息最多上传 4 张图片。')
+          break
+        }
+        try {
+          added.push({ ...await prepareChatImage(file), id: nextImageID.current++ })
+        } catch (error) {
+          errors.add(error instanceof Error ? error.message : '无法读取这张图片。')
+        }
+      }
+      setPendingImages(current => [...current, ...added])
+      if (errors.size > 0) setImageError(Array.from(errors).join(' '))
+    } finally {
+      preparingRef.current = false
+      setPreparing(false)
+    }
+  }
+
+  function pasteImages(event: ClipboardEvent<HTMLTextAreaElement>) {
+    const files = Array.from(event.clipboardData.items).flatMap(item => {
+      const file = item.kind === 'file' ? item.getAsFile() : null
+      return file ? [file] : []
+    })
+    if (files.length === 0) return
+    event.preventDefault()
+    const text = event.clipboardData.getData('text/plain')
+    if (text) {
+      const input = event.currentTarget
+      const selected = input.selectionEnd - input.selectionStart
+      input.setRangeText(text.slice(0, input.maxLength - input.value.length + selected), input.selectionStart, input.selectionEnd, 'end')
+      setDraft(input.value)
+      dismissSlash(false)
+    }
+    void addImages(files)
+  }
+
+  function dragImages(event: DragEvent<HTMLDivElement>) {
+    if (!event.dataTransfer.types.includes('Files')) return
+    event.preventDefault()
+    const blocked = send.isPending || preparing
+    event.dataTransfer.dropEffect = blocked ? 'none' : 'copy'
+    setDragging(!blocked)
+  }
+
+  function dropImages(event: DragEvent<HTMLDivElement>) {
+    if (!event.dataTransfer.types.includes('Files')) return
+    event.preventDefault()
+    setDragging(false)
+    void addImages(Array.from(event.dataTransfer.files))
   }
 
   function submitForm(event: FormEvent<HTMLFormElement>) {
@@ -213,40 +295,83 @@ export function Conversation({ device, commands, session, opened, back }: {
               {availableCommands.map(command => {
                 const Icon = commandIcons[command.capability]
                 return (
-                  <button type="button" className="quick-command" key={command.slash} onClick={() => submit(command.slash)} disabled={send.isPending}>
+                  <button type="button" className="quick-command" key={command.slash} onClick={() => submit(command.slash)} disabled={send.isPending || preparing}>
                     <Icon size={15} />{command.title}
                   </button>
                 )
               })}
             </div>
           )}
-          {send.isError && <p className="inline-error" role="alert">{errorText(send.error)}</p>}
-          <div className="composer-field">
+          {(imageError || send.isError) && <p className="inline-error" role="alert">{imageError || errorText(send.error)}</p>}
+          <div
+            className={'composer-field' + (dragging ? ' is-dragging' : '')}
+            onDragOver={dragImages}
+            onDragLeave={event => {
+              if (!(event.relatedTarget instanceof Node) || !event.currentTarget.contains(event.relatedTarget)) setDragging(false)
+            }}
+            onDrop={dropImages}
+          >
             {suggestions.length > 0 && (
               <ul className="slash-menu" aria-label="可用指令">
                 {suggestions.map(command => (
                   <li key={command.slash}>
-                    <button type="button" onClick={() => submit(command.slash)} disabled={send.isPending}>
+                    <button type="button" onClick={() => submit(command.slash)} disabled={send.isPending || preparing}>
                       <Terminal size={16} /><span>{command.title}</span><code>{command.slash}</code>
                     </button>
                   </li>
                 ))}
               </ul>
             )}
-            <textarea
-              ref={composerRef}
-              aria-label="消息内容" rows={2} maxLength={2000} value={draft}
-              placeholder="描述想在设备上完成的任务，或键入 / 查看指令"
-              onChange={event => { setDraft(event.target.value); dismissSlash(false) }}
-              onKeyDown={composerKey}
-            />
-            <button type="submit" className="primary-button send-button" aria-label="发送消息" disabled={!draft.trim() || send.isPending}>
-              {send.isPending ? <LoaderCircle size={18} className="spin" /> : <Send size={18} />}
-            </button>
+            {pendingImages.length > 0 && (
+              <div className="composer-attachments" aria-label="待发送图片">
+                {pendingImages.map(image => (
+                  <div className="composer-thumb" key={image.id}>
+                    <button type="button" className="composer-thumb-preview" onClick={() => setImagePreview(image)} aria-label={'预览 ' + image.file.name}>
+                      <img src={image.preview} alt={image.file.name} />
+                    </button>
+                    <button
+                      type="button" className="composer-thumb-remove" disabled={send.isPending} aria-label={'移除 ' + image.file.name}
+                      onClick={() => { setPendingImages(current => current.filter(item => item !== image)); setImageError('') }}
+                    ><X size={13} /></button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div className="composer-controls">
+              <input
+                ref={fileInputRef} type="file" accept={acceptedChatImages} multiple hidden
+                onChange={event => {
+                  const files = Array.from(event.currentTarget.files ?? [])
+                  event.currentTarget.value = ''
+                  void addImages(files)
+                }}
+              />
+              <button
+                type="button" className="icon-button attach-button" disabled={send.isPending || preparing}
+                title="添加图片（也支持直接 Ctrl+V 粘贴）" aria-label="添加图片" onClick={() => fileInputRef.current?.click()}
+              >
+                {preparing ? <LoaderCircle size={19} className="spin" /> : <ImagePlus size={19} />}
+              </button>
+              <textarea
+                ref={composerRef}
+                aria-label="消息内容" rows={2} maxLength={2000} value={draft}
+                placeholder="描述想在设备上完成的任务，或键入 / 查看指令"
+                onChange={event => { setDraft(event.target.value); dismissSlash(false); setImageError('') }}
+                onKeyDown={composerKey}
+                onPaste={pasteImages}
+              />
+              <button
+                type="submit" className="primary-button send-button" aria-label="发送消息"
+                disabled={(!draft.trim() && pendingImages.length === 0) || send.isPending || preparing}
+              >
+                {send.isPending ? <LoaderCircle size={18} className="spin" /> : <Send size={18} />}
+              </button>
+            </div>
           </div>
           <p className="composer-hint">Enter 发送 · Shift + Enter 换行</p>
         </div>
       </form>
+      {imagePreview && <ImagePreview src={imagePreview.preview} name={imagePreview.file.name} close={() => setImagePreview(null)} />}
       {confirmClear && (
         <Panel
           title="清空聊天记录"
@@ -312,6 +437,9 @@ function MessageItem({ message, device, session }: { message: Message; device: D
   if (message.type === 'status_card') return <StatusMessage card={message.payload} />
   if (message.type === 'media') return <ScreenshotMessage card={message.payload} />
   if (message.type === 'confirm_card') return <ConfirmationMessage card={message.payload} device={device} session={session} />
+  if (message.sender === 'user' && message.payload) {
+    return <UserImageMessage text={message.text} time={time} images={message.payload.attachments} />
+  }
   if (message.sender === 'agent') {
     return (
       <div className="text-message agent">
@@ -328,6 +456,30 @@ function MessageItem({ message, device, session }: { message: Message; device: D
   return (
     <div className={'text-message ' + message.sender}>
       <p className="plain-text">{message.text}</p><time>{time}</time>
+    </div>
+  )
+}
+
+function UserImageMessage({ text, time, images }: { text: string; time: string; images: MediaCard[] }) {
+  const [previewID, setPreviewID] = useState<string | null>(null)
+  const selected = images.find(image => image.id === previewID)
+  const full = selected ? api.attachment(selected.id, 'content') : ''
+  return (
+    <div className="text-message user">
+      <div className="user-media-bubble">
+        {text && <p>{text}</p>}
+        {images.length > 0 ? (
+          <div className="user-message-images" aria-label="消息图片">
+            {images.map(image => (
+              <button type="button" key={image.id} aria-label={'预览 ' + image.name} onClick={() => setPreviewID(image.id)}>
+                <img src={api.attachment(image.id, 'thumb')} alt={image.name} loading="lazy" />
+              </button>
+            ))}
+          </div>
+        ) : !text && <span className="expired-image">图片已过期</span>}
+      </div>
+      <time>{time}</time>
+      {selected && <ImagePreview src={full} name={selected.name} download={full + '?download=1'} close={() => setPreviewID(null)} />}
     </div>
   )
 }
@@ -431,29 +583,39 @@ function StatusMessage({ card }: { card: StatusCard }) {
 
 function ScreenshotMessage({ card }: { card: MediaCard }) {
   const [preview, setPreview] = useState(false)
-  const [zoomed, setZoomed] = useState(false)
   const full = api.attachment(card.id, 'content')
   return (
     <article className="message-card media-card">
-      <button type="button" className="media-thumbnail" aria-label="预览截图" onClick={() => { setZoomed(false); setPreview(true) }}>
+      <button type="button" className="media-thumbnail" aria-label="预览截图" onClick={() => setPreview(true)}>
         <img src={api.attachment(card.id, 'thumb')} alt="主显示器截图" loading="lazy" />
       </button>
       <footer>
         <span>截图 · {Math.max(1, Math.round(card.size / 1024))} KB</span>
         <a className="text-button" href={full + '?download=1'} download={card.name}><Download size={14} />下载</a>
       </footer>
-      {preview && (
-        <Panel title="截图预览" className="media-preview" close={() => setPreview(false)}>
-          <div className={'media-preview-image' + (zoomed ? ' zoomed' : '')}>
-            <img src={full} alt="主显示器截图" />
-          </div>
-          <footer>
-            <button type="button" className="text-button" onClick={() => setZoomed(value => !value)}>{zoomed ? '适应窗口' : '放大'}</button>
-            <a className="text-button" href={full + '?download=1'} download={card.name}><Download size={14} />下载</a>
-          </footer>
-        </Panel>
-      )}
+      {preview && <ImagePreview src={full} name={card.name} title="截图预览" download={full + '?download=1'} close={() => setPreview(false)} />}
     </article>
+  )
+}
+
+function ImagePreview({ src, name, title = '图片预览', download, close }: {
+  src: string
+  name: string
+  title?: string
+  download?: string
+  close: () => void
+}) {
+  const [zoomed, setZoomed] = useState(false)
+  return (
+    <Panel title={title} className="media-preview" close={close}>
+      <div className={'media-preview-image' + (zoomed ? ' zoomed' : '')}>
+        <img src={src} alt={name} />
+      </div>
+      <footer>
+        <button type="button" className="text-button" onClick={() => setZoomed(value => !value)}>{zoomed ? '适应窗口' : '放大'}</button>
+        {download && <a className="text-button" href={download} download={name}><Download size={14} />下载原图</a>}
+      </footer>
+    </Panel>
   )
 }
 

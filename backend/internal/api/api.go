@@ -214,22 +214,81 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request, _ auth.Session
 }
 
 func (s *Server) send(w http.ResponseWriter, r *http.Request, session auth.Session, _ string) {
-	var input struct {
-		Text string `json:"text"`
+	var text string
+	var images []workbench.UploadImage
+	contentType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if contentType == "multipart/form-data" {
+		var ok bool
+		text, images, ok = readChatForm(w, r)
+		if !ok {
+			return
+		}
+	} else {
+		var input struct {
+			Text string `json:"text"`
+		}
+		if !readJSON(w, r, &input) {
+			return
+		}
+		text = strings.TrimSpace(input.Text)
+		if text == "" || utf8.RuneCountInString(text) > 2000 {
+			fail(w, http.StatusBadRequest, "消息长度须为 1–2000 个字符。")
+			return
+		}
 	}
-	if !readJSON(w, r, &input) {
-		return
-	}
-	input.Text = strings.TrimSpace(input.Text)
-	if input.Text == "" || utf8.RuneCountInString(input.Text) > 2000 {
-		fail(w, http.StatusBadRequest, "消息长度须为 1–2000 个字符。")
-		return
-	}
-	if err := s.workbench.Send(r.Context(), session.UserID, r.PathValue("device"), input.Text); err != nil {
+	if err := s.workbench.Send(r.Context(), session.UserID, r.PathValue("device"), text, images); err != nil {
 		workbenchError(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func readChatForm(w http.ResponseWriter, r *http.Request) (string, []workbench.UploadImage, bool) {
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(90 * time.Second))
+	r.Body = http.MaxBytesReader(w, r.Body, workbench.MaxChatImages*workbench.MaxChatImageSize+(1<<20))
+	if err := r.ParseMultipartForm(8 << 20); err != nil {
+		var oversized *http.MaxBytesError
+		if errors.As(err, &oversized) {
+			fail(w, http.StatusRequestEntityTooLarge, "请求过大。")
+		} else {
+			fail(w, http.StatusBadRequest, "无法读取图片上传表单。")
+		}
+		return "", nil, false
+	}
+	defer r.MultipartForm.RemoveAll()
+	text := strings.TrimSpace(r.FormValue("text"))
+	files := r.MultipartForm.File["images"]
+	switch {
+	case len(files) > workbench.MaxChatImages:
+		workbenchError(w, r, workbench.ErrChatImageCount)
+		return "", nil, false
+	case text == "" && len(files) == 0:
+		fail(w, http.StatusBadRequest, "请输入消息内容或添加图片。")
+		return "", nil, false
+	case utf8.RuneCountInString(text) > 2000:
+		fail(w, http.StatusBadRequest, "消息长度须为 1–2000 个字符。")
+		return "", nil, false
+	}
+	images := make([]workbench.UploadImage, 0, len(files))
+	for _, header := range files {
+		if header.Size > workbench.MaxChatImageSize {
+			workbenchError(w, r, workbench.ErrChatImageSize)
+			return "", nil, false
+		}
+		file, err := header.Open()
+		if err != nil {
+			internalError(w, r, err)
+			return "", nil, false
+		}
+		data, err := io.ReadAll(io.LimitReader(file, workbench.MaxChatImageSize+1))
+		_ = file.Close()
+		if err != nil {
+			internalError(w, r, err)
+			return "", nil, false
+		}
+		images = append(images, workbench.UploadImage{Name: header.Filename, Data: data})
+	}
+	return text, images, true
 }
 
 func (s *Server) clearMessages(w http.ResponseWriter, r *http.Request, session auth.Session, _ string) {
@@ -305,8 +364,13 @@ func workbenchError(w http.ResponseWriter, r *http.Request, err error) {
 		fail(w, http.StatusNotFound, "任务不存在。")
 	case errors.Is(err, workbench.ErrTaskControl):
 		fail(w, http.StatusConflict, "任务当前无法执行此操作。")
+	case errors.Is(err, workbench.ErrChatImagesExpired):
+		fail(w, http.StatusConflict, err.Error())
 	case errors.Is(err, workbench.ErrUnknownCommand):
 		fail(w, http.StatusBadRequest, "未知的快捷指令。")
+	case errors.Is(err, workbench.ErrChatImageCount), errors.Is(err, workbench.ErrChatImageSize),
+		errors.Is(err, workbench.ErrChatImageData), errors.Is(err, workbench.ErrCommandImages):
+		fail(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, workbench.ErrUnsupported):
 		fail(w, http.StatusConflict, "此设备不支持该快捷指令。")
 	default:

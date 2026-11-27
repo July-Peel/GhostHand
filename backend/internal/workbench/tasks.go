@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"time"
 
+	"ghosthand/backend/internal/settings"
 	"ghosthand/proto"
 )
 
@@ -155,6 +156,14 @@ func RequeueUnacknowledged(ctx context.Context, tx *sql.Tx, device string) error
 }
 
 func (s *Service) Control(ctx context.Context, userID int64, device, task, action string) error {
+	var images []storedImage
+	if action == "retry" {
+		var err error
+		images, err = s.stageRetryImages(ctx, device, task)
+		if err != nil {
+			return err
+		}
+	}
 	err := s.store.Write(ctx, func(tx *sql.Tx) error {
 		var state proto.TaskState
 		var lane proto.Lane
@@ -182,6 +191,12 @@ func (s *Service) Control(ctx context.Context, userID int64, device, task, actio
 			info, err := scanDevice(tx.QueryRowContext(ctx, "SELECT "+deviceFields+" FROM devices d WHERE d.id=?", device))
 			if err != nil {
 				return err
+			}
+			if len(images) > 0 {
+				if err := insertChatImageTask(ctx, tx, info, userID, prompt, images, "", created); err != nil {
+					return err
+				}
+				break
 			}
 			command := commandFor(capability)
 			request := command.Slash
@@ -222,10 +237,49 @@ func (s *Service) Control(ctx context.Context, userID int64, device, task, actio
 		}
 		return RecordChange(ctx, tx, device)
 	})
-	if err == nil && (action == "cancel" || action == "force") {
+	if err != nil {
+		s.deleteStagedImages(ctx, images)
+	} else if action == "cancel" || action == "force" {
 		s.cancelBrainSession(device, task)
 	}
 	return err
+}
+
+func (s *Service) stageRetryImages(ctx context.Context, device, task string) ([]storedImage, error) {
+	var raw string
+	err := s.store.QueryRowContext(ctx, `SELECT m.payload_json FROM chat_messages m
+		JOIN tasks t ON t.id=m.task_id JOIN devices d ON d.id=t.device_id
+		WHERE m.device_id=? AND m.task_id=? AND m.sender='user' AND m.type='text' AND m.payload_json IS NOT NULL
+		AND t.source='brain' AND t.state IN ('failed','expired') AND (d.is_demo=0 OR ?)`, device, task, s.demo).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var payload userMediaPayload
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return nil, err
+	}
+	if len(payload.Attachments) == 0 {
+		return nil, ErrChatImagesExpired
+	}
+	uploads := make([]UploadImage, 0, len(payload.Attachments))
+	for _, card := range payload.Attachments {
+		data, err := s.loadModelImage(ctx, card.ID)
+		if errors.Is(err, ErrTaskNotFound) {
+			return nil, ErrChatImagesExpired
+		}
+		if err != nil {
+			return nil, err
+		}
+		uploads = append(uploads, UploadImage{Name: card.Name, Data: data})
+	}
+	configs, err := s.config.Read(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.stageChatImages(ctx, uploads, configs[settings.WebDAV])
 }
 
 func enqueueTaskCancel(ctx context.Context, tx *sql.Tx, device, task string, force, withdraw bool) error {

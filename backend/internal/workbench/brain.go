@@ -23,6 +23,8 @@ var errBrainDenied = errors.New("管理员已拒绝该操作，任务已停止�
 
 var brainCommand = Command{Title: "AI 任务", Capability: proto.BrainTask, Lane: proto.UILane}
 
+const imageAnalysisPrompt = "请分析用户上传的图片，并根据图片内容协助处理。"
+
 type brainTask struct {
 	id, device, prompt, title, source string
 	quiet                             bool
@@ -56,13 +58,20 @@ func CanonicalResources(resources []proto.MCPResource) []proto.MCPResource {
 
 func (s *Service) queueBrain(ctx context.Context, tx *sql.Tx, device Device, user int64, prompt string,
 	config settings.Configuration, now time.Time) error {
-	if config.Endpoint == "" || config.Label == "" {
-		return addReply(ctx, tx, device.ID, "", "尚未配置 AI 模型接口。请在「系统设置 → 模型接口」填写服务地址并选择模型，或使用下方快捷指令。", now.UnixMilli())
-	}
-	if device.Demo || device.Platform != proto.Windows {
-		return addReply(ctx, tx, device.ID, "", "AI 任务需要已配对的 Windows 执行器。", now.UnixMilli())
+	if message := brainUnavailable(device, config); message != "" {
+		return addReply(ctx, tx, device.ID, "", message, now.UnixMilli())
 	}
 	return createTask(ctx, tx, user, device, brainCommand, prompt, now)
+}
+
+func brainUnavailable(device Device, config settings.Configuration) string {
+	if config.Endpoint == "" || config.Label == "" {
+		return "尚未配置 AI 模型接口。请在「系统设置 → 模型接口」填写服务地址并选择模型，或使用下方快捷指令。"
+	}
+	if device.Demo || device.Platform != proto.Windows {
+		return "AI 任务需要已配对的 Windows 执行器。"
+	}
+	return ""
 }
 
 func addReply(ctx context.Context, tx *sql.Tx, device, task, content string, now int64) error {
@@ -375,7 +384,15 @@ func (s *Service) runLoop(ctx context.Context, task brainTask, unlock *taskUnloc
 	if !autoApprove {
 		modelTools = append(slicesClone(tools), proto.ConfirmTool)
 	}
-	session, err := brain.New(config.Endpoint, config.Secret, config.Label, task.prompt, modelTools)
+	images, err := s.loadTaskUserImages(ctx, task.id)
+	if err != nil {
+		return "", err
+	}
+	prompt := task.prompt
+	if prompt == "" && len(images) > 0 {
+		prompt = imageAnalysisPrompt
+	}
+	session, err := brain.NewWithImages(config.Endpoint, config.Secret, config.Label, prompt, images, modelTools)
 	if err != nil {
 		return "", err
 	}
@@ -549,7 +566,43 @@ func (s *Service) loadModelImage(ctx context.Context, id string) ([]byte, error)
 		return nil, err
 	}
 	defer body.Close()
-	return io.ReadAll(io.LimitReader(body, proto.MaxScreenshotSize))
+	data, err := io.ReadAll(io.LimitReader(body, MaxChatImageSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) == 0 || len(data) > MaxChatImageSize {
+		return nil, ErrChatImageData
+	}
+	return data, nil
+}
+
+func (s *Service) loadTaskUserImages(ctx context.Context, task string) ([][]byte, error) {
+	rows, err := s.store.QueryContext(ctx, `SELECT id FROM attachments
+		WHERE task_id=? AND upload_id`+userUploadIDs+` ORDER BY upload_id`, task)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	var images [][]byte
+	for _, id := range ids {
+		data, err := s.loadModelImage(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		images = append(images, data)
+	}
+	return images, nil
 }
 
 func limitText(s string, n int) string {

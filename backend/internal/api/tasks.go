@@ -110,5 +110,5 @@ func (s *Server) attachment(w http.ResponseWriter, r *http.Request, _ auth.Sessi
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	_, _ = io.Copy(w, io.LimitReader(body, proto.MaxScreenshotSize))
+	_, _ = io.Copy(w, io.LimitReader(body, workbench.MaxChatImageSize))
 }

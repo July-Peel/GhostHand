@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -46,6 +47,114 @@ func TestToolLimitAndHistoryCompaction(t *testing.T) {
 			t.Fatalf("invalid compacted output at round %d", i)
 		}
 	}
+}
+
+func TestUserImagesSurviveToolRounds(t *testing.T) {
+	const original = "data:image/jpeg;base64,AQID"
+	const screenshot = "data:image/jpeg;base64,BAUG"
+	requests := captureImageRequests(t, 0)
+	s, err := NewWithImages(requests.URL, "", "vision", "查看图片", [][]byte{{1, 2, 3}}, proto.DeviceTools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Clear()
+	for i, want := range [][]string{{original}, {original, screenshot}, {original}} {
+		turn, err := s.Next(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := <-requests.bodies
+		if got := modelImageURLs(t, body); !reflect.DeepEqual(got, want) {
+			t.Fatalf("round %d images = %v, want %v", i+1, got, want)
+		}
+		if i == 0 {
+			var first struct {
+				Role    string
+				Content []map[string]string
+			}
+			if err := json.Unmarshal(body[0], &first); err != nil {
+				t.Fatal(err)
+			}
+			if first.Role != "user" || len(first.Content) != 2 || first.Content[0]["type"] != "input_text" ||
+				first.Content[0]["text"] != "查看图片" || first.Content[1]["detail"] != "auto" {
+				t.Fatalf("initial input = %s", body[0])
+			}
+			s.Return(turn.Calls, []Observation{{Text: "屏幕内容", JPEG: []byte{4, 5, 6}}})
+		} else {
+			s.Return(turn.Calls, []Observation{{Text: "工具结果"}})
+		}
+	}
+}
+
+func TestUserImagesFallbackForTextOnlyModel(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusUnprocessableEntity} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			requests := captureImageRequests(t, status)
+			s, err := NewWithImages(requests.URL, "", "text", "查看图片", [][]byte{{1, 2, 3}}, proto.DeviceTools)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Clear()
+			if _, err := s.Next(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			initial, fallback := <-requests.bodies, <-requests.bodies
+			if len(modelImageURLs(t, initial)) != 1 || len(modelImageURLs(t, fallback)) != 0 ||
+				!strings.Contains(string(fallback[0]), "用户上传了图片（当前模型不支持视觉输入）。") {
+				t.Fatalf("fallback input = %s", fallback[0])
+			}
+		})
+	}
+}
+
+type imageRequests struct {
+	URL    string
+	bodies chan []json.RawMessage
+}
+
+func captureImageRequests(t *testing.T, firstStatus int) imageRequests {
+	t.Helper()
+	bodies := make(chan []json.RawMessage, 3)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct{ Input []json.RawMessage }
+		if r.URL.Path != "/v1/responses" || json.NewDecoder(r.Body).Decode(&request) != nil || len(request.Input) == 0 {
+			t.Error("invalid Responses request")
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		bodies <- request.Input
+		if firstStatus != 0 {
+			w.WriteHeader(firstStatus)
+			firstStatus = 0
+			return
+		}
+		fmt.Fprintf(w, `{"status":"completed","output":[{"type":"function_call","call_id":"call_%d","name":"device_get_status","arguments":"{}"}]}`, len(request.Input))
+	}))
+	t.Cleanup(srv.Close)
+	return imageRequests{URL: srv.URL, bodies: bodies}
+}
+
+func modelImageURLs(t *testing.T, input []json.RawMessage) []string {
+	t.Helper()
+	var urls []string
+	for _, item := range input {
+		var message struct {
+			Role    string
+			Content []map[string]string
+		}
+		if err := json.Unmarshal(item, &message); err != nil {
+			t.Fatal(err)
+		}
+		if message.Role != "user" {
+			continue
+		}
+		for _, block := range message.Content {
+			if block["type"] == "input_image" {
+				urls = append(urls, block["image_url"])
+			}
+		}
+	}
+	return urls
 }
 
 func TestOpenAIResponsesLoop(t *testing.T) {

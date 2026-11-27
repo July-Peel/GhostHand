@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -17,7 +18,6 @@ import (
 
 	"ghosthand/backend/internal/db"
 	"ghosthand/backend/internal/settings"
-	"ghosthand/backend/internal/storage"
 	"ghosthand/proto"
 )
 
@@ -321,20 +321,40 @@ func (s *Service) Messages(ctx context.Context, deviceID string, before int64) (
 	return page, nil
 }
 
-func (s *Service) Send(ctx context.Context, userID int64, deviceID, text string) error {
+func (s *Service) Send(ctx context.Context, userID int64, deviceID, text string, images []UploadImage) error {
+	if len(images) > MaxChatImages {
+		return ErrChatImageCount
+	}
 	command, err := findCommand(text)
+	if len(images) > 0 && (command.Capability != "" || errors.Is(err, ErrUnknownCommand)) {
+		return ErrCommandImages
+	}
 	if err != nil {
 		return err
 	}
-	var model settings.Configuration
+	var configs map[settings.Kind]settings.Configuration
 	if command.Capability == "" {
-		configs, err := s.config.Read(ctx)
+		configs, err = s.config.Read(ctx)
 		if err != nil {
 			return err
 		}
-		model = configs[settings.LLM]
 	}
-	return s.store.Write(ctx, func(tx *sql.Tx) error {
+	var stored []storedImage
+	if len(images) > 0 {
+		var exists bool
+		if err := s.store.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM devices WHERE id=? AND (is_demo=0 OR ?))",
+			deviceID, s.demo).Scan(&exists); err != nil {
+			return err
+		}
+		if !exists {
+			return ErrDeviceNotFound
+		}
+		stored, err = s.stageChatImages(ctx, images, configs[settings.WebDAV])
+		if err != nil {
+			return err
+		}
+	}
+	err = s.store.Write(ctx, func(tx *sql.Tx) error {
 		device, err := scanDevice(tx.QueryRowContext(ctx, "SELECT "+deviceFields+
 			" FROM devices d WHERE d.id=? AND (d.is_demo=0 OR ?)", deviceID, s.demo))
 		if errors.Is(err, sql.ErrNoRows) {
@@ -344,6 +364,12 @@ func (s *Service) Send(ctx context.Context, userID int64, deviceID, text string)
 			return err
 		}
 		now := time.Now()
+		if len(stored) > 0 {
+			if err := insertChatImageTask(ctx, tx, device, userID, text, stored, brainUnavailable(device, configs[settings.LLM]), now); err != nil {
+				return err
+			}
+			return RecordChange(ctx, tx, deviceID)
+		}
 		if command.Capability != "" && !command.supported(device) {
 			return ErrUnsupported
 		}
@@ -364,17 +390,73 @@ func (s *Service) Send(ctx context.Context, userID int64, deviceID, text string)
 			if err := createTask(ctx, tx, userID, device, command, "", now); err != nil {
 				return err
 			}
-		} else if err := s.queueBrain(ctx, tx, device, userID, text, model, now); err != nil {
+		} else if err := s.queueBrain(ctx, tx, device, userID, text, configs[settings.LLM], now); err != nil {
 			return err
 		}
 		return RecordChange(ctx, tx, deviceID)
 	})
+	if err != nil {
+		s.deleteStagedImages(ctx, stored)
+	}
+	return err
+}
+
+func (s *Service) stageChatImages(ctx context.Context, images []UploadImage, remote settings.Configuration) ([]storedImage, error) {
+	stored := make([]storedImage, 0, len(images))
+	now := time.Now()
+	for _, image := range images {
+		file, err := s.saveUserAttachment(ctx, image, remote, now)
+		if err != nil {
+			s.deleteStagedImages(ctx, stored)
+			return nil, err
+		}
+		stored = append(stored, file)
+	}
+	return stored, nil
+}
+
+func (s *Service) deleteStagedImages(ctx context.Context, stored []storedImage) {
+	for _, image := range stored {
+		s.deleteAttachmentFiles(ctx, image.AttachmentFiles)
+	}
+}
+
+func insertChatImageTask(ctx context.Context, tx *sql.Tx, device Device, user int64, prompt string, images []storedImage, unavailable string, now time.Time) error {
+	title := limitText(prompt, 80)
+	if title == "" {
+		title = "图片分析任务"
+	}
+	task, err := insertTask(ctx, tx, user, device, brainCommand, prompt, "brain", title, now, brainTaskTTL, true)
+	if err != nil {
+		return err
+	}
+	cards := make([]imageCard, 0, len(images))
+	for i, image := range images {
+		if err := image.insert(ctx, tx, task, fmt.Sprintf("user_%d", i), now); err != nil {
+			return err
+		}
+		cards = append(cards, imageCard{ID: image.ID, Name: image.name, Size: image.size})
+	}
+	payload, err := json.Marshal(userMediaPayload{Attachments: cards})
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO chat_messages(device_id,sender,type,text,task_id,payload_json,created_at)
+		VALUES (?,'user','text',?,?,?,?)`, device.ID, prompt, task, string(payload), now.UnixMilli()); err != nil {
+		return err
+	}
+	if unavailable != "" {
+		if err := finishTask(ctx, tx, task, proto.Failed, "", now.UnixMilli()); err != nil {
+			return err
+		}
+		return addReply(ctx, tx, device.ID, task, unavailable, now.UnixMilli())
+	}
+	return addTaskCard(ctx, tx, device.ID, task, now)
 }
 
 // ClearMessages deletes all chat history, tasks, and active LLM sessions for a device.
 func (s *Service) ClearMessages(ctx context.Context, userID int64, deviceID string) error {
-	type localFile struct{ key, thumb string }
-	var localFiles []localFile
+	var files []AttachmentFiles
 	var stopped []string
 	err := s.store.Write(ctx, func(tx *sql.Tx) error {
 		var exists bool
@@ -417,22 +499,8 @@ func (s *Service) ClearMessages(ctx context.Context, userID int64, deviceID stri
 			stopped = append(stopped, item.id)
 		}
 
-		attRows, err := tx.QueryContext(ctx, `SELECT a.storage_key, a.thumb_key
-			FROM attachments a JOIN tasks t ON t.id=a.task_id
-			WHERE t.device_id=? AND a.storage_backend='local'`, deviceID)
+		files, err = DeviceAttachmentFiles(ctx, tx, deviceID)
 		if err != nil {
-			return err
-		}
-		for attRows.Next() {
-			var f localFile
-			if err := attRows.Scan(&f.key, &f.thumb); err != nil {
-				attRows.Close()
-				return err
-			}
-			localFiles = append(localFiles, f)
-		}
-		attRows.Close()
-		if err := attRows.Err(); err != nil {
 			return err
 		}
 
@@ -454,10 +522,8 @@ func (s *Service) ClearMessages(ctx context.Context, userID int64, deviceID stri
 	for _, task := range stopped {
 		s.cancelBrainSession(deviceID, task)
 	}
-	local := storage.Local{Directory: s.fileDir}
-	for _, f := range localFiles {
-		_ = local.Delete(ctx, f.key)
-		_ = local.Delete(ctx, f.thumb)
+	for _, file := range files {
+		s.deleteAttachmentFiles(ctx, file)
 	}
 	return nil
 }
@@ -470,13 +536,11 @@ func (s *Service) RefreshSeq() int64 {
 	return s.refreshSeq.Load()
 }
 
-// CleanupDeviceState cancels active LLM sessions, deletes local attachment files, and notifies browsers to refresh.
-func (s *Service) CleanupDeviceState(ctx context.Context, deviceID string, localFiles [][2]string) {
+// CleanupDeviceState cancels active LLM sessions, deletes attachment files, and notifies browsers to refresh.
+func (s *Service) CleanupDeviceState(ctx context.Context, deviceID string, files []AttachmentFiles) {
 	s.cancelDeviceBrainSessions(deviceID)
-	local := storage.Local{Directory: s.fileDir}
-	for _, pair := range localFiles {
-		_ = local.Delete(ctx, pair[0])
-		_ = local.Delete(ctx, pair[1])
+	for _, file := range files {
+		s.deleteAttachmentFiles(ctx, file)
 	}
 	s.MarkRefresh()
 }
@@ -521,9 +585,7 @@ func insertTask(ctx context.Context, tx *sql.Tx, userID int64, device Device, co
 		return "", err
 	}
 	if !quiet {
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO chat_messages(device_id, sender, type, task_id, created_at) VALUES (?, 'agent', 'task_card', ?, ?)
-		`, device.ID, id, now.UnixMilli()); err != nil {
+		if err := addTaskCard(ctx, tx, device.ID, id, now); err != nil {
 			return "", err
 		}
 	}
@@ -531,6 +593,12 @@ func insertTask(ctx context.Context, tx *sql.Tx, userID int64, device Device, co
 		return "", err
 	}
 	return id, auditTask(ctx, tx, userID, device.ID, id, "task.create", now.UnixMilli())
+}
+
+func addTaskCard(ctx context.Context, tx *sql.Tx, device, task string, now time.Time) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO chat_messages(device_id,sender,type,task_id,created_at)
+		VALUES (?,'agent','task_card',?,?)`, device, task, now.UnixMilli())
+	return err
 }
 
 func auditTask(ctx context.Context, tx *sql.Tx, userID int64, deviceID, taskID, action string, now int64) error {

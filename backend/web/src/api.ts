@@ -46,6 +46,7 @@ export type TaskCard = {
 
 export type TaskAction = 'pause' | 'resume' | 'cancel' | 'force' | 'retry'
 export type MediaCard = { id: string; name: string; size: number }
+export type UserMediaPayload = { attachments: MediaCard[] }
 export type ConfirmCard = {
   id: string
   task_id: string
@@ -61,7 +62,8 @@ export type StatusCard = Pick<Device, 'battery_pct' | 'charging' | 'os_version' 
 
 type MessageBase = { id: number; sender: 'user' | 'agent' | 'system'; text: string; created_at: number }
 export type Message = MessageBase & (
-  | { type: 'text' | 'system' }
+  | { type: 'text'; payload?: UserMediaPayload }
+  | { type: 'system' }
   | { type: 'task_card'; payload: TaskCard }
   | { type: 'status_card'; payload: StatusCard }
   | { type: 'media'; payload: MediaCard }
@@ -145,7 +147,14 @@ export const api = {
   messages: (id: string, before: number, signal: AbortSignal) => request<MessagePage>(
     devicePath(id) + '/messages' + (before ? '?before=' + before : ''), { signal },
   ),
-  send: (id: string, text: string, csrf: string) => request<void>(devicePath(id) + '/messages', post({ text }, csrf)),
+  send: (id: string, text: string, csrf: string, files?: File[]) => {
+    const path = devicePath(id) + '/messages'
+    if (!files?.length) return request<void>(path, post({ text }, csrf))
+    const body = new FormData()
+    body.set('text', text)
+    for (const file of files) body.append('images', file)
+    return request<void>(path, { method: 'POST', headers: { 'X-CSRF-Token': csrf }, body })
+  },
   clearMessages: (id: string, csrf: string) => request<void>(devicePath(id) + '/messages/clear', post({}, csrf)),
   taskControl: (id: string, task: string, action: TaskAction, csrf: string) => request<void>(
     devicePath(id) + '/tasks/' + encodeURIComponent(task) + '/' + action, post({}, csrf),

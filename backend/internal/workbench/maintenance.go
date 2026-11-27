@@ -76,8 +76,8 @@ func (s *Service) backup(ctx context.Context, now time.Time) error {
 }
 
 type staleAttachment struct {
-	id, device, kind, key, thumb string
-	ref                          []byte
+	AttachmentFiles
+	device, task string
 }
 
 func (s *Service) prune(ctx context.Context, before int64) error {
@@ -94,7 +94,7 @@ func (s *Service) prune(ctx context.Context, before int64) error {
 	var cursor string
 	var cleanupErr error
 	for ctx.Err() == nil {
-		rows, err := s.store.QueryContext(ctx, `SELECT a.id,t.device_id,a.storage_backend,a.storage_key,a.thumb_key,a.storage_ref
+		rows, err := s.store.QueryContext(ctx, `SELECT a.id,t.device_id,t.id,a.storage_backend,a.storage_key,a.thumb_key,a.storage_ref
 			FROM attachments a JOIN tasks t ON t.id=a.task_id WHERE a.created_at<? AND t.finished_at IS NOT NULL AND a.id>?
 			ORDER BY a.id LIMIT 50`, before, cursor)
 		if err != nil {
@@ -103,7 +103,7 @@ func (s *Service) prune(ctx context.Context, before int64) error {
 		var batch []staleAttachment
 		for rows.Next() {
 			var a staleAttachment
-			if err := rows.Scan(&a.id, &a.device, &a.kind, &a.key, &a.thumb, &a.ref); err != nil {
+			if err := rows.Scan(&a.ID, &a.device, &a.task, &a.Kind, &a.Key, &a.Thumb, &a.Ref); err != nil {
 				rows.Close()
 				return errors.Join(cleanupErr, err)
 			}
@@ -117,7 +117,7 @@ func (s *Service) prune(ctx context.Context, before int64) error {
 			break
 		}
 		for _, a := range batch {
-			cursor = a.id
+			cursor = a.ID
 			if err := s.pruneAttachment(ctx, a); err != nil {
 				cleanupErr = err
 			}
@@ -127,19 +127,22 @@ func (s *Service) prune(ctx context.Context, before int64) error {
 }
 
 func (s *Service) pruneAttachment(ctx context.Context, a staleAttachment) error {
-	backend, err := s.screenshotBackend(a.id, a.kind, a.ref)
-	if err != nil {
-		return err
-	}
-	if err := errors.Join(backend.Delete(ctx, a.key), backend.Delete(ctx, a.thumb)); err != nil {
+	if err := s.removeAttachmentFiles(ctx, a.AttachmentFiles); err != nil {
 		return err
 	}
 	return s.store.Write(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, "DELETE FROM attachments WHERE id=?", a.id); err != nil {
+		if _, err := tx.ExecContext(ctx, "DELETE FROM attachments WHERE id=?", a.ID); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM chat_messages WHERE device_id=? AND type='media'
-			AND json_extract(payload_json,'$.id')=?`, a.device, a.id); err != nil {
+			AND json_extract(payload_json,'$.id')=?`, a.device, a.ID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `WITH matches AS (
+			SELECT m.id,j.key FROM chat_messages m, json_each(m.payload_json,'$.attachments') j
+			WHERE m.device_id=? AND m.task_id=? AND m.sender='user' AND m.type='text' AND json_extract(j.value,'$.id')=?
+		) UPDATE chat_messages SET payload_json=json_remove(payload_json,'$.attachments['||matches.key||']')
+		  FROM matches WHERE chat_messages.id=matches.id`, a.device, a.task, a.ID); err != nil {
 			return err
 		}
 		return RecordChange(ctx, tx, a.device)

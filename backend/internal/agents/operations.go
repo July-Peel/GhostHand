@@ -131,13 +131,13 @@ func (s *Service) Restore(ctx context.Context, user int64, id string) error {
 }
 
 // DeleteDevice removes an offline device and all its associated records and agent logs.
-func (s *Service) DeleteDevice(ctx context.Context, user int64, id string) ([][2]string, error) {
+func (s *Service) DeleteDevice(ctx context.Context, user int64, id string) ([]workbench.AttachmentFiles, error) {
 	s.connectionMu.Lock()
 	defer s.connectionMu.Unlock()
 	if s.connections[id] != nil {
 		return nil, ErrDeviceOnline
 	}
-	var localFiles [][2]string
+	var files []workbench.AttachmentFiles
 	var logIDs []string
 	err := s.store.Write(ctx, func(tx *sql.Tx) error {
 		var connState proto.ConnState
@@ -153,22 +153,8 @@ func (s *Service) DeleteDevice(ctx context.Context, user int64, id string) ([][2
 			return ErrDeviceOnline
 		}
 
-		attRows, err := tx.QueryContext(ctx, `SELECT a.storage_key, a.thumb_key
-			FROM attachments a JOIN tasks t ON t.id=a.task_id
-			WHERE t.device_id=? AND a.storage_backend='local'`, id)
+		files, err = workbench.DeviceAttachmentFiles(ctx, tx, id)
 		if err != nil {
-			return err
-		}
-		for attRows.Next() {
-			var pair [2]string
-			if err := attRows.Scan(&pair[0], &pair[1]); err != nil {
-				attRows.Close()
-				return err
-			}
-			localFiles = append(localFiles, pair)
-		}
-		attRows.Close()
-		if err := attRows.Err(); err != nil {
 			return err
 		}
 
@@ -209,7 +195,7 @@ func (s *Service) DeleteDevice(ctx context.Context, user int64, id string) ([][2
 	for _, opID := range logIDs {
 		_ = os.Remove(filepath.Join(logDir, opID+".jsonl.gz"))
 	}
-	return localFiles, nil
+	return files, nil
 }
 
 type OperationRequest struct {

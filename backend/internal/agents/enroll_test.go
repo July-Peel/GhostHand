@@ -214,7 +214,7 @@ func TestDeleteOfflineDeviceRemovesAllDataAndLogs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DeleteDevice: %v", err)
 	}
-	if len(localFiles) != 1 || localFiles[0][0] != "s.jpg" {
+	if len(localFiles) != 1 || localFiles[0].Key != "s.jpg" {
 		t.Fatalf("unexpected localFiles: %v", localFiles)
 	}
 	if _, err := os.Stat(logFile); !os.IsNotExist(err) {
