@@ -12,12 +12,34 @@ import { SettingsPanel } from './settings'
 import { PairingPanel } from './agent-ui'
 import { connectionKey, rdpKey } from './agent-api'
 
+const lastDeviceKey = 'ghosthand-last-device'
+
+function readLastDevice() {
+  try {
+    return localStorage.getItem(lastDeviceKey)
+  } catch {
+    return null
+  }
+}
+
+function saveLastDevice(id: string | null) {
+  try {
+    if (id === null) localStorage.removeItem(lastDeviceKey)
+    else localStorage.setItem(lastDeviceKey, id)
+  } catch {
+    // Device selection still works when browser storage is unavailable.
+  }
+}
+
 const useWorkspace = create<{
   selected: string | null
   select: (id: string | null) => void
 }>(set => ({
-  selected: null,
-  select: selected => set({ selected }),
+  selected: readLastDevice(),
+  select: selected => {
+    set({ selected })
+    if (selected !== null) saveLastDevice(selected)
+  },
 }))
 
 function DeviceRow({ device, active, select }: { device: Device; active: boolean; select: () => void }) {
@@ -118,6 +140,7 @@ export function Workspace({ session, brand, themeButton, onPasswordChanged }: {
     mutationFn: () => api.logout(session.csrf_token),
     onSuccess: () => {
       select(null)
+      saveLastDevice(null)
       client.setQueryData(sessionKey, null)
       client.removeQueries({ predicate: query => query.queryKey[0] !== sessionKey[0] })
     },
