@@ -229,7 +229,7 @@ func (j *journal) reportUninstall(op pendingOperation) (uint64, error) {
 		return op.ResultSeq, nil
 	}
 	seq, err := j.enqueueLocked(proto.OperationResult, proto.OperationOutcome{
-		ID: op.Operation.ID, Success: true, Detail: "Windows 服务清理已启动",
+		ID: op.Operation.ID, Success: true, Detail: "服务清理已启动",
 	})
 	if err != nil {
 		return 0, err

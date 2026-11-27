@@ -91,13 +91,13 @@ var DeviceTools = append([]MCPTool{
 	{ToolKey, "发送单个按键或组合快捷键（如 Win+R、Ctrl+Shift+Esc、Alt+F4、Enter），支持重复次数。", toolSchema(`"keys":{"type":"array","items":{"type":"string","maxLength":24},"minItems":1,"maxItems":5},"repeat":{"type":"integer","minimum":1,"maximum":50}`, `"keys"`), "interactive"},
 	{ToolScroll, "在当前窗口或指定坐标处滚动滚轮，或使用 from_xy 与 to_xy 跨坐标拖拽。", toolSchema(`"direction":{"type":"string","enum":["up","down","left","right"]},"distance":{"type":"integer","minimum":1,"maximum":5000},"x":{"type":"integer","minimum":-32768,"maximum":32767},"y":{"type":"integer","minimum":-32768,"maximum":32767},"from_xy":{"type":"array","items":{"type":"integer"},"minItems":2,"maxItems":2},"to_xy":{"type":"array","items":{"type":"integer"},"minItems":2,"maxItems":2}`, ""), "interactive"},
 	{ToolLaunch, "全能应用、系统工具、绝对路径、快捷方式、文件夹与 URI 启动器，支持启动参数和管理员提权。", toolSchema(`"name_or_path":{"type":"string","maxLength":512},"args":{"type":"string","maxLength":2000},"cwd":{"type":"string","maxLength":512},"run_as_admin":{"type":"boolean"}`, `"name_or_path"`), "interactive"},
-	{ToolProcesses, "直接读取 Windows 进程列表，支持过滤和按内存、CPU、PID、名称排序，锁屏时可用。", toolSchema(`"filter":{"type":"string","maxLength":120},"sort_by":{"type":"string","enum":["memory","cpu","pid","name"]},"limit":{"type":"integer","minimum":1,"maximum":300}`, ""), "read_only"},
-	{ToolProcessManage, "终止进程或进程树，或查询/启停/重启 Windows 系统服务（SYSTEM 权限，锁屏时可用）。", toolSchema(`"action":{"type":"string","enum":["kill","kill_tree","service_status","service_start","service_stop","service_restart"]},"pid":{"type":"integer","minimum":1},"name":{"type":"string","maxLength":256}`, `"action"`), "system"},
+	{ToolProcesses, "直接读取系统进程列表，支持过滤和按内存、CPU、PID、名称排序，锁屏时可用。", toolSchema(`"filter":{"type":"string","maxLength":120},"sort_by":{"type":"string","enum":["memory","cpu","pid","name"]},"limit":{"type":"integer","minimum":1,"maximum":300}`, ""), "read_only"},
+	{ToolProcessManage, "终止进程或进程树，或查询/启停/重启系统服务（Windows 服务 / Linux systemd / Alpine OpenRC）。", toolSchema(`"action":{"type":"string","enum":["kill","kill_tree","service_status","service_start","service_stop","service_restart"]},"pid":{"type":"integer","minimum":1},"name":{"type":"string","maxLength":256}`, `"action"`), "system"},
 	{ToolWindows, "枚举当前桌面所有顶层可见窗口（含句柄 ID、标题、进程名、PID、区域和窗口状态）。", toolSchema(`"filter":{"type":"string","maxLength":120},"include_minimized":{"type":"boolean"}`, ""), "read_only"},
 	{ToolWindowControl, "激活、最小化、最大化、还原、关闭或调整任意窗口位置大小（可按 window_id、title_contains 或 process_name 指定）。", toolSchema(`"window_id":{"type":"string","maxLength":24},"title_contains":{"type":"string","maxLength":120},"process_name":{"type":"string","maxLength":120},"action":{"type":"string","enum":["focus","minimize","maximize","restore","close","move_resize"]},"bounds":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4}`, `"action"`), "interactive"},
 	{ToolWait, "等待指定窗口标题或 UI 控件出现或消失。", toolSchema(`"window_title_contains":{"type":"string","maxLength":120},"text_contains":{"type":"string","maxLength":120},"role":{"type":"string","maxLength":64},"state":{"type":"string","enum":["appear","disappear"]},"timeout_ms":{"type":"integer","minimum":500,"maximum":30000}`, ""), "read_only"},
-	{ToolShellExec, "以 SYSTEM 或当前桌面管理员身份直接执行 PowerShell (powershell/pwsh) 或 CMD 命令并返回 UTF-8 输出，锁屏可用。", toolSchema(`"command":{"type":"string","maxLength":32000},"shell":{"type":"string","enum":["powershell","pwsh","cmd"]},"cwd":{"type":"string","maxLength":512},"timeout_sec":{"type":"integer","minimum":1,"maximum":600},"run_as":{"type":"string","enum":["admin","system"]}`, `"command"`), "system"},
-	{ToolScriptRun, "在节点上落盘或执行 PowerShell(.ps1)/Batch(.bat/.cmd)/Python(.py) 脚本并返回完整输出，锁屏可用。", toolSchema(`"content":{"type":"string","maxLength":100000},"path":{"type":"string","maxLength":512},"interpreter":{"type":"string","enum":["powershell","pwsh","cmd","python","auto"]},"args":{"type":"array","items":{"type":"string","maxLength":1000},"maxItems":64},"cwd":{"type":"string","maxLength":512},"keep_file":{"type":"boolean"},"timeout_sec":{"type":"integer","minimum":1,"maximum":600}`, ""), "system"},
+	{ToolShellExec, "直接执行终端命令并返回 UTF-8 输出（Windows 支持 powershell/pwsh/cmd，Linux 支持 sh/bash/ash）。", toolSchema(`"command":{"type":"string","maxLength":32000},"shell":{"type":"string","enum":["powershell","pwsh","cmd","sh","bash","ash"]},"cwd":{"type":"string","maxLength":512},"timeout_sec":{"type":"integer","minimum":1,"maximum":600},"run_as":{"type":"string","enum":["admin","system"]}`, `"command"`), "system"},
+	{ToolScriptRun, "在节点上落盘或执行脚本（PowerShell/Batch/Shell/Python）并返回完整输出。", toolSchema(`"content":{"type":"string","maxLength":100000},"path":{"type":"string","maxLength":512},"interpreter":{"type":"string","enum":["powershell","pwsh","cmd","sh","bash","ash","python","python3","auto"]},"args":{"type":"array","items":{"type":"string","maxLength":1000},"maxItems":64},"cwd":{"type":"string","maxLength":512},"keep_file":{"type":"boolean"},"timeout_sec":{"type":"integer","minimum":1,"maximum":600}`, ""), "system"},
 	{ToolTerminalOpen, "在用户可见的交互桌面上打开一个可视化终端窗口（PowerShell/pwsh/Windows Terminal/CMD），可选自动执行初始命令。", toolSchema(`"shell":{"type":"string","enum":["powershell","pwsh","wt","cmd"]},"command":{"type":"string","maxLength":8000},"cwd":{"type":"string","maxLength":512},"title":{"type":"string","maxLength":120}`, ""), "interactive"},
 	{ToolFSList, "列出节点任意磁盘路径下的文件与目录清单，支持环境变量展开、通配符过滤和递归遍历，锁屏可用。", toolSchema(`"path":{"type":"string","maxLength":512},"pattern":{"type":"string","maxLength":120},"recursive":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":500}`, `"path"`), "read_only"},
 	{ToolFSRead, "读取节点任意磁盘路径下的文本、配置或脚本文件内容，支持按行偏移分段读取，锁屏可用。", toolSchema(`"path":{"type":"string","maxLength":512},"offset_line":{"type":"integer","minimum":1},"max_lines":{"type":"integer","minimum":1,"maximum":2000}`, `"path"`), "read_only"},
@@ -112,6 +112,32 @@ var DeviceResources = []MCPResource{
 	{URI: "ghosthand://device/windows", Name: "当前窗口", MIMEType: "application/json"},
 	{URI: "ghosthand://device/processes", Name: "当前进程", MIMEType: "application/json"},
 	{URI: "ghosthand://device/clipboard", Name: "系统剪贴板", MIMEType: "text/plain"},
+}
+
+var LinuxToolNames = map[string]bool{
+	ToolStatus:        true,
+	ToolProcesses:     true,
+	ToolProcessManage: true,
+	ToolShellExec:     true,
+	ToolScriptRun:     true,
+	ToolFSList:        true,
+	ToolFSRead:        true,
+	ToolFSWrite:       true,
+}
+
+var LinuxTools = func() []MCPTool {
+	tools := make([]MCPTool, 0, len(LinuxToolNames))
+	for _, t := range DeviceTools {
+		if LinuxToolNames[t.Name] {
+			tools = append(tools, t)
+		}
+	}
+	return tools
+}()
+
+var LinuxResources = []MCPResource{
+	{URI: "ghosthand://device/status", Name: "设备状态", MIMEType: "application/json"},
+	{URI: "ghosthand://device/processes", Name: "当前进程", MIMEType: "application/json"},
 }
 
 var ConfirmTool = MCPTool{ToolConfirm, "向管理员请求确认涉及外部高风险业务影响或人机验证码的操作。",
@@ -330,7 +356,7 @@ func ValidateTool(name string, data json.RawMessage) (GUIArgs, error) {
 			len([]rune(args.Cwd)) <= 512 && !strings.ContainsAny(args.Cwd, "\r\n\x00")
 	case ToolShellExec:
 		valid = strings.TrimSpace(args.Command) != "" && len([]rune(args.Command)) <= 32000 && !strings.ContainsRune(args.Command, 0) &&
-			(args.Shell == "" || args.Shell == "powershell" || args.Shell == "pwsh" || args.Shell == "cmd") &&
+			(args.Shell == "" || args.Shell == "powershell" || args.Shell == "pwsh" || args.Shell == "cmd" || args.Shell == "sh" || args.Shell == "bash" || args.Shell == "ash") &&
 			len([]rune(args.Cwd)) <= 512 && !strings.ContainsAny(args.Cwd, "\r\n\x00") &&
 			(fields["timeout_sec"] == nil || args.TimeoutSec >= 1 && args.TimeoutSec <= 600) &&
 			(args.RunAs == "" || args.RunAs == "admin" || args.RunAs == "system")
@@ -340,7 +366,9 @@ func ValidateTool(name string, data json.RawMessage) (GUIArgs, error) {
 		valid = (hasContent || hasPath) &&
 			(args.Content == nil || (len([]rune(*args.Content)) <= 100000 && !strings.ContainsRune(*args.Content, 0))) &&
 			len([]rune(args.Path)) <= 512 && !strings.ContainsAny(args.Path, "\r\n\x00") &&
-			(args.Interpreter == "" || args.Interpreter == "powershell" || args.Interpreter == "pwsh" || args.Interpreter == "cmd" || args.Interpreter == "python" || args.Interpreter == "auto") &&
+			(args.Interpreter == "" || args.Interpreter == "powershell" || args.Interpreter == "pwsh" || args.Interpreter == "cmd" ||
+				args.Interpreter == "sh" || args.Interpreter == "bash" || args.Interpreter == "ash" ||
+				args.Interpreter == "python" || args.Interpreter == "python3" || args.Interpreter == "auto") &&
 			len(args.ArgsList) <= 64 &&
 			len([]rune(args.Cwd)) <= 512 && !strings.ContainsAny(args.Cwd, "\r\n\x00") &&
 			(fields["timeout_sec"] == nil || args.TimeoutSec >= 1 && args.TimeoutSec <= 600)

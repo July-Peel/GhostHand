@@ -12,10 +12,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"ghosthand/launcher/state"
 	"ghosthand/proto"
+	"ghosthand/proto/sshrunner"
 )
 
 var version = "0.4.0"
@@ -58,6 +60,8 @@ func run() error {
 	group := flags.String("group", os.Getenv("GH_GROUP"), "device group")
 	helper := flags.String("helper", "", "optional Helper executable path")
 	service := flags.Bool("service", false, "receive launcher events over stdin")
+	doInstall := flags.Bool("install", false, "install as a system service on Linux")
+	doUninstall := flags.Bool("uninstall", false, "uninstall system service on Linux")
 	_ = flags.String("data", "", "deprecated (ignored in stateless mode)")
 	_ = flags.String("trial", "", "deprecated (ignored in stateless mode)")
 	_ = flags.Bool("verify-helper", false, "deprecated (ignored in stateless mode)")
@@ -65,10 +69,21 @@ func run() error {
 		return err
 	}
 
+	if *doUninstall {
+		return uninstallServiceFlag()
+	}
+
 	srv := strings.TrimRight(strings.TrimSpace(*server), "/")
 	accessKey := strings.TrimSpace(*key)
 	if srv == "" || accessKey == "" {
 		return errors.New("server and key are required: ghosthand-core --server <URL> --key <KEY>")
+	}
+	if *doInstall {
+		return installServiceFlag(configuration{
+			Server: srv,
+			Key:    accessKey,
+			Pin:    strings.ToLower(strings.ReplaceAll(strings.TrimSpace(*pin), ":", "")),
+		})
 	}
 	machineID, err := machineFingerprint()
 	if err != nil {
@@ -100,7 +115,7 @@ func run() error {
 
 func start(cfg configuration, helper string, service bool) error {
 	logBuf := initMemoryLogger(service)
-	ctx, stop := osSignal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := osSignal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	client, err := transport(cfg)
@@ -128,8 +143,13 @@ func start(cfg configuration, helper string, service bool) error {
 		operations:   make(chan struct{}, 1),
 		taskChanges:  make(chan struct{}, 1),
 		background:   make(chan struct{}, 4),
-		canUninstall: service && runtime.GOOS == "windows",
+		sshEvents:    make(chan sshOutbound, 64),
+		canUninstall: service && (runtime.GOOS == "windows" || runtime.GOOS == "linux"),
 	}
+	a.ssh = sshrunner.NewManager(ctx, func(st proto.SSHStatePayload) {
+		a.enqueueSSHOutbound(proto.SSHStateMessage, st)
+	})
+	defer a.ssh.Close()
 	a.cfg.Store(&cfg)
 
 	if err := a.enrollWithRetry(ctx); err != nil {

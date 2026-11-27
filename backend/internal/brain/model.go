@@ -55,9 +55,10 @@ type Turn struct {
 }
 
 type Observation struct {
-	Text  string
-	JPEG  []byte
-	Error bool
+	Text       string
+	JPEG       []byte
+	ImageLabel string
+	Error      bool
 }
 
 type Message struct {
@@ -398,7 +399,11 @@ func (s *Session) Return(calls []Call, observed []Observation) {
 		outputs = append(outputs, output)
 		if len(result.JPEG) > 0 {
 			image := imageBlock(result.JPEG)
-			images = append(images, map[string]any{"type": "input_text", "text": "设备屏幕的截图观察"}, image)
+			label := "设备屏幕的截图观察"
+			if result.ImageLabel != "" {
+				label += " · " + result.ImageLabel
+			}
+			images = append(images, map[string]any{"type": "input_text", "text": label}, image)
 			s.images = append(s.images, image)
 		}
 	}

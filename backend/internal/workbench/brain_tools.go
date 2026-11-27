@@ -11,6 +11,9 @@ import (
 )
 
 func (s *Service) showBrain(ctx context.Context, t brainTask, step int, label string) error {
+	if s.sshExecutor != nil && s.sshExecutor.IsSSHDevice(ctx, t.device) {
+		return s.awaitBrain(ctx, t.id)
+	}
 	return s.writeBrainReady(ctx, t.id, func(tx *sql.Tx) error {
 		_, err := Enqueue(ctx, tx, t.device, proto.MCPTaskDisplay, proto.TaskDisplay{
 			TaskID: t.id, Title: t.title, StepIndex: step, StepTotal: step, StepName: label, State: proto.Running,
@@ -79,6 +82,45 @@ func (s *Service) callDevice(ctx context.Context, t brainTask, step, attempt int
 	timeout := toolTimeout(tool, args)
 	display := proto.TaskDisplay{TaskID: t.id, Title: t.title, StepIndex: step, StepTotal: step, StepName: label, State: proto.Running}
 	call := proto.MCPCall{CallID: id, TaskID: t.id, Tool: tool, Arguments: args, Display: display, Approved: approved, Window: window}
+	if s.sshExecutor != nil && s.sshExecutor.IsSSHDevice(ctx, t.device) {
+		err = s.writeBrainReady(ctx, t.id, func(tx *sql.Tx) error {
+			now := time.Now().UnixMilli()
+			if _, err := tx.ExecContext(ctx, "INSERT INTO brain_calls(id,task_id,tool,created_at) VALUES (?,?,?,?)", id, t.id, tool, now); err != nil {
+				return err
+			}
+			payload, _ := json.Marshal(proto.TaskProgressPayload{TaskID: t.id, StepIndex: step, StepTotal: step,
+				StepKey: tool, StepName: label, Status: "running", Attempt: attempt, Detail: label, TimeoutMS: timeout.Milliseconds()})
+			if err := ApplyTaskReport(ctx, tx, t.device, proto.Envelope{Type: proto.TaskProgress, Payload: payload}, now); err != nil {
+				return err
+			}
+			return RecordChange(ctx, tx, t.device)
+		})
+		if err != nil {
+			return proto.MCPResult{}, err
+		}
+		execCtx, cancelExec := context.WithTimeout(ctx, timeout)
+		res, execErr := s.sshExecutor.ExecuteSSHTool(execCtx, t.device, call)
+		cancelExec()
+		if execErr != nil {
+			return proto.MCPResult{}, execErr
+		}
+		res.CallID = id
+		res.TaskID = t.id
+		raw, err := json.Marshal(res)
+		if err != nil {
+			return proto.MCPResult{}, err
+		}
+		if err := s.store.Write(ctx, func(tx *sql.Tx) error {
+			now := time.Now().UnixMilli()
+			if err := recordToolResult(ctx, tx, t.device, t.id, raw, now); err != nil {
+				return err
+			}
+			return RecordChange(ctx, tx, t.device)
+		}); err != nil {
+			return proto.MCPResult{}, err
+		}
+		return res, nil
+	}
 	err = s.writeBrainReady(ctx, t.id, func(tx *sql.Tx) error {
 		now := time.Now().UnixMilli()
 		if _, err := tx.ExecContext(ctx, "INSERT INTO brain_calls(id,task_id,tool,created_at) VALUES (?,?,?,?)", id, t.id, tool, now); err != nil {
@@ -219,7 +261,9 @@ func (s *Service) finishBrain(ctx context.Context, t brainTask, reply string, st
 		case proto.Cancelled:
 			code = proto.ErrCancelled
 		}
-		if t.source != "chat" {
+		var isSSH bool
+		_ = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM device_ssh_credentials WHERE device_id=?)", t.device).Scan(&isSSH)
+		if t.source != "chat" && !isSSH {
 			if _, err := Enqueue(ctx, tx, t.device, proto.MCPTaskFinish, proto.TaskResultPayload{TaskID: t.id, State: state, ErrorCode: code}); err != nil {
 				return err
 			}

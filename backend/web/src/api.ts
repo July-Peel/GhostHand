@@ -24,11 +24,13 @@ export type Device = {
   task_protocol: boolean
   is_demo: boolean
   auto_approve: boolean
+  ssh_managed?: boolean
+  revoked?: boolean
 }
 
 export type TaskCard = {
   id: string
-  source?: 'quick' | 'brain' | 'mcp'
+  source?: 'quick' | 'brain' | 'mcp' | 'chat'
   title: string
   state: 'queued' | 'dispatched' | 'running' | 'paused' | 'waiting_user' | 'cancelling' | 'succeeded' | 'cancelled' | 'expired' | 'failed' | 'unknown'
   step_index: number
@@ -43,11 +45,11 @@ export type TaskCard = {
   control?: Exclude<TaskAction, 'retry'>
   cancel_at: number | null
   stalled: boolean
-  timeline: { seq: number; step_name: string; detail: string; status: string; elapsed_ms: number; attempt: number; created_at: number }[]
+  timeline: { seq: number; step_key: string; step_name: string; detail: string; status: string; elapsed_ms: number; attempt: number; created_at: number }[]
 }
 
 export type TaskAction = 'pause' | 'resume' | 'cancel' | 'force' | 'retry'
-export type MediaCard = { id: string; name: string; size: number }
+export type MediaCard = { id: string; name: string; size: number; device_name?: string }
 export type UserMediaPayload = { attachments: MediaCard[] }
 export type ConfirmCard = {
   id: string
@@ -55,6 +57,7 @@ export type ConfirmCard = {
   summary: string
   risk_action: string
   attachment_id?: string
+  device_name?: string
   decision: 'pending' | 'approved' | 'denied' | 'cancelled'
 }
 

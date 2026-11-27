@@ -104,7 +104,7 @@ type uninstallWorker struct {
 
 func (a *agent) uninstall(ctx context.Context, op pendingOperation) error {
 	if !a.canUninstall {
-		return errors.New("remote uninstall requires a managed Windows installation")
+		return errors.New("remote uninstall requires a managed service installation")
 	}
 	worker, err := startUninstallWorker(ctx)
 	if err != nil {

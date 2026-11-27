@@ -90,7 +90,8 @@ func loadKey(ctx context.Context, store *db.Store, path string) ([]byte, error) 
 	if err := store.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM integration_settings WHERE secret IS NOT NULL)
 		OR EXISTS(SELECT 1 FROM attachments WHERE storage_ref IS NOT NULL)
 		OR EXISTS(SELECT 1 FROM chat_attachment_deletions WHERE storage_ref IS NOT NULL)
-		OR EXISTS(SELECT 1 FROM device_rdp_credentials)`).
+		OR EXISTS(SELECT 1 FROM device_rdp_credentials)
+		OR EXISTS(SELECT 1 FROM device_ssh_credentials)`).
 		Scan(&hasCredentials); err != nil {
 		return nil, err
 	}

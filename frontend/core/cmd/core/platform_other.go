@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build !windows && !linux
 
 package main
 
@@ -59,4 +59,12 @@ func startPlatform(_ context.Context, _ context.CancelFunc, _ string, _ bool) (*
 	done := make(chan struct{})
 	close(done)
 	return newHost("headless", "none"), done
+}
+
+func installServiceFlag(configuration) error {
+	return errors.New("--install is only supported on Linux")
+}
+
+func uninstallServiceFlag() error {
+	return errors.New("--uninstall is only supported on Linux")
 }

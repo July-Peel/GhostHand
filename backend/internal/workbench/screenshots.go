@@ -289,7 +289,7 @@ func (s *Service) Attachment(ctx context.Context, id string, thumb bool) (io.Rea
 	var ref []byte
 	err := s.store.QueryRowContext(ctx, `SELECT a.name,a.storage_backend,a.storage_key,a.thumb_key,a.storage_ref
 		FROM attachments a JOIN tasks t ON t.id=a.task_id WHERE a.id=? AND
-		(a.upload_id`+userUploadIDs+` OR (t.source='chat' AND a.upload_id GLOB 'chat_*')
+		(a.upload_id`+userUploadIDs+` OR (t.source IN ('chat','brain') AND a.upload_id GLOB 'chat_*')
 		OR t.state='succeeded' OR EXISTS(SELECT 1 FROM brain_calls b WHERE b.id=a.upload_id AND b.task_id=t.id
 			AND json_extract(b.result_json,'$.attachment_id')=a.id))`, id).Scan(&name, &kind, &key, &thumbKey, &ref)
 	if errors.Is(err, sql.ErrNoRows) {

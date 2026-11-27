@@ -31,6 +31,8 @@ type peer struct {
 	terminalDone         chan struct{}
 	terminalMu           sync.Mutex
 	terminalSessions     map[string]*TerminalSession
+	sshFrames            chan proto.Envelope
+	sshDone              chan struct{}
 	conn                 *websocket.Conn
 	id                   string
 	gen                  uint64
@@ -78,9 +80,11 @@ func (s *Service) Connect(w http.ResponseWriter, r *http.Request) {
 	reason := "network_error"
 	defer func() { s.detach(p, reason) }()
 	defer close(p.desktopDone)
+	defer close(p.sshDone)
 	if err := sendFrame(ctx, conn, proto.Welcome, welcome, 0); err != nil {
 		return
 	}
+	go s.syncHostAgentSSH(ctx, p)
 	reason = s.servePeer(ctx, p, hello.LastAck)
 }
 
@@ -114,8 +118,9 @@ func (s *Service) attach(ctx context.Context, conn *websocket.Conn, hello proto.
 	}
 	p := &peer{conn: conn, id: hello.DeviceID, interval: time.Duration(interval) * time.Second, secureTransport: secure,
 		desktopOperations: hello.DesktopOperations && hello.Platform == proto.Windows,
-		desktopRequests:   make(chan desktopRequest), desktopDone: make(chan struct{}), desktopPolicyChanged: make(chan struct{}, 1)}
-	if hello.TerminalOperations && hello.Platform == proto.Windows {
+		desktopRequests:   make(chan desktopRequest), desktopDone: make(chan struct{}), desktopPolicyChanged: make(chan struct{}, 1),
+		sshFrames: make(chan proto.Envelope, 32), sshDone: make(chan struct{})}
+	if hello.TerminalOperations && (hello.Platform == proto.Windows || hello.Platform == proto.Linux) {
 		p.terminalFrames = make(chan proto.Envelope, 32)
 		p.terminalDone = make(chan struct{})
 		p.terminalSessions = make(map[string]*TerminalSession)
@@ -291,6 +296,27 @@ func (s *Service) servePeer(ctx context.Context, p *peer, sent uint64) string {
 					continue
 				}
 			}
+			if err == nil && frame.Seq == 0 && (frame.Type == proto.SSHStateMessage || frame.Type == proto.SSHResultMessage) {
+				if frame.Version != proto.Version || len(frame.ID) != 26 {
+					err = ErrInvalid
+				} else if frame.Type == proto.SSHStateMessage {
+					var st proto.SSHStatePayload
+					if json.Unmarshal(frame.Payload, &st) != nil {
+						err = ErrInvalid
+					} else {
+						go s.handleAgentSSHState(p.id, st)
+						continue
+					}
+				} else {
+					var res proto.SSHMCPResultPayload
+					if json.Unmarshal(frame.Payload, &res) != nil {
+						err = ErrInvalid
+					} else {
+						s.handleAgentSSHResult(p.id, res)
+						continue
+					}
+				}
+			}
 			select {
 			case in <- frameRead{frame, err}:
 			case <-ctx.Done():
@@ -325,6 +351,11 @@ func (s *Service) servePeer(ctx context.Context, p *peer, sent uint64) string {
 			}
 		case req := <-p.desktopRequests:
 			if err := sendFrame(ctx, p.conn, req.kind, req.payload, ack); err != nil {
+				return "network_error"
+			}
+		case frame := <-p.sshFrames:
+			frame.Ack = ack
+			if err := writeFrame(ctx, p.conn, frame); err != nil {
 				return "network_error"
 			}
 		case <-unstable.C:
@@ -571,6 +602,7 @@ func (s *Service) detach(p *peer, reason string) {
 		delete(s.connections, p.id)
 	}
 	s.connectionMu.Unlock()
+	go s.detachHostAgentSSH(p.id)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	err := s.store.Write(ctx, func(tx *sql.Tx) error {

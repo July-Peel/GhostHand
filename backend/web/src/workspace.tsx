@@ -10,7 +10,7 @@ import { Conversation } from './conversation'
 import { Battery, Connection, DeviceIcon, Panel } from './device-ui'
 import { SettingsPanel } from './settings'
 import { PairingPanel } from './agent-ui'
-import { connectionKey, rdpKey } from './agent-api'
+import { connectionKey, rdpKey, sshKey } from './agent-api'
 
 const lastDeviceKey = 'ghosthand-last-device'
 
@@ -78,11 +78,13 @@ function useEvents() {
           void client.invalidateQueries({ queryKey: ['messages'] })
           void client.invalidateQueries({ queryKey: ['connection'] })
           void client.invalidateQueries({ queryKey: ['rdp'] })
+          void client.invalidateQueries({ queryKey: ['ssh'] })
         } else {
           for (const id of changedDevices) {
             void client.invalidateQueries({ queryKey: messagesKey(id) })
             void client.invalidateQueries({ queryKey: connectionKey(id) })
             void client.invalidateQueries({ queryKey: rdpKey(id) })
+            void client.invalidateQueries({ queryKey: sshKey(id) })
           }
         }
         refreshAll = false
@@ -233,6 +235,7 @@ export function Workspace({ session, brand, themeButton, onPasswordChanged }: {
             <Conversation
               key={active.id}
               device={active}
+              devices={devices}
               commands={query.data?.commands ?? []}
               session={session}
               opened={chosen !== undefined}
@@ -246,7 +249,7 @@ export function Workspace({ session, brand, themeButton, onPasswordChanged }: {
           )}
         </main>
       </div>
-      {pairingOpen && <PairingPanel session={session} close={() => setPairingOpen(false)} />}
+      {pairingOpen && <PairingPanel session={session} devices={devices} onSelectDevice={id => { select(id); setPairingOpen(false) }} close={() => setPairingOpen(false)} />}
       {settingsOpen && (
         <SettingsPanel session={session} close={() => setSettingsOpen(false)} onPasswordChanged={onPasswordChanged} />
       )}

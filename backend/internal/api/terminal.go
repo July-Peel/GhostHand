@@ -46,7 +46,7 @@ func (s *Server) terminalSocket(w http.ResponseWriter, r *http.Request, login au
 		case errors.Is(err, agents.ErrTerminalOffline):
 			fail(w, http.StatusConflict, "设备离线。")
 		case errors.Is(err, agents.ErrTerminalUnsupported):
-			fail(w, http.StatusConflict, "此设备不支持 Windows 远程终端。")
+			fail(w, http.StatusConflict, "此设备不支持远程终端。")
 		case errors.Is(err, agents.ErrTerminalBusy):
 			fail(w, http.StatusTooManyRequests, "设备已达到终端会话上限。")
 		default:
@@ -64,7 +64,7 @@ func (s *Server) terminalSocket(w http.ResponseWriter, r *http.Request, login au
 	conn.SetReadLimit(proto.MaxTerminalFrameSize)
 	ctx, cancel := context.WithDeadline(r.Context(), login.ExpiresAt)
 	defer cancel()
-	openCtx, cancelOpen := context.WithTimeout(ctx, 5*time.Second)
+	openCtx, cancelOpen := context.WithTimeout(ctx, 10*time.Second)
 	err = terminal.Open(openCtx, shell, cols, rows)
 	cancelOpen()
 	if err != nil {

@@ -89,12 +89,16 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("open device connections: %w", err)
 	}
+	fleet.SetSettings(config)
+	fleet.StartSSH(ctx)
+	defer fleet.CloseSSH()
 	desk, err := workbench.New(store, config, dataDir, demo)
 	if err != nil {
 		return fmt.Errorf("open workbench: %w", err)
 	}
 	unlock := agents.NewUnlockManager(fleet, config)
 	desk.SetDesktopUnlocker(unlock)
+	desk.SetSSHExecutor(fleet)
 	if err := desk.Seed(ctx); err != nil {
 		return fmt.Errorf("seed demo devices: %w", err)
 	}

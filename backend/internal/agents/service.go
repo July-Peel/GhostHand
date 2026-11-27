@@ -21,8 +21,10 @@ import (
 	"unicode/utf8"
 
 	"ghosthand/backend/internal/db"
+	"ghosthand/backend/internal/settings"
 	"ghosthand/backend/internal/workbench"
 	"ghosthand/proto"
+	"ghosthand/proto/sshrunner"
 )
 
 var (
@@ -53,11 +55,19 @@ type Service struct {
 	pairWindow   time.Time
 	pairTotal    int
 	pairAttempts map[string]int
+
+	settings     *settings.Service
+	sshRunner    *sshrunner.Manager
+	sshPending   sync.Map
+	sshWaitMu    sync.Mutex
+	sshWaiters   map[string][]chan proto.SSHStatePayload
+	sshLocalMu   sync.Mutex
+	sshLocalSess map[string]*TerminalSession
 }
 
 func New(ctx context.Context, store *db.Store, dataDir string, cloudflare bool) (*Service, error) {
 	dir := filepath.Join(dataDir, "agents")
-	for _, child := range []string{"", "logs", "windows-install"} {
+	for _, child := range []string{"", "logs", "windows-install", "linux-install"} {
 		if err := os.MkdirAll(filepath.Join(dir, child), 0700); err != nil {
 			return nil, err
 		}
@@ -73,6 +83,8 @@ func New(ctx context.Context, store *db.Store, dataDir string, cloudflare bool) 
 	s := &Service{
 		store: store, dir: dir, key: key, ctx: ctx, cloudflare: cloudflare,
 		nodeKey: nodeKey, nodeKeyFixed: nodeKeyFixed, connections: make(map[string]*peer),
+		sshWaiters:   make(map[string][]chan proto.SSHStatePayload),
+		sshLocalSess: make(map[string]*TerminalSession),
 	}
 	err = store.Write(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, "DELETE FROM device_sessions"); err != nil {

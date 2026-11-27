@@ -22,9 +22,10 @@ type StatusSnapshot struct {
 }
 
 type MediaCard struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	Size int64  `json:"size"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Size       int64  `json:"size"`
+	DeviceName string `json:"device_name,omitempty"`
 }
 
 type activeTask struct {

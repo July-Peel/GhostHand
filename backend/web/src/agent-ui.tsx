@@ -1,13 +1,14 @@
-import { useId, useRef, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import { useIsMutating, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { LoaderCircle, RefreshCw } from 'lucide-react'
-import { agentAPI, browserExtensionKey, connectionKey, windowsInstallerNames } from './agent-api'
-import type { OperationKind, WindowsInstallerFile, WindowsInstallerName } from './agent-api'
-import { errorText } from './api'
+import { agentAPI, browserExtensionKey, connectionKey, linuxInstallerNames, sshKey, windowsInstallerNames } from './agent-api'
+import type { LinuxInstallerFile, LinuxInstallerName, OperationKind, Pairing, SSHAuthKind, WindowsInstallerFile, WindowsInstallerName } from './agent-api'
+import { devicesKey, errorText, FREE_CHAT_ID } from './api'
 import type { Device, Session } from './api'
-import { Panel } from './device-ui'
+import { connections, Panel } from './device-ui'
 
 const formatDate = (time: number) => new Date(time).toLocaleString('zh-CN', { dateStyle: 'short', timeStyle: 'medium' })
+const platformLabels: Record<Device['platform'], string> = { windows: 'Windows', linux: 'Linux', android: 'Android', chat: '闲聊' }
 
 export function BrowserExtensionSection({ device, session }: { device: Device; session: Session }) {
   const client = useQueryClient()
@@ -76,8 +77,9 @@ export function BrowserExtensionSection({ device, session }: { device: Device; s
   </section>
 }
 
-const pairingPlatforms = ['Windows', 'Linux', 'Android'] as const
+const pairingPlatforms = ['Windows', 'Linux', 'Android', 'SSH'] as const
 const windowsInstallerFilesKey = ['pairing', 'windows-files'] as const
+const linuxInstallerFilesKey = ['pairing', 'linux-files'] as const
 
 function WindowsInstallerFileRow({ name, saved, statusLoaded, csrf }: {
   name: WindowsInstallerName
@@ -125,15 +127,113 @@ function WindowsInstallerFileRow({ name, saved, statusLoaded, csrf }: {
   </li>
 }
 
-export function PairingPanel({ session, close }: { session: Session; close: () => void }) {
+function LinuxInstallerFileRow({ name, saved, statusLoaded, csrf }: {
+  name: LinuxInstallerName
+  saved: LinuxInstallerFile | undefined
+  statusLoaded: boolean
+  csrf: string
+}) {
+  const client = useQueryClient()
+  const input = useRef<HTMLInputElement>(null)
+  const [progress, setProgress] = useState(0)
+  const mutationKey = ['pairing', 'linux-upload', name] as const
+  const upload = useMutation({
+    mutationKey,
+    mutationFn: (file: File) => agentAPI.uploadLinuxInstallerFile(name, file, csrf, setProgress),
+    onSuccess: async savedFile => {
+      await client.cancelQueries({ queryKey: linuxInstallerFilesKey, exact: true })
+      client.setQueryData<LinuxInstallerFile[]>(linuxInstallerFilesKey, files =>
+        files && [...files.filter(file => file.name !== name), savedFile])
+      void client.invalidateQueries({ queryKey: linuxInstallerFilesKey, exact: true })
+    },
+  })
+  const uploading = useIsMutating({ mutationKey, exact: true }) > 0
+  const percent = upload.isPending ? progress : undefined
+  const action = saved ? '替换' : '上传'
+
+  return <li>
+    {uploading && <div className="pairing-file-fill" aria-hidden="true" style={{ width: `${percent ?? 0}%` }} />}
+    <div className="pairing-file-label">
+      <strong>{name}</strong>
+      <span aria-live="polite">{saved ? `已上传 · ${(saved.size / (1024 * 1024)).toFixed(1)} MiB` : statusLoaded ? '未上传' : '—'}</span>
+    </div>
+    <input type="file" ref={input} hidden onChange={event => {
+      const file = event.currentTarget.files?.[0]
+      event.currentTarget.value = ''
+      if (!file || uploading) return
+      setProgress(0)
+      upload.mutate(file)
+    }} />
+    {uploading ? <span className="pairing-file-progress" role="progressbar" aria-label={`${name} 上传进度`}
+      aria-valuenow={percent} aria-valuetext={percent === 100 ? '100%，正在保存' : undefined}>
+      {percent === undefined ? '上传中…' : percent === 100 ? '100% · 保存中' : `${percent}%`}
+    </span> : <button type="button" className="secondary-button" aria-label={`${action} ${name}`}
+      onClick={() => input.current?.click()}>{action}</button>}
+    {upload.isError && <p role="alert">{errorText(upload.error)}</p>}
+  </li>
+}
+
+function PairingKeySection({ panelId, details, copiedKey, onCopyKey, confirmRotate, setConfirmRotate, rotate }: {
+  panelId: string
+  details: Pairing | undefined
+  copiedKey: boolean
+  onCopyKey: (text: string) => void
+  confirmRotate: boolean
+  setConfirmRotate: (value: boolean) => void
+  rotate: { isPending: boolean; isError: boolean; error: unknown; mutate: () => void }
+}) {
+  return <section className="agent-section">
+    {details && <>
+      <div className="agent-kv">
+        <label htmlFor={panelId} className="pairing-key-label">服务端固定接入密钥</label>
+        <div className="settings-model-row">
+          <input id={panelId} value={details.key} readOnly spellCheck={false} onFocus={event => event.currentTarget.select()} />
+          <button type="button" className="secondary-button" onClick={() => onCopyKey(details.key)}>
+            {copiedKey ? '已复制' : '复制密钥'}
+          </button>
+        </div>
+      </div>
+      <img className="pairing-qr" alt="设备接入二维码" src={'data:image/png;base64,' + details.qr_png} />
+      <dl className="agent-kv">
+        <dt>控制端地址</dt><dd><code>{details.server}</code></dd>
+        {details.fingerprint && <><dt>证书指纹</dt><dd><code>{details.fingerprint}</code></dd></>}
+      </dl>
+      {!details.managed_by_env && (
+        confirmRotate ? (
+          <div className="agent-confirm">
+            <p>重置固定密钥后，旧密钥将无法用于新设备接入或手动重连（已在线连接会保持至下次重启）。确定重置？</p>
+            <div className="agent-actions">
+              <button type="button" className="secondary-button" disabled={rotate.isPending} onClick={() => rotate.mutate()}>
+                {rotate.isPending ? '正在重置…' : '确认重置'}
+              </button>
+              <button type="button" className="text-button" disabled={rotate.isPending} onClick={() => setConfirmRotate(false)}>取消</button>
+            </div>
+          </div>
+        ) : (
+          <button type="button" className="secondary-button" onClick={() => setConfirmRotate(true)}>重置固定密钥</button>
+        )
+      )}
+      {details.managed_by_env && <p>当前固定密钥由环境变量 GH_NODE_KEY 管理。</p>}
+      {rotate.isError && <p role="alert">{errorText(rotate.error)}</p>}
+    </>}
+  </section>
+}
+
+export function PairingPanel({ session, devices, onSelectDevice, close }: {
+  session: Session
+  devices: Device[]
+  onSelectDevice?: (id: string) => void
+  close: () => void
+}) {
   const client = useQueryClient()
   const panelId = useId()
   const [platform, setPlatform] = useState<typeof pairingPlatforms[number]>('Windows')
   const keyQuery = ['pairing'] as const
   const pairing = useQuery({ queryKey: keyQuery, queryFn: ({ signal }) => agentAPI.getPairing(signal), gcTime: 0 })
   const files = useQuery({ queryKey: windowsInstallerFilesKey, queryFn: ({ signal }) => agentAPI.windowsInstallerFiles(signal) })
+  const linuxFiles = useQuery({ queryKey: linuxInstallerFilesKey, queryFn: ({ signal }) => agentAPI.linuxInstallerFiles(signal) })
   const [confirmRotate, setConfirmRotate] = useState(false)
-  const [copied, setCopied] = useState<'key' | 'svc' | null>(null)
+  const [copied, setCopied] = useState<'key' | 'svc' | 'linux' | null>(null)
   const rotate = useMutation({
     mutationFn: () => agentAPI.rotatePairingKey(session.csrf_token),
     onSuccess: data => {
@@ -141,11 +241,44 @@ export function PairingPanel({ session, close }: { session: Session; close: () =
       client.setQueryData(keyQuery, data)
     },
   })
+
+  // SSH pairing form state
+  const [sshName, setSSHName] = useState('')
+  const [sshGroup, setSSHGroup] = useState('')
+  const [sshHost, setSSHHost] = useState('')
+  const [sshPort, setSSHPort] = useState(22)
+  const [sshUsername, setSSHUsername] = useState('root')
+  const [sshAuthKind, setSSHAuthKind] = useState<SSHAuthKind>('password')
+  const [sshSecret, setSSHSecret] = useState('')
+  const [sshHostAgentID, setSSHHostAgentID] = useState('')
+
+  const hostAgents = devices.filter(d => !d.is_demo && !d.revoked && !d.ssh_managed && d.id !== FREE_CHAT_ID)
+
+  const createSSH = useMutation({
+    mutationFn: () => agentAPI.createSSH({
+      name: sshName.trim(),
+      group: sshGroup.trim(),
+      host: sshHost.trim(),
+      port: Number.isFinite(sshPort) && sshPort > 0 ? sshPort : 22,
+      username: sshUsername.trim(),
+      auth_kind: sshAuthKind,
+      secret: sshSecret,
+      host_agent_id: sshHostAgentID,
+    }, session.csrf_token),
+    onSuccess: async result => {
+      await client.invalidateQueries({ queryKey: devicesKey })
+      if (onSelectDevice) onSelectDevice(result.device_id)
+      else close()
+    },
+  })
+
   const details = pairing.data
   const svcCmd = details?.windows_install_command
+  const linuxCmd = details?.linux_install_command
   const installerReady = files.isSuccess && windowsInstallerNames.every(name => files.data.some(file => file.name === name))
+  const linuxInstallerReady = linuxFiles.isSuccess && linuxInstallerNames.every(name => linuxFiles.data.some(file => file.name === name))
 
-  async function copyText(kind: 'key' | 'svc', text: string) {
+  async function copyText(kind: 'key' | 'svc' | 'linux', text: string) {
     try {
       await navigator.clipboard.writeText(text)
       setCopied(kind)
@@ -172,6 +305,7 @@ export function PairingPanel({ session, close }: { session: Session; close: () =
             document.getElementById(panelId + '-tab-' + pairingPlatforms[next])?.focus()
           }}>{name}</button>)}
       </div>
+
       <div role="tabpanel" id={panelId + '-Windows'} aria-labelledby={panelId + '-tab-Windows'} hidden={platform !== 'Windows'}>
         <section className="agent-section pairing-install">
           <h3>Windows 安装文件</h3>
@@ -196,46 +330,275 @@ export function PairingPanel({ session, close }: { session: Session; close: () =
           </> : details && !svcCmd ? <p>请将控制端地址配置为 HTTPS，以生成 Windows 安装命令。</p>
             : files.isSuccess && <p>上传全部三个文件后即可复制安装命令。</p>}
         </section>
+        <PairingKeySection
+          panelId={panelId + '-win-key'}
+          details={details}
+          copiedKey={copied === 'key'}
+          onCopyKey={text => void copyText('key', text)}
+          confirmRotate={confirmRotate}
+          setConfirmRotate={setConfirmRotate}
+          rotate={rotate}
+        />
+      </div>
+
+      <div role="tabpanel" id={panelId + '-Linux'} aria-labelledby={panelId + '-tab-Linux'} hidden={platform !== 'Linux'}>
+        <section className="agent-section pairing-install">
+          <h3>Linux 安装文件</h3>
+          <p>上传静态编译好的 Linux 64 位二进制文件 ghosthand-core（CGO_ENABLED=0，同时兼容 Debian 与 Alpine）。</p>
+          {linuxFiles.isPending && <p role="status">正在读取上传状态…</p>}
+          {linuxFiles.isError && <p role="alert">{errorText(linuxFiles.error)} <button type="button" className="text-button" onClick={() => void linuxFiles.refetch()}>重试</button></p>}
+          <ul className="pairing-files">
+            {linuxInstallerNames.map(name => <LinuxInstallerFileRow key={name} name={name}
+              saved={linuxFiles.data?.find(file => file.name === name)} statusLoaded={linuxFiles.isSuccess} csrf={session.csrf_token} />)}
+          </ul>
+          {pairing.isPending && <p role="status">正在读取服务端接入密钥…</p>}
+          {pairing.isError && <p role="alert">{errorText(pairing.error)} <button type="button" className="text-button" onClick={() => void pairing.refetch()}>重试</button></p>}
+          <div className="agent-actions">
+            <h3>安装为 Linux 服务</h3>
+            {linuxInstallerReady && linuxCmd && <button type="button" className="text-button" onClick={() => void copyText('linux', linuxCmd)}>
+              {copied === 'linux' ? '已复制' : '复制命令'}
+            </button>}
+          </div>
+          {linuxInstallerReady && linuxCmd ? <>
+            <p>在新设备上以 root 身份打开 Linux 终端，粘贴并运行这一条命令（自动识别 Debian systemd 与 Alpine OpenRC）。</p>
+            <pre className="agent-code">{linuxCmd}</pre>
+          </> : details && !linuxCmd ? <p>请将控制端地址配置为 HTTPS，以生成 Linux 安装命令。</p>
+            : linuxFiles.isSuccess && <p>上传 ghosthand-core 后即可复制安装命令。</p>}
+        </section>
+        <PairingKeySection
+          panelId={panelId + '-linux-key'}
+          details={details}
+          copiedKey={copied === 'key'}
+          onCopyKey={text => void copyText('key', text)}
+          confirmRotate={confirmRotate}
+          setConfirmRotate={setConfirmRotate}
+          rotate={rotate}
+        />
+      </div>
+
+      <div className="pairing-empty" role="tabpanel" id={panelId + '-Android'} aria-labelledby={panelId + '-tab-Android'} hidden={platform !== 'Android'} tabIndex={0} />
+
+      <div role="tabpanel" id={panelId + '-SSH'} aria-labelledby={panelId + '-tab-SSH'} hidden={platform !== 'SSH'}>
         <section className="agent-section">
-          {details && <>
-            <div className="agent-kv">
-              <label htmlFor={panelId + '-key'} className="pairing-key-label">服务端固定接入密钥</label>
-              <div className="settings-model-row">
-                <input id={panelId + '-key'} value={details.key} readOnly spellCheck={false} onFocus={event => event.currentTarget.select()} />
-                <button type="button" className="secondary-button" onClick={() => void copyText('key', details.key)}>
-                  {copied === 'key' ? '已复制' : '复制密钥'}
-                </button>
-              </div>
+          <h3>SSH 零客户端接入 Linux</h3>
+          <p>无需在目标 Linux 上安装客户端，可选择由某台已连接设备的 Agent 在本地直接完成 SSH 登录，或由服务端直接登录。</p>
+          <form className="rdp-form" onSubmit={event => {
+            event.preventDefault()
+            if (!createSSH.isPending) createSSH.mutate()
+          }}>
+            <div className="ssh-form-row equal">
+              <label>
+                设备名称
+                <input value={sshName} onChange={e => setSSHName(e.target.value)} placeholder="例如：内网编译机" maxLength={80} required />
+              </label>
+              <label>
+                设备分组（选填）
+                <input value={sshGroup} onChange={e => setSSHGroup(e.target.value)} placeholder="例如：生产集群" maxLength={80} />
+              </label>
             </div>
-            <img className="pairing-qr" alt="设备接入二维码" src={'data:image/png;base64,' + details.qr_png} />
-            <dl className="agent-kv">
-              <dt>控制端地址</dt><dd><code>{details.server}</code></dd>
-              {details.fingerprint && <><dt>证书指纹</dt><dd><code>{details.fingerprint}</code></dd></>}
-            </dl>
-            {!details.managed_by_env && (
-              confirmRotate ? (
-                <div className="agent-confirm">
-                  <p>重置固定密钥后，旧密钥将无法用于新设备接入或手动重连（已在线连接会保持至下次重启）。确定重置？</p>
-                  <div className="agent-actions">
-                    <button type="button" className="secondary-button" disabled={rotate.isPending} onClick={() => rotate.mutate()}>
-                      {rotate.isPending ? '正在重置…' : '确认重置'}
-                    </button>
-                    <button type="button" className="text-button" disabled={rotate.isPending} onClick={() => setConfirmRotate(false)}>取消</button>
-                  </div>
-                </div>
-              ) : (
-                <button type="button" className="secondary-button" onClick={() => setConfirmRotate(true)}>重置固定密钥</button>
-              )
+            <div className="ssh-form-row">
+              <label>
+                主机地址
+                <input value={sshHost} onChange={e => setSSHHost(e.target.value)} placeholder="IP 或域名，如 192.168.1.50" maxLength={255} required />
+              </label>
+              <label>
+                SSH 端口
+                <input type="number" min={1} max={65535} value={Number.isNaN(sshPort) ? '' : sshPort}
+                  onChange={e => setSSHPort(e.target.valueAsNumber)} required />
+              </label>
+            </div>
+            <div className="ssh-form-row equal">
+              <label>
+                登录用户名
+                <input value={sshUsername} onChange={e => setSSHUsername(e.target.value)} placeholder="root / ubuntu" maxLength={128} required />
+              </label>
+              <label>
+                认证方式
+                <select value={sshAuthKind} onChange={e => setSSHAuthKind(e.target.value as SSHAuthKind)}>
+                  <option value="password">密码认证</option>
+                  <option value="private_key">SSH 私钥</option>
+                </select>
+              </label>
+            </div>
+            {sshAuthKind === 'password' ? (
+              <label>
+                登录密码
+                <input type="password" value={sshSecret} onChange={e => setSSHSecret(e.target.value)} placeholder="输入 SSH 登录密码" autoComplete="new-password" required />
+              </label>
+            ) : (
+              <label>
+                SSH 私钥（PEM / OpenSSH 格式）
+                <textarea rows={4} value={sshSecret} onChange={e => setSSHSecret(e.target.value)}
+                  placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" required />
+              </label>
             )}
-            {details.managed_by_env && <p>当前固定密钥由环境变量 GH_NODE_KEY 管理。</p>}
-            {rotate.isError && <p role="alert">{errorText(rotate.error)}</p>}
-          </>}
+            <label>
+              SSH 登录发起节点（宿主 Agent）
+              <select value={sshHostAgentID} onChange={e => setSSHHostAgentID(e.target.value)}>
+                <option value="">服务端直接登录（由 GhostHand 服务端直接发起 SSH 连接并登录）</option>
+                {hostAgents.map(agent => (
+                  <option key={agent.id} value={agent.id}>
+                    由「{agent.name}」（{connections[agent.conn_state]} · {platformLabels[agent.platform]}）的 Agent 完成 SSH 登录
+                  </option>
+                ))}
+              </select>
+            </label>
+            {createSSH.isError && <p role="alert">{errorText(createSSH.error)}</p>}
+            <div className="agent-actions">
+              <button type="submit" className="primary-button" disabled={createSSH.isPending || !sshName.trim() || !sshHost.trim() || !sshUsername.trim() || !sshSecret}>
+                {createSSH.isPending ? <><LoaderCircle size={15} className="spin" /> 正在连接…</> : '连接并接入'}
+              </button>
+            </div>
+          </form>
         </section>
       </div>
-      {pairingPlatforms.slice(1).map(name => <div key={name} className="pairing-empty" role="tabpanel"
-        id={panelId + '-' + name} aria-labelledby={panelId + '-tab-' + name} hidden={platform !== name} tabIndex={0} />)}
     </Panel>
   )
+}
+
+export function SSHSection({ device, devices, session }: { device: Device; devices: Device[]; session: Session }) {
+  const client = useQueryClient()
+  const key = sshKey(device.id)
+  const status = useQuery({
+    queryKey: key,
+    queryFn: ({ signal }) => agentAPI.sshStatus(device.id, signal),
+  })
+  const hostAgents = devices.filter(d => !d.is_demo && !d.revoked && !d.ssh_managed && d.id !== FREE_CHAT_ID && d.id !== device.id)
+  const [host, setHost] = useState('')
+  const [port, setPort] = useState(22)
+  const [username, setUsername] = useState('')
+  const [authKind, setAuthKind] = useState<SSHAuthKind>('password')
+  const [secret, setSecret] = useState('')
+  const [hostAgentID, setHostAgentID] = useState('')
+  const [editingInit, setEditingInit] = useState(false)
+
+  const data = status.data
+  useEffect(() => {
+    if (!data || editingInit) return
+    setEditingInit(true)
+    setHost(data.host)
+    setPort(data.port)
+    setUsername(data.username)
+    setAuthKind(data.auth_kind)
+    setHostAgentID(data.host_agent_id)
+  }, [data, editingInit])
+
+  const reconnect = useMutation({
+    mutationFn: () => agentAPI.reconnectSSH(device.id, session.csrf_token),
+    onSettled: () => {
+      void client.invalidateQueries({ queryKey: key })
+      void client.invalidateQueries({ queryKey: devicesKey })
+    },
+  })
+  const disconnect = useMutation({
+    mutationFn: () => agentAPI.disconnectSSH(device.id, session.csrf_token),
+    onSettled: () => {
+      void client.invalidateQueries({ queryKey: key })
+      void client.invalidateQueries({ queryKey: devicesKey })
+    },
+  })
+  const save = useMutation({
+    mutationFn: () => agentAPI.updateSSH(device.id, {
+      host: host.trim(),
+      port: Number.isFinite(port) && port > 0 ? port : 22,
+      username: username.trim(),
+      auth_kind: authKind,
+      secret,
+      host_agent_id: hostAgentID,
+      enabled: true,
+    }, session.csrf_token),
+    onSuccess: updated => {
+      setSecret('')
+      client.setQueryData(key, updated)
+      void client.invalidateQueries({ queryKey: devicesKey })
+    },
+  })
+  const busy = reconnect.isPending || disconnect.isPending || save.isPending
+
+  return <section className="agent-section">
+    <h3>SSH 连接管理</h3>
+    {status.isPending && <p role="status">正在加载 SSH 配置…</p>}
+    {status.isError && <p role="alert">{errorText(status.error)}</p>}
+    {data && <>
+      <dl className="agent-kv">
+        <dt>目标地址</dt><dd><code>{data.username}@{data.host}:{data.port}</code></dd>
+        <dt>登录发起节点</dt><dd>{data.host_agent_id ? (data.host_agent_name || data.host_agent_id) + '（宿主 Agent）' : '服务端直接登录'}</dd>
+        {data.host_key_fp && <><dt>主机指纹</dt><dd><code>{data.host_key_fp}</code></dd></>}
+      </dl>
+      {data.last_error && <p role="alert">{data.last_error}</p>}
+      <div className="agent-actions">
+        <button type="button" className="secondary-button" disabled={busy} onClick={() => reconnect.mutate()}>
+          {reconnect.isPending ? '正在重连…' : '重新连接'}
+        </button>
+        <button type="button" className="text-button" disabled={busy || !data.enabled} onClick={() => disconnect.mutate()}>
+          {disconnect.isPending ? '正在断开…' : '断开连接'}
+        </button>
+      </div>
+      {reconnect.isError && <p role="alert">{errorText(reconnect.error)}</p>}
+      {disconnect.isError && <p role="alert">{errorText(disconnect.error)}</p>}
+      <details className="rdp-disclosure">
+        <summary>编辑 SSH 配置与凭据</summary>
+        <form className="rdp-form" onSubmit={event => {
+          event.preventDefault()
+          if (!busy) save.mutate()
+        }}>
+          <div className="ssh-form-row">
+            <label>
+              主机地址
+              <input value={host} onChange={e => setHost(e.target.value)} required />
+            </label>
+            <label>
+              端口
+              <input type="number" min={1} max={65535} value={Number.isNaN(port) ? '' : port}
+                onChange={e => setPort(e.target.valueAsNumber)} required />
+            </label>
+          </div>
+          <div className="ssh-form-row equal">
+            <label>
+              用户名
+              <input value={username} onChange={e => setUsername(e.target.value)} required />
+            </label>
+            <label>
+              认证方式
+              <select value={authKind} onChange={e => setAuthKind(e.target.value as SSHAuthKind)}>
+                <option value="password">密码认证</option>
+                <option value="private_key">SSH 私钥</option>
+              </select>
+            </label>
+          </div>
+          {authKind === 'password' ? (
+            <label>
+              新密码（留空则保持原密码不变）
+              <input type="password" value={secret} onChange={e => setSecret(e.target.value)} autoComplete="new-password" placeholder="留空保持不变" />
+            </label>
+          ) : (
+            <label>
+              新 SSH 私钥（留空则保持原私钥不变）
+              <textarea rows={3} value={secret} onChange={e => setSecret(e.target.value)} placeholder="留空保持不变" />
+            </label>
+          )}
+          <label>
+            SSH 登录发起节点（宿主 Agent）
+            <select value={hostAgentID} onChange={e => setHostAgentID(e.target.value)}>
+              <option value="">服务端直接登录</option>
+              {hostAgents.map(agent => (
+                <option key={agent.id} value={agent.id}>
+                  由「{agent.name}」（{connections[agent.conn_state]} · {platformLabels[agent.platform]}）的 Agent 登录
+                </option>
+              ))}
+            </select>
+          </label>
+          {save.isError && <p role="alert">{errorText(save.error)}</p>}
+          {save.isSuccess && <p role="status">SSH 配置已保存并触发重连。</p>}
+          <div className="agent-actions">
+            <button type="submit" className="secondary-button" disabled={busy || !host.trim() || !username.trim()}>
+              {save.isPending ? '保存中…' : '保存并重连'}
+            </button>
+          </div>
+        </form>
+      </details>
+    </>}
+  </section>
 }
 
 const operationNames: Record<OperationKind, string> = {
@@ -272,6 +635,7 @@ export function DeviceOperations({ device, session }: { device: Device; session:
   const outstanding = (kind: OperationKind) => data?.operations.some(op => op.kind === kind && op.state === 'queued')
   const uninstallPending = outstanding('agent.uninstall')
   const busy = action.isPending || !data || data.revoked || uninstallPending
+  const supportsUninstallPlatform = device.platform === 'windows' || device.platform === 'linux'
 
   return (
     <>
@@ -298,11 +662,11 @@ export function DeviceOperations({ device, session }: { device: Device; session:
             <button type="button" className="secondary-button" disabled={busy || outstanding('agent.rollback')} onClick={() => setConfirm('agent.rollback')}>回滚版本</button>
           </>}
           <button type="button" className="text-button" disabled={busy} onClick={() => setConfirm('revoke')}>吊销凭证</button>
-          {device.platform === 'windows' && <button type="button" className="secondary-button"
+          {supportsUninstallPlatform && <button type="button" className="secondary-button"
             disabled={busy || !data?.can_uninstall || data.operations.some(op => op.state === 'queued')}
             onClick={() => setConfirm('agent.uninstall')}>卸载节点</button>}
         </div>
-        {device.platform === 'windows' && data && !data.revoked && !data.can_uninstall &&
+        {supportsUninstallPlatform && data && !data.revoked && !data.can_uninstall &&
           <p>此设备尚未上报远程卸载能力。</p>}
         {confirm && (
           <div className="agent-confirm">

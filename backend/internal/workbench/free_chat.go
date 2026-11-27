@@ -17,7 +17,7 @@ import (
 const FreeChatDeviceID = "__chat__"
 
 const freeChatInstructions = `当前频道是「随意闲聊」，没有绑定设备。普通问答、代码、文本和图片请求可直接回答。
-仅在用户要求查看或操作设备时调用设备工具。用 devices_list 确认目标，然后为设备工具传入 device_id。目标无法唯一确定时向用户询问。`
+仅在用户要求查看或操作设备时调用设备工具。为设备工具和跨设备的 human_confirm 传入实际目标的 device_id。目标已在引用上下文中确定时直接使用，缺少设备信息时再调用 devices_list。目标无法唯一确定时向用户询问。`
 
 var (
 	ErrFreeChatDisabled = errors.New("请先在「系统设置 → 模型接口」配置服务地址、API Key 和模型。")
@@ -99,7 +99,7 @@ func (s *Service) freeChatHistory(ctx context.Context, task string) ([]brain.Mes
 
 func freeChatTools() []proto.MCPTool {
 	tools := make([]proto.MCPTool, 0, len(proto.DeviceTools)+2)
-	tools = append(tools, MCPDevicesTool, proto.ConfirmTool)
+	tools = append(tools, MCPDevicesTool, AddressedMCPTool(proto.ConfirmTool, false))
 	for _, tool := range proto.DeviceTools {
 		tools = append(tools, AddressedMCPTool(tool, true))
 	}
@@ -127,6 +127,10 @@ func (s *Service) runFreeChat(ctx context.Context, task brainTask) (string, erro
 		return "", err
 	}
 	prompt := task.prompt
+	mentioned, err := s.resolveMentions(ctx, task.device, prompt)
+	if err != nil {
+		return "", err
+	}
 	if prompt == "" && len(images) > 0 {
 		prompt = imageAnalysisPrompt
 	}
@@ -136,9 +140,16 @@ func (s *Service) runFreeChat(ctx context.Context, task brainTask) (string, erro
 	}
 	defer session.Clear()
 	session.SetInstructions(config.Instructions)
+	if instructions := mentionInstructions(task.device, "", mentioned); instructions != "" {
+		history = append(history, brain.Message{Role: "developer", Text: instructions})
+	}
 	session.PrependHistory(append([]brain.Message{{Role: "developer", Text: freeChatInstructions}}, history...))
+	runner := chatToolRunner{service: s, task: task, remote: configs[settings.WebDAV]}
 	attempts := 0
 	for {
+		if err := s.awaitBrain(ctx, task.id); err != nil {
+			return "", err
+		}
 		turn, err := session.Next(ctx)
 		if err != nil || len(turn.Calls) == 0 {
 			return turn.Text, err
@@ -147,116 +158,26 @@ func (s *Service) runFreeChat(ctx context.Context, task brainTask) (string, erro
 		if attempts > brain.MaxSteps {
 			return "", fmt.Errorf("已达到 %d 次工具调用上限。", brain.MaxSteps)
 		}
-		observations := make([]brain.Observation, 0, len(turn.Calls))
-		for _, call := range turn.Calls {
-			if err := s.awaitBrain(ctx, task.id); err != nil {
-				return "", err
-			}
-			observation, err := s.freeChatTool(ctx, task, call, configs[settings.WebDAV])
-			if err != nil {
-				return "", err
-			}
-			observations = append(observations, observation)
+		calls := s.planChatCalls(ctx, task, turn.Calls, mentioned)
+		observations, err := runChatCalls(ctx, calls, runner.execute)
+		if err != nil {
+			return "", err
 		}
 		session.Return(turn.Calls, observations)
 	}
 }
 
-func (s *Service) freeChatTool(ctx context.Context, task brainTask, call brain.Call, remote settings.Configuration) (brain.Observation, error) {
-	failure := func(message string) (brain.Observation, error) {
-		return brain.Observation{Text: message, Error: true}, nil
-	}
-	switch call.Name {
-	case MCPDevicesTool.Name:
-		var args map[string]json.RawMessage
-		if json.Unmarshal(call.Args, &args) != nil || args == nil || len(args) != 0 {
-			return failure("devices_list 不接受参数。")
-		}
-		devices, err := s.MCPDevices(ctx)
-		if err != nil {
-			return failure("暂时无法获取设备列表。")
-		}
-		data, err := json.Marshal(map[string]any{"devices": devices})
-		return brain.Observation{Text: string(data)}, err
-	case proto.ToolConfirm:
-		args, err := proto.ValidateTool(call.Name, call.Args)
-		if err != nil {
-			return failure(err.Error())
-		}
-		if err := s.confirmFreeChat(ctx, task, args.Summary, args.RiskAction, args.AttachmentID); err != nil {
-			return brain.Observation{}, err
-		}
-		return brain.Observation{Text: "管理员已确认。"}, nil
-	}
-	if !IsMCPToolAllowed(call.Name) {
-		return failure("未知的设备工具。")
-	}
-	target, args, err := MCPArguments(call.Args, "")
-	if err != nil {
-		return failure(err.Error())
-	}
-	device, err := s.MCPDeviceID(ctx, target)
-	if err != nil {
-		return failure(mcpDeviceError(err))
-	}
-	command := mcpCommand{Tool: call.Name, Args: args, FromChat: true}
-	result, err := s.callMCP(ctx, task.user, device, command, "")
-	if err != nil {
-		return failure(mcpDeviceError(err))
-	}
-	if hint := confirmationHint(result.Error); hint != "" {
-		summary := limitText(hint+"\n"+target+" ("+device+") · "+toolLabel(call.Name)+" "+string(args), 500)
-		if err := s.confirmFreeChat(ctx, task, summary, call.Name, ""); err != nil {
-			return brain.Observation{}, err
-		}
-		command.Approved = true
-		result, err = s.callMCP(ctx, task.user, device, command, "")
-		if err != nil {
-			return failure(mcpDeviceError(err))
-		}
-	}
-	if result.Error != "" {
-		return failure(result.Error + "\n" + string(result.Data))
-	}
-	observation := brain.Observation{Text: string(result.Data)}
-	if observation.Text == "" {
-		observation.Text = "工具执行完成。"
-	}
-	if id := result.AttachmentID; id != "" {
-		observation.JPEG, err = s.loadModelImage(ctx, id)
-		if err != nil {
-			observation.Text += " 截图暂时不可读取。"
-		} else if err := s.addFreeChatMedia(ctx, task, observation.JPEG, remote); err != nil {
-			observation.Text += " 截图未能保存到闲聊记录。"
-		} else {
-			observation.Text += " 截图已写入闲聊记录。"
-		}
-	}
-	return observation, nil
-}
-
-func (s *Service) confirmFreeChat(ctx context.Context, task brainTask, summary, risk, attachment string) error {
-	approved, err := s.requestConfirmation(ctx, task, summary, risk, attachment)
-	if err != nil {
-		return err
-	}
-	if !approved {
-		return errBrainDenied
-	}
-	return nil
-}
-
-func (s *Service) addFreeChatMedia(ctx context.Context, task brainTask, data []byte, remote settings.Configuration) error {
+func (s *Service) addChatToolMedia(ctx context.Context, task brainTask, deviceName string, data []byte, remote settings.Configuration) (string, error) {
 	now := time.Now()
 	image, err := s.saveUserAttachment(ctx, UploadImage{Name: "设备截图.jpg", Data: data}, remote, now)
 	if err != nil {
-		return err
+		return "", err
 	}
 	err = s.writeBrainReady(ctx, task.id, func(tx *sql.Tx) error {
 		if err := image.insert(ctx, tx, task.id, "chat_"+image.ID, now); err != nil {
 			return err
 		}
-		body, _ := json.Marshal(MediaCard{ID: image.ID, Name: image.name, Size: int64(image.size)})
+		body, _ := json.Marshal(MediaCard{ID: image.ID, Name: image.name, Size: int64(image.size), DeviceName: deviceName})
 		if _, err := tx.ExecContext(ctx, `INSERT INTO chat_messages(device_id,sender,type,task_id,payload_json,created_at)
 			VALUES (?,'agent','media',?,?,?)`, task.device, task.id, string(body), now.UnixMilli()); err != nil {
 			return err
@@ -265,8 +186,9 @@ func (s *Service) addFreeChatMedia(ctx context.Context, task brainTask, data []b
 	})
 	if err != nil {
 		s.deleteAttachmentFiles(ctx, image.AttachmentFiles)
+		return "", err
 	}
-	return err
+	return image.ID, nil
 }
 
 func mcpDeviceError(err error) string {
@@ -276,7 +198,7 @@ func mcpDeviceError(err error) string {
 	case errors.Is(err, ErrUnsupported):
 		return "设备离线或尚未提供此工具。"
 	case errors.Is(err, ErrTaskControl):
-		return "此设备已有一项 MCP 任务在执行。"
+		return "此设备的执行通道忙，请稍后重试。"
 	case errors.Is(err, ErrMCPDeviceAmbiguous), errors.Is(err, proto.ErrToolArguments):
 		return err.Error()
 	case errors.Is(err, context.DeadlineExceeded):

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"ghosthand/backend/internal/db"
+	"ghosthand/backend/internal/workbench"
 	"ghosthand/proto"
 )
 
@@ -221,8 +222,14 @@ func TestDeleteOfflineDeviceRemovesAllDataAndLogs(t *testing.T) {
 		t.Fatalf("expected agent log file deleted, err=%v", err)
 	}
 	for _, table := range []string{"devices", "device_credentials", "tasks", "attachments", "chat_messages", "device_operations", "pairing_codes"} {
+		query := "SELECT COUNT(*) FROM " + table
+		var args []any
+		if table == "devices" {
+			query += " WHERE id<>?"
+			args = append(args, workbench.FreeChatDeviceID)
+		}
 		var count int
-		if err := store.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+table).Scan(&count); err != nil {
+		if err := store.QueryRowContext(ctx, query, args...).Scan(&count); err != nil {
 			t.Fatal(err)
 		}
 		if count != 0 {

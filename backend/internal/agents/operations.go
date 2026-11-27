@@ -54,7 +54,7 @@ func (s *Service) History(ctx context.Context, id string) (RealtimeDevice, error
 	if err != nil {
 		return result, err
 	}
-	result.CanUninstall = platform == proto.Windows && proto.SupportsUninstall(capsHash)
+	result.CanUninstall = (platform == proto.Windows || platform == proto.Linux) && proto.SupportsUninstall(capsHash)
 	rows, err := s.store.QueryContext(ctx, `SELECT id,kind,state,detail,created_at,finished_at,uploaded_at IS NOT NULL
 		FROM device_operations WHERE device_id=? ORDER BY created_at DESC,id DESC LIMIT 50`, id)
 	if err != nil {
@@ -105,6 +105,7 @@ func (s *Service) Revoke(ctx context.Context, user int64, id string) error {
 		if p := s.connections[id]; p != nil {
 			_ = p.conn.CloseNow()
 		}
+		go s.disconnectSSHIfManaged(context.Background(), id)
 	}
 	return err
 }
@@ -142,6 +143,8 @@ func (s *Service) DeleteDevice(ctx context.Context, user int64, id string) ([]wo
 	}
 	var files []workbench.AttachmentFiles
 	var logIDs []string
+	var sshHostAgent sql.NullString
+	var isSSH bool
 	err := s.store.Write(ctx, func(tx *sql.Tx) error {
 		var connState proto.ConnState
 		var name string
@@ -154,6 +157,9 @@ func (s *Service) DeleteDevice(ctx context.Context, user int64, id string) ([]wo
 		}
 		if connState == proto.Online {
 			return ErrDeviceOnline
+		}
+		if err := tx.QueryRowContext(ctx, "SELECT host_agent_id FROM device_ssh_credentials WHERE device_id=?", id).Scan(&sshHostAgent); err == nil {
+			isSSH = true
 		}
 
 		files, err = workbench.DeviceAttachmentFiles(ctx, tx, id)
@@ -193,6 +199,10 @@ func (s *Service) DeleteDevice(ctx context.Context, user int64, id string) ([]wo
 	})
 	if err != nil {
 		return nil, err
+	}
+	if isSSH {
+		s.dispatchSSHDisconnect(sshHostAgent.String, id)
+		s.closeLocalSSHTerminals(id)
 	}
 	logDir := filepath.Join(s.dir, "logs")
 	for _, opID := range logIDs {
@@ -235,7 +245,7 @@ func (s *Service) Queue(ctx context.Context, user int64, id string, input Operat
 		if (input.Kind == proto.HelperRestart || input.Kind == proto.AgentRollback) && platform != proto.Windows {
 			return ErrInvalid
 		}
-		if input.Kind == proto.AgentUninstall && (platform != proto.Windows || !proto.SupportsUninstall(capsHash)) {
+		if input.Kind == proto.AgentUninstall && ((platform != proto.Windows && platform != proto.Linux) || !proto.SupportsUninstall(capsHash)) {
 			return ErrUninstallUnsupported
 		}
 		operationID, err = queue(ctx, tx, user, id, input.Kind, input.Hours)

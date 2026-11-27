@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -69,8 +70,8 @@ func brainUnavailable(device Device, config settings.Configuration) string {
 	if config.Endpoint == "" || config.Label == "" {
 		return "尚未配置 AI 模型接口。请在「系统设置 → 模型接口」填写服务地址并选择模型，或使用下方快捷指令。"
 	}
-	if device.Demo || device.Platform != proto.Windows {
-		return "AI 任务需要已配对的 Windows 执行器。"
+	if device.Demo || (device.Platform != proto.Windows && device.Platform != proto.Linux) {
+		return "AI 任务需要已配对的 Windows 或 Linux 执行器。"
 	}
 	return ""
 }
@@ -91,20 +92,21 @@ func (s *Service) RunBrain(ctx context.Context) {
 	if err := s.recoverBrain(ctx); err != nil && ctx.Err() == nil {
 		slog.Error("recover AI tasks", "error", err)
 	}
-	slots := make(chan struct{}, 8)
-	// A server-side chat can wait on an MCP task that needs a device worker.
+	brainSlots := make(chan struct{}, 8)
+	// Either chat type can wait for an MCP task on another device.
+	mcpSlots := make(chan struct{}, 8)
 	chatSlot := make(chan struct{}, 1)
 	slotFreed := make(chan struct{}, 1)
 	for ctx.Err() == nil {
 		changed := s.store.Changed()
 		retry := false
-		deviceReady, chatReady := len(slots) < cap(slots), len(chatSlot) == 0
-		if deviceReady || chatReady {
+		brainReady, mcpReady, chatReady := len(brainSlots) < cap(brainSlots), len(mcpSlots) < cap(mcpSlots), len(chatSlot) == 0
+		if brainReady || mcpReady || chatReady {
 			var task brainTask
 			err := s.store.QueryRowContext(ctx, `SELECT id,device_id,prompt,title,source,created_by FROM tasks
-				WHERE ((source IN ('brain','mcp') AND ?) OR (source='chat' AND ?))
+				WHERE ((source='brain' AND ?) OR (source='mcp' AND ?) OR (source='chat' AND ?))
 				AND state='running' AND control='' AND brain_started_at IS NULL
-				ORDER BY created_at,id LIMIT 1`, deviceReady, chatReady).
+				ORDER BY created_at,id LIMIT 1`, brainReady, mcpReady, chatReady).
 				Scan(&task.id, &task.device, &task.prompt, &task.title, &task.source, &task.user)
 			if err == nil {
 				claimed, err := s.claimBrain(ctx, task.id)
@@ -112,9 +114,12 @@ func (s *Service) RunBrain(ctx context.Context) {
 					slog.Error("claim AI task", "error", err)
 					retry = true
 				} else if claimed {
-					pool := slots
-					if task.source == "chat" {
+					pool := brainSlots
+					switch task.source {
+					case "chat":
 						pool = chatSlot
+					case "mcp":
+						pool = mcpSlots
 					}
 					pool <- struct{}{}
 					workers.Add(1)
@@ -379,9 +384,9 @@ func (s *Service) deviceAutoApprove(ctx context.Context, device string) bool {
 }
 
 func (s *Service) runLoop(ctx context.Context, task brainTask, unlock *taskUnlock) (string, error) {
-	var raw string
+	var selfName, raw string
 	var autoApprove bool
-	if err := s.store.QueryRowContext(ctx, "SELECT mcp_tools, auto_approve=1 FROM devices WHERE id=?", task.device).Scan(&raw, &autoApprove); err != nil {
+	if err := s.store.QueryRowContext(ctx, "SELECT name, mcp_tools, auto_approve=1 FROM devices WHERE id=?", task.device).Scan(&selfName, &raw, &autoApprove); err != nil {
 		return "", err
 	}
 	var advertised []proto.MCPTool
@@ -389,19 +394,29 @@ func (s *Service) runLoop(ctx context.Context, task brainTask, unlock *taskUnloc
 		return "", err
 	}
 	tools := CanonicalTools(advertised)
-	allowed := make(map[string]proto.MCPTool, len(tools)+1)
+	allowed := make(map[string]proto.MCPTool, len(tools))
 	for _, tool := range tools {
 		allowed[tool.Name] = tool
 	}
-	allowed[proto.ToolConfirm] = proto.ConfirmTool
+	mentioned, err := s.resolveMentions(ctx, task.device, task.prompt)
+	if err != nil {
+		return "", err
+	}
 	configs, err := s.config.Read(ctx)
 	if err != nil {
 		return "", err
 	}
 	config := configs[settings.LLM]
 	modelTools := tools
-	if !autoApprove {
-		modelTools = append(slicesClone(tools), proto.ConfirmTool)
+	if len(mentioned) > 0 {
+		const routing = "目标设备 ID 或唯一名称。不填或指定当前设备时操作本机，指定本条消息引用的设备时跨设备操作。"
+		modelTools = make([]proto.MCPTool, 0, len(proto.DeviceTools)+2)
+		modelTools = append(modelTools, MCPDevicesTool, addressedMCPTool(proto.ConfirmTool, false, routing))
+		for _, tool := range proto.DeviceTools {
+			modelTools = append(modelTools, addressedMCPTool(tool, false, routing))
+		}
+	} else if !autoApprove {
+		modelTools = append(slices.Clone(tools), proto.ConfirmTool)
 	}
 	images, err := s.loadTaskUserImages(ctx, task.id)
 	if err != nil {
@@ -417,10 +432,14 @@ func (s *Service) runLoop(ctx context.Context, task brainTask, unlock *taskUnloc
 	}
 	defer session.Clear()
 	session.SetInstructions(config.Instructions)
-	step, attempts := 0, 0
-	var observedWindow toolWindow
+	if strings.Contains(task.prompt, "@") {
+		session.PrependHistory([]brain.Message{{Role: "developer", Text: mentionInstructions(task.device, selfName, mentioned)}})
+	}
+	runner := chatToolRunner{service: s, task: task, remote: configs[settings.WebDAV]}
+	local := localChatTools{name: selfName, crossDevice: len(mentioned) > 0, allowed: allowed, unlock: unlock}
+	attempts := 0
 	for round := 0; round <= brain.MaxSteps; round++ {
-		if err := s.showBrain(ctx, task, step, "等待模型返回"); err != nil {
+		if err := s.showBrain(ctx, task, local.step, "等待模型返回"); err != nil {
 			return "", err
 		}
 		if err := s.awaitBrain(ctx, task.id); err != nil {
@@ -440,105 +459,96 @@ func (s *Service) runLoop(ctx context.Context, task brainTask, unlock *taskUnloc
 			break
 		}
 		attempts += len(turn.Calls)
-		observations := make([]brain.Observation, 0, len(turn.Calls))
-		for _, call := range turn.Calls {
-			tool, ok := allowed[call.Name]
-			args, invalid := proto.ValidateTool(call.Name, call.Args)
-			if !ok || invalid != nil {
-				observations = append(observations, brain.Observation{Text: "工具不在当前设备的允许列表中，或参数无效。", Error: true})
-				continue
+		calls := s.planChatCalls(ctx, task, turn.Calls, mentioned)
+		observations, err := runChatCalls(ctx, calls, func(ctx context.Context, call chatToolCall) (brain.Observation, error) {
+			if call.problem == "" && call.device == task.device && call.name != proto.ToolConfirm {
+				return runner.executeLocal(ctx, call, &local)
 			}
-			if err := s.awaitBrain(ctx, task.id); err != nil {
-				return "", err
-			}
-			autoApprove = s.deviceAutoApprove(ctx, task.device)
-			if call.Name == proto.ToolConfirm {
-				if autoApprove {
-					observations = append(observations, brain.Observation{Text: "当前设备已开启免确认自动执行模式，操作已自动批准，请直接继续执行。"})
-					continue
-				}
-				approved, err := s.requestConfirmation(ctx, task, args.Summary, args.RiskAction, args.AttachmentID)
-				if err != nil {
-					return "", err
-				}
-				if !approved {
-					return "", errBrainDenied
-				}
-				observations = append(observations, brain.Observation{Text: "管理员已确认。具体交互操作仍需要与目标和参数匹配。"})
-				continue
-			}
-			label := toolLabel(call.Name)
-			windowID := ""
-			needsObservedWindow := (call.Name == proto.ToolClick || call.Name == proto.ToolInput) && args.ElementID != nil
-			if needsObservedWindow {
-				windowID = observedWindow.ID
-				if windowID == "" {
-					observations = append(observations, brain.Observation{Text: "使用 element_id 操作前请先用 ui_inspect 或 screen_observe 获取目标窗口元素。", Error: true})
-					continue
-				}
-			}
-			step++
-			attempt := 1
-			result, err := s.callDevice(ctx, task, step, attempt, call.Name, call.Args, label, windowID, autoApprove)
-			if err != nil {
-				return "", err
-			}
-			result, err = unlock.retry(ctx, result, step, &attempt, call.Name, call.Args, label, windowID, autoApprove)
-			if err != nil {
-				return "", err
-			}
-			if hint := confirmationHint(result.Error); (tool.RiskLevel == "interactive" || tool.RiskLevel == "system") && hint != "" {
-				if !s.deviceAutoApprove(ctx, task.device) {
-					justification := label + " " + string(call.Args)
-					if windowID != "" && observedWindow.Title != "" {
-						justification = limitText(observedWindow.Title, 120) + " · " + justification
-					}
-					approved, err := s.requestConfirmation(ctx, task, hint+"\n"+justification, call.Name, "")
-					if err != nil {
-						return "", err
-					}
-					if !approved {
-						return "", errBrainDenied
-					}
-				}
-				attempt++
-				result, err = s.callDevice(ctx, task, step, attempt, call.Name, call.Args, label, windowID, true)
-				if err != nil {
-					return "", err
-				}
-				result, err = unlock.retry(ctx, result, step, &attempt, call.Name, call.Args, label, windowID, true)
-				if err != nil {
-					return "", err
-				}
-			}
-			observedWindow = nextToolWindow(observedWindow, call.Name, result)
-			observation := brain.Observation{Text: string(result.Data)}
-			if result.Error != "" {
-				observation.Text, observation.Error = result.Error, true
-				if call.Name == proto.ToolBrowserAct && len(result.Data) > 0 {
-					observation.Text += "\n" + string(result.Data)
-				}
-			}
-			if result.AttachmentID != "" {
-				observation.Text += " 截图已写入聊天，附件 ID：" + result.AttachmentID
-				if data, err := s.loadModelImage(ctx, result.AttachmentID); err == nil {
-					observation.JPEG = data
-				}
-			}
-			if observation.Text == "" {
-				observation.Text = "工具执行完成。"
-			}
-			observations = append(observations, observation)
+			return runner.execute(ctx, call)
+		})
+		if err != nil {
+			return "", err
 		}
 		session.Return(turn.Calls, observations)
 	}
 	return "", fmt.Errorf("AI 任务已达到 %d 次工具调用上限。请核对设备上的实际结果。", brain.MaxSteps)
 }
 
-func slicesClone(tools []proto.MCPTool) []proto.MCPTool {
-	out := make([]proto.MCPTool, len(tools))
-	copy(out, tools)
-	return out
+type localChatTools struct {
+	name        string
+	crossDevice bool
+	allowed     map[string]proto.MCPTool
+	unlock      *taskUnlock
+	step        int
+	window      toolWindow
+}
+
+func (r *chatToolRunner) executeLocal(ctx context.Context, call chatToolCall, local *localChatTools) (brain.Observation, error) {
+	s, task := r.service, r.task
+	tool, ok := local.allowed[call.name]
+	args, invalid := proto.ValidateTool(call.name, call.args)
+	if !ok || invalid != nil {
+		return brain.Observation{Text: "工具不在当前设备的允许列表中，或参数无效。", Error: true}, nil
+	}
+	if err := s.awaitBrain(ctx, task.id); err != nil {
+		return brain.Observation{}, err
+	}
+	windowID := ""
+	if (call.name == proto.ToolClick || call.name == proto.ToolInput) && args.ElementID != nil {
+		windowID = local.window.ID
+		if windowID == "" {
+			return brain.Observation{Text: "使用 element_id 操作前请先用 ui_inspect 或 screen_observe 获取目标窗口元素。", Error: true}, nil
+		}
+	}
+	local.step++
+	attempt := 1
+	label := toolLabel(call.name)
+	execute := func(approved bool) (proto.MCPResult, error) {
+		result, err := s.callDevice(ctx, task, local.step, attempt, call.name, call.args, label, windowID, approved)
+		if err != nil {
+			return result, err
+		}
+		return local.unlock.retry(ctx, result, local.step, &attempt, call.name, call.args, label, windowID, approved)
+	}
+	result, err := execute(s.deviceAutoApprove(ctx, task.device))
+	if err != nil {
+		return brain.Observation{}, err
+	}
+	if hint := confirmationHint(result.Error); (tool.RiskLevel == "interactive" || tool.RiskLevel == "system") && hint != "" {
+		justification := label + " " + string(call.args)
+		if windowID != "" && local.window.Title != "" {
+			justification = limitText(local.window.Title, 120) + " · " + justification
+		}
+		if err := r.confirm(ctx, task.device, "", hint+"\n"+justification, call.name, ""); err != nil {
+			return brain.Observation{}, err
+		}
+		attempt++
+		result, err = execute(true)
+		if err != nil {
+			return brain.Observation{}, err
+		}
+	}
+	local.window = nextToolWindow(local.window, call.name, result)
+	observation := brain.Observation{Text: string(result.Data)}
+	if result.Error != "" {
+		observation.Text, observation.Error = result.Error, true
+		if call.name == proto.ToolBrowserAct && len(result.Data) > 0 {
+			observation.Text += "\n" + string(result.Data)
+		}
+	}
+	if result.AttachmentID != "" {
+		observation.Text += " 截图已写入聊天，附件 ID：" + result.AttachmentID
+		if data, err := s.loadModelImage(ctx, result.AttachmentID); err == nil {
+			observation.JPEG = data
+			if local.crossDevice && local.name != "" {
+				observation.ImageLabel = "[" + local.name + "] " + label
+			}
+		}
+	}
+	if observation.Text == "" {
+		observation.Text = "工具执行完成。"
+	}
+	return observation, nil
 }
 
 func confirmationHint(code string) string {

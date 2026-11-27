@@ -21,21 +21,23 @@ type TerminalShell string
 const (
 	TerminalShellCMD        TerminalShell = "cmd"
 	TerminalShellPowerShell TerminalShell = "powershell"
+	TerminalShellSh         TerminalShell = "sh"
 )
 
 func (s TerminalShell) Valid() bool {
-	return s == TerminalShellCMD || s == TerminalShellPowerShell
+	return s == TerminalShellCMD || s == TerminalShellPowerShell || s == TerminalShellSh
 }
 
 // TerminalFrame is carried on the live device connection with Seq and Ack zero.
 type TerminalFrame struct {
-	SessionID string        `json:"session_id"`
-	Shell     TerminalShell `json:"shell,omitempty"`
-	Cols      int           `json:"cols,omitempty"`
-	Rows      int           `json:"rows,omitempty"`
-	Data      string        `json:"data,omitempty"`
-	ExitCode  *int          `json:"exit_code,omitempty"`
-	Error     string        `json:"error,omitempty"`
+	SessionID      string        `json:"session_id"`
+	TargetDeviceID string        `json:"target_device_id,omitempty"`
+	Shell          TerminalShell `json:"shell,omitempty"`
+	Cols           int           `json:"cols,omitempty"`
+	Rows           int           `json:"rows,omitempty"`
+	Data           string        `json:"data,omitempty"`
+	ExitCode       *int          `json:"exit_code,omitempty"`
+	Error          string        `json:"error,omitempty"`
 }
 
 func TerminalDimensions(cols, rows int) (int, int) {

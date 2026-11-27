@@ -3,8 +3,8 @@ import { Terminal, X } from 'lucide-react'
 import { CellAttribute, clamp, CURSOR_COLOR, DEFAULT_BACKGROUND, SELECTION_COLOR, TerminalBuffer } from './terminal-buffer'
 import type { TerminalCell, TerminalFrame, TerminalPosition } from './terminal-buffer'
 
-export type TerminalShell = 'cmd' | 'powershell'
-export const terminalShellNames: Record<TerminalShell, string> = { cmd: 'CMD', powershell: 'PowerShell' }
+export type TerminalShell = 'cmd' | 'powershell' | 'sh'
+export const terminalShellNames: Record<TerminalShell, string> = { cmd: 'CMD', powershell: 'PowerShell', sh: 'Shell' }
 
 type Selection = { start: TerminalPosition; end: TerminalPosition }
 type Status = { text: string; state: 'connecting' | 'connected' | 'closed' }
@@ -287,7 +287,7 @@ function attachTerminal(elements: TerminalElements, deviceID: string, shell: Ter
         finish('收到无效的终端数据。')
       }
     }, { signal })
-    socket.addEventListener('error', () => finish('无法连接设备终端，请确认 Windows 节点在线且支持远程终端。'), { signal })
+    socket.addEventListener('error', () => finish('无法连接设备终端，请确认节点在线且支持远程终端。'), { signal })
     socket.addEventListener('close', () => finish('终端连接已断开。'), { signal })
   }
 

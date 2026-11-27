@@ -1,6 +1,7 @@
 package workbench
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -48,6 +49,10 @@ var MCPDevicesTool = proto.MCPTool{
 
 // AddressedMCPTool adds the server's routing field to the node's tool schema.
 func AddressedMCPTool(tool proto.MCPTool, requireDevice bool) proto.MCPTool {
+	return addressedMCPTool(tool, requireDevice, "设备 ID 或唯一设备名称")
+}
+
+func addressedMCPTool(tool proto.MCPTool, requireDevice bool, description string) proto.MCPTool {
 	var schema struct {
 		Type                 string                     `json:"type"`
 		Properties           map[string]json.RawMessage `json:"properties"`
@@ -60,7 +65,9 @@ func AddressedMCPTool(tool proto.MCPTool, requireDevice bool) proto.MCPTool {
 	if schema.Properties == nil {
 		schema.Properties = make(map[string]json.RawMessage)
 	}
-	schema.Properties["device_id"] = json.RawMessage(`{"type":"string","minLength":1,"maxLength":80,"description":"设备 ID 或唯一设备名称"}`)
+	schema.Properties["device_id"], _ = json.Marshal(map[string]any{
+		"type": "string", "minLength": 1, "maxLength": 80, "description": description,
+	})
 	if requireDevice {
 		schema.Required = append(schema.Required, "device_id")
 	}
@@ -81,11 +88,16 @@ func MCPArguments(raw json.RawMessage, defaultDevice string) (string, json.RawMe
 	}
 	device := defaultDevice
 	if value, exists := args["device_id"]; exists {
-		device = ""
-		if json.Unmarshal(value, &device) != nil {
-			return "", nil, errMCPDeviceArgument
-		}
 		delete(args, "device_id")
+		if string(bytes.TrimSpace(value)) != "null" {
+			var parsed string
+			if json.Unmarshal(value, &parsed) != nil {
+				return "", nil, errMCPDeviceArgument
+			}
+			if strings.TrimSpace(parsed) != "" || defaultDevice == "" {
+				device = parsed
+			}
+		}
 	}
 	if strings.TrimSpace(device) == "" || utf8.RuneCountInString(device) > 80 {
 		return "", nil, errMCPDeviceArgument
@@ -157,7 +169,7 @@ func (s *Service) MCPCapabilities(ctx context.Context, device string) ([]proto.M
 
 // CallMCP uses the same serialized desktop lane, local stop controls and audit trail as chat.
 func (s *Service) CallMCP(ctx context.Context, user int64, device, tool string, args json.RawMessage) (proto.MCPResult, error) {
-	return s.callMCP(ctx, user, device, mcpCommand{Tool: tool, Args: args}, "")
+	return s.callMCP(ctx, user, device, mcpCommand{Tool: tool, Args: args}, "", nil)
 }
 
 func (s *Service) CallBrowserExtension(ctx context.Context, user int64, device, action string) (proto.MCPResult, error) {
@@ -165,7 +177,7 @@ func (s *Service) CallBrowserExtension(ctx context.Context, user int64, device, 
 		return proto.MCPResult{}, ErrUnsupported
 	}
 	args, _ := json.Marshal(map[string]string{"action": action, "browser": "chrome"})
-	return s.callMCP(ctx, user, device, mcpCommand{Tool: proto.ToolBrowserManage, Args: args, Quiet: true}, "browser_ext."+action)
+	return s.callMCP(ctx, user, device, mcpCommand{Tool: proto.ToolBrowserManage, Args: args, Quiet: true}, "browser_ext."+action, nil)
 }
 
 func resolveMCPDevice(ctx context.Context, q brainStateQuery, target string) (string, error) {
@@ -192,7 +204,7 @@ func (s *Service) MCPDeviceID(ctx context.Context, target string) (string, error
 	return resolveMCPDevice(ctx, s.store, target)
 }
 
-func (s *Service) callMCP(ctx context.Context, user int64, target string, command mcpCommand, auditAction string) (proto.MCPResult, error) {
+func (s *Service) callMCP(ctx context.Context, user int64, target string, command mcpCommand, auditAction string, origin *brainTask) (proto.MCPResult, error) {
 	var result proto.MCPResult
 	tool, args, quiet := command.Tool, command.Args, command.Quiet
 	if !IsMCPToolAllowed(tool) {
@@ -204,7 +216,7 @@ func (s *Service) callMCP(ctx context.Context, user int64, target string, comman
 	ttl := mcpTTL(tool, args, quiet)
 	device := target
 	var taskID string
-	err := s.store.Write(ctx, func(tx *sql.Tx) error {
+	queue := func(tx *sql.Tx) error {
 		var err error
 		if !command.FromChat && !quiet {
 			device, err = resolveMCPDevice(ctx, tx, target)
@@ -213,12 +225,14 @@ func (s *Service) callMCP(ctx context.Context, user int64, target string, comman
 			}
 		}
 		var available, busy bool
+		// Another device chat can hold the target UI lane while waiting for this chat.
+		fromDeviceChat := origin != nil && origin.source == "brain"
 		err = tx.QueryRowContext(ctx, `SELECT d.task_protocol>=2 AND d.conn_state IN ('online','unstable')
 			AND EXISTS (SELECT 1 FROM json_each(d.mcp_tools) WHERE json_extract(value,'$.name')=?),
-			EXISTS (SELECT 1 FROM tasks WHERE device_id=d.id AND (source='mcp' OR (? AND lane='ui'))
+			EXISTS (SELECT 1 FROM tasks WHERE device_id=d.id AND (source='mcp' OR (? AND lane='ui') OR (? AND source='brain'))
 				AND state IN ('queued','dispatched','running','paused','waiting_user','cancelling'))
 			FROM devices d JOIN device_credentials c ON c.device_id=d.id
-			WHERE d.id=? AND d.id<>? AND d.is_demo=0 AND c.revoked_at IS NULL`, tool, quiet, device, FreeChatDeviceID).Scan(&available, &busy)
+			WHERE d.id=? AND d.id<>? AND d.is_demo=0 AND c.revoked_at IS NULL`, tool, quiet, fromDeviceChat, device, FreeChatDeviceID).Scan(&available, &busy)
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrDeviceNotFound
 		}
@@ -246,7 +260,13 @@ func (s *Service) callMCP(ctx context.Context, user int64, target string, comman
 			}
 		}
 		return RecordChange(ctx, tx, device)
-	})
+	}
+	var err error
+	if origin == nil {
+		err = s.store.Write(ctx, queue)
+	} else {
+		err = s.writeBrainReady(ctx, origin.id, queue)
+	}
 	if err != nil {
 		return result, err
 	}

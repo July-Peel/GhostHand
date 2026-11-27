@@ -112,6 +112,37 @@ func (s *Service) dispatchTask(ctx context.Context) error {
 			}
 			return RecordChange(ctx, tx, device)
 		}
+		var isSSH bool
+		_ = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM device_ssh_credentials WHERE device_id=?)", device).Scan(&isSSH)
+		if isSSH {
+			if assignment.Capability == proto.BrainTask {
+				if _, err := tx.ExecContext(ctx, "UPDATE tasks SET state='running',assign_seq=0,started_at=?,last_heartbeat_at=? WHERE id=?",
+					now, now, assignment.TaskID); err != nil {
+					return err
+				}
+				if err := addTaskEvent(ctx, tx, assignment.TaskID, "queue", "accepted", "SSH 节点已就绪，开始执行", now); err != nil {
+					return err
+				}
+				return RecordChange(ctx, tx, device)
+			}
+			// Quick commands such as /info on SSH devices resolve immediately from device metadata.
+			if _, err := tx.ExecContext(ctx, "UPDATE tasks SET state='running',assign_seq=0,started_at=?,last_heartbeat_at=? WHERE id=?",
+				now, now, assignment.TaskID); err != nil {
+				return err
+			}
+			if assignment.Capability == proto.DeviceInfo {
+				raw, _ := json.Marshal(proto.DeviceState{HelperState: "none", DesktopState: "headless"})
+				if err := publishResult(ctx, tx, device, assignment.Capability, proto.TaskResultPayload{
+					TaskID: assignment.TaskID, State: proto.Succeeded, Result: raw,
+				}, now); err != nil {
+					return err
+				}
+			}
+			if err := finishTask(ctx, tx, assignment.TaskID, proto.Succeeded, "", now); err != nil {
+				return err
+			}
+			return RecordChange(ctx, tx, device)
+		}
 		if !seq.Valid {
 			number, err := Enqueue(ctx, tx, device, proto.TaskAssign, assignment)
 			if err != nil {
@@ -342,6 +373,24 @@ func requestControl(ctx context.Context, tx *sql.Tx, device, task string, state 
 	default:
 		return ErrTaskControl
 	}
+	var isSSH bool
+	_ = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM device_ssh_credentials WHERE device_id=?)", device).Scan(&isSSH)
+	if isSSH {
+		switch action {
+		case "pause":
+			if _, err := tx.ExecContext(ctx, "UPDATE tasks SET state='paused',control='' WHERE id=?", task); err != nil {
+				return err
+			}
+			return addTaskEvent(ctx, tx, task, "control", "paused", "任务已暂停", now)
+		case "resume":
+			if _, err := tx.ExecContext(ctx, "UPDATE tasks SET state='running',control='' WHERE id=?", task); err != nil {
+				return err
+			}
+			return addTaskEvent(ctx, tx, task, "control", "running", "任务已继续", now)
+		case "cancel", "force":
+			return finishTask(ctx, tx, task, proto.Cancelled, proto.ErrCancelled, now)
+		}
+	}
 	var err error
 	if kind == proto.TaskCancel {
 		err = enqueueTaskCancel(ctx, tx, device, task, control.Force, false)
@@ -372,7 +421,7 @@ func finishTask(ctx context.Context, tx *sql.Tx, task string, state proto.TaskSt
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE task_events SET status=?,elapsed_ms=MAX(elapsed_ms,?-created_at)
-		WHERE task_id=? AND status='running' AND attempt>0`, state, now, task); err != nil {
+		WHERE task_id=? AND status='running' AND (attempt>0 OR step_key='remote_tool')`, state, now, task); err != nil {
 		return err
 	}
 	if err := closeTaskConfirmations(ctx, tx, task, now); err != nil {

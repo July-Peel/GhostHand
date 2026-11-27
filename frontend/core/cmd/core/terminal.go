@@ -8,6 +8,7 @@ import (
 
 	"ghosthand/launcher/state"
 	"ghosthand/proto"
+	"ghosthand/proto/sshrunner"
 )
 
 type terminalEvent struct {
@@ -22,6 +23,7 @@ type terminalSession struct {
 
 type terminalManager struct {
 	ctx      context.Context
+	ssh      *sshrunner.Manager
 	events   chan terminalEvent
 	mu       sync.Mutex
 	sessions map[string]*terminalSession
@@ -30,8 +32,8 @@ type terminalManager struct {
 
 var errTerminalBacklog = errors.New("终端输入积压过多，会话已结束。")
 
-func newTerminalManager(ctx context.Context) *terminalManager {
-	return &terminalManager{ctx: ctx, events: make(chan terminalEvent, 32), sessions: make(map[string]*terminalSession)}
+func newTerminalManager(ctx context.Context, sshMgr *sshrunner.Manager) *terminalManager {
+	return &terminalManager{ctx: ctx, ssh: sshMgr, events: make(chan terminalEvent, 32), sessions: make(map[string]*terminalSession)}
 }
 
 func isTerminalCommand(kind proto.MessageType) bool {
@@ -50,7 +52,7 @@ func (m *terminalManager) receive(envelope proto.Envelope) error {
 		return errors.New("invalid terminal message")
 	}
 	if envelope.Type == proto.TerminalOpenMessage {
-		if !request.Shell.Valid() {
+		if !request.Shell.Valid() || (request.TargetDeviceID != "" && !state.IDPattern.MatchString(request.TargetDeviceID)) {
 			return errors.New("invalid terminal shell")
 		}
 		m.open(request)
@@ -98,9 +100,35 @@ func (m *terminalManager) open(request proto.TerminalFrame) {
 			delete(m.sessions, request.SessionID)
 			m.mu.Unlock()
 		}()
-		result := runTerminal(ctx, request, session.commands, func(text string) {
+		outputFn := func(text string) {
 			m.emit(ctx, proto.TerminalOutputMessage, proto.TerminalFrame{SessionID: request.SessionID, Data: text})
-		})
+		}
+		var result proto.TerminalFrame
+		if request.TargetDeviceID != "" {
+			if m.ssh == nil {
+				result = proto.TerminalFrame{Error: "当前节点未启用 SSH 终端代理。"}
+			} else {
+				sshCmds := make(chan sshrunner.TerminalCommand, 32)
+				go func() {
+					defer close(sshCmds)
+					for {
+						select {
+						case <-ctx.Done():
+							return
+						case ev := <-session.commands:
+							select {
+							case sshCmds <- sshrunner.TerminalCommand{Kind: ev.kind, Frame: ev.frame}:
+							case <-ctx.Done():
+								return
+							}
+						}
+					}
+				}()
+				result = m.ssh.OpenTerminal(ctx, request, sshCmds, outputFn)
+			}
+		} else {
+			result = runTerminal(ctx, request, session.commands, outputFn)
+		}
 		if cause := context.Cause(ctx); errors.Is(cause, errTerminalBacklog) {
 			result.Error = cause.Error()
 		} else if cause != nil {

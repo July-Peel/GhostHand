@@ -57,6 +57,9 @@ func TaskCapabilities(platform Platform) []Capability {
 			Capability{ID: DeviceBattery, Version: 1, Lane: BackgroundLane, ParamsSchema: emptyParams},
 			Capability{ID: ScreenCapture, Version: 1, Lane: UILane, ParamsSchema: emptyParams},
 			Capability{ID: BrainTask, Version: 1, Lane: UILane, ParamsSchema: emptyParams})
+	} else if platform == Linux {
+		caps = append(caps,
+			Capability{ID: BrainTask, Version: 1, Lane: UILane, ParamsSchema: emptyParams})
 	}
 	return caps
 }
@@ -64,24 +67,37 @@ func TaskCapabilities(platform Platform) []Capability {
 var emptyParams = json.RawMessage(`{"type":"object","additionalProperties":false}`)
 
 func TaskCapabilitiesHash(platform Platform) string {
-	if platform == Windows {
+	switch platform {
+	case Windows:
 		return "m5-tasks-v2-windows-browser"
+	case Linux:
+		return "m5-tasks-v2-linux"
+	default:
+		return "m4-tasks-v1-" + string(platform)
 	}
-	return "m4-tasks-v1-" + string(platform)
 }
 
 const (
 	WindowsUninstallCapsHash         = "m5-tasks-v2-windows-browser-uninstall"
 	PreviousWindowsUninstallCapsHash = "m45-tasks-v2-windows-uninstall"
 	LegacyWindowsUninstallCapsHash   = "m4-tasks-v1-windows-uninstall"
+	LinuxUninstallCapsHash           = "m5-tasks-v2-linux-uninstall"
 )
 
 func SupportsUninstall(hash string) bool {
-	return hash == WindowsUninstallCapsHash || hash == PreviousWindowsUninstallCapsHash || hash == "m45-tasks-v1-windows-uninstall" || hash == LegacyWindowsUninstallCapsHash
+	return hash == WindowsUninstallCapsHash || hash == PreviousWindowsUninstallCapsHash ||
+		hash == "m45-tasks-v1-windows-uninstall" || hash == LegacyWindowsUninstallCapsHash ||
+		hash == LinuxUninstallCapsHash
 }
 
 func SupportsBrain(platform Platform, hash string) bool {
-	return platform == Windows && (hash == TaskCapabilitiesHash(platform) || hash == "m45-tasks-v2-windows" || hash == "m45-tasks-v1-windows" || hash == "m4-tasks-v1-windows" || SupportsUninstall(hash))
+	if platform == Windows {
+		return hash == TaskCapabilitiesHash(platform) || hash == "m45-tasks-v2-windows" || hash == "m45-tasks-v1-windows" || hash == "m4-tasks-v1-windows" || SupportsUninstall(hash)
+	}
+	if platform == Linux {
+		return hash == TaskCapabilitiesHash(platform) || hash == LinuxUninstallCapsHash
+	}
+	return false
 }
 
 func SupportsTasks(platform Platform, hash string) bool {

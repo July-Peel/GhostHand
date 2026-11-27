@@ -35,6 +35,14 @@ func osVersion() string {
 	return fmt.Sprintf("Windows %d.%d.%d", v.MajorVersion, v.MinorVersion, v.BuildNumber)
 }
 
+func installServiceFlag(configuration) error {
+	return fmt.Errorf("--install is not used on Windows; use ghosthand-launcher.exe install")
+}
+
+func uninstallServiceFlag() error {
+	return fmt.Errorf("--uninstall is not used on Windows; use ghosthand-launcher.exe uninstall")
+}
+
 func currentProcessSessionID() uint32 {
 	var id uint32
 	if err := windows.ProcessIdToSessionId(windows.GetCurrentProcessId(), &id); err != nil {

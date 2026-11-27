@@ -16,14 +16,24 @@ type ConfirmationCard struct {
 	Summary      string `json:"summary"`
 	RiskAction   string `json:"risk_action"`
 	AttachmentID string `json:"attachment_id,omitempty"`
+	DeviceName   string `json:"device_name,omitempty"`
 }
 
-func (s *Service) requestConfirmation(ctx context.Context, t brainTask, summary, risk, attachment string) (bool, error) {
+func (s *Service) requestConfirmation(ctx context.Context, t brainTask, target, targetName, summary, risk, attachment string) (bool, error) {
 	id, err := proto.NewID()
 	if err != nil {
 		return false, err
 	}
+	var auto bool
 	err = s.writeBrainReady(ctx, t.id, func(tx *sql.Tx) error {
+		if target != FreeChatDeviceID {
+			if err := tx.QueryRowContext(ctx, "SELECT auto_approve=1 FROM devices WHERE id=?", target).Scan(&auto); err != nil {
+				return err
+			}
+			if auto {
+				return nil
+			}
+		}
 		now := time.Now().UnixMilli()
 		var step int
 		if err := tx.QueryRowContext(ctx, `UPDATE tasks SET state='waiting_user' WHERE id=? RETURNING step_index`, t.id).Scan(&step); err != nil {
@@ -38,9 +48,14 @@ func (s *Service) requestConfirmation(ctx context.Context, t brainTask, summary,
 				attachment = ""
 			}
 		}
+		var targetID any
 		card := ConfirmationCard{ID: id, TaskID: t.id, Summary: summary, RiskAction: risk, AttachmentID: attachment}
+		if target != t.device {
+			targetID = target
+			card.DeviceName = targetName
+		}
 		raw, _ := json.Marshal(card)
-		if _, err := tx.ExecContext(ctx, "INSERT INTO confirmations(id,task_id,summary,created_at) VALUES (?,?,?,?)", id, t.id, summary, now); err != nil {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO confirmations(id,task_id,summary,created_at,target_device_id) VALUES (?,?,?,?,?)", id, t.id, summary, now, targetID); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO chat_messages(device_id,sender,type,task_id,payload_json,created_at)
@@ -56,8 +71,8 @@ func (s *Service) requestConfirmation(ctx context.Context, t brainTask, summary,
 		}
 		return RecordChange(ctx, tx, t.device)
 	})
-	if err != nil {
-		return false, err
+	if err != nil || auto {
+		return auto, err
 	}
 	wait, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
@@ -133,4 +148,39 @@ func (s *Service) Decide(ctx context.Context, user int64, device, id string, app
 		s.cancelBrainSession(device, task)
 	}
 	return err
+}
+
+func approveTargetConfirmations(ctx context.Context, tx *sql.Tx, device string, now int64) error {
+	rows, err := tx.QueryContext(ctx, `UPDATE confirmations AS c SET decision='approved',decided_at=?
+		WHERE c.decision='pending' AND EXISTS (SELECT 1 FROM tasks t WHERE t.id=c.task_id
+			AND COALESCE(c.target_device_id,t.device_id)=? AND t.state IN ('waiting_user','paused'))
+		RETURNING task_id`, now, device)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var tasks []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		tasks = append(tasks, id)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, id := range tasks {
+		var owner string
+		if err := tx.QueryRowContext(ctx, `UPDATE tasks SET state=CASE WHEN state='waiting_user' THEN 'running' ELSE state END
+			WHERE id=? RETURNING device_id`, id).Scan(&owner); err != nil {
+			return err
+		}
+		if owner != device {
+			if err := RecordChange(ctx, tx, owner); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

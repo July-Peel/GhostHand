@@ -18,7 +18,13 @@ import (
 
 	"ghosthand/launcher/state"
 	"ghosthand/proto"
+	"ghosthand/proto/sshrunner"
 )
+
+type sshOutbound struct {
+	kind    proto.MessageType
+	payload any
+}
 
 type agent struct {
 	cfg          atomic.Pointer[configuration]
@@ -27,6 +33,8 @@ type agent struct {
 	logs         *memLogBuffer
 	platform     *host
 	browser      *browserBridge
+	ssh          *sshrunner.Manager
+	sshEvents    chan sshOutbound
 	corePath     string
 	helperPath   string
 	operations   chan struct{}
@@ -36,6 +44,17 @@ type agent struct {
 	welcomed     chan struct{}
 	firstWelcome sync.Once
 	rdpMu        sync.Mutex
+}
+
+func (a *agent) enqueueSSHOutbound(kind proto.MessageType, payload any) {
+	if a.sshEvents == nil {
+		return
+	}
+	select {
+	case a.sshEvents <- sshOutbound{kind: kind, payload: payload}:
+	default:
+		slog.Warn("dropping ssh outbound message due to full queue", "kind", kind)
+	}
 }
 
 var (
@@ -116,12 +135,16 @@ func (a *agent) session(ctx context.Context) error {
 	hello := proto.HelloPayload{
 		DeviceID: cfg.DeviceID, Token: cfg.Token, Platform: platform, AgentVersion: version,
 		DesktopOperations:  platform == proto.Windows,
-		TerminalOperations: platform == proto.Windows,
+		TerminalOperations: platform == proto.Windows || platform == proto.Linux,
 		LastAck:            lastAck, Fresh: fresh, CapsHash: proto.TaskCapabilitiesHash(platform), RunningTasks: running, State: snapshot,
 		TaskInventory: true, PendingTaskResults: pendingResults,
 	}
 	if a.canUninstall {
-		hello.CapsHash = proto.WindowsUninstallCapsHash
+		if platform == proto.Linux {
+			hello.CapsHash = proto.LinuxUninstallCapsHash
+		} else {
+			hello.CapsHash = proto.WindowsUninstallCapsHash
+		}
 	}
 	if err := write(helloCtx, conn, proto.Hello, hello, 0); err != nil {
 		return err
@@ -160,6 +183,9 @@ func (a *agent) session(ctx context.Context) error {
 		if platform == proto.Windows {
 			report.Tools = proto.DeviceTools
 			report.Resources = proto.DeviceResources
+		} else if platform == proto.Linux {
+			report.Tools = proto.LinuxTools
+			report.Resources = proto.LinuxResources
 		}
 		if err := a.local.enqueueCaps(report); err != nil {
 			return err
@@ -190,7 +216,7 @@ type readResult struct {
 
 func (a *agent) exchange(ctx context.Context, conn *websocket.Conn, interval time.Duration, inbound, sent uint64, taskHeartbeat bool) error {
 	ctx, cancel := context.WithCancel(ctx)
-	terminals := newTerminalManager(ctx)
+	terminals := newTerminalManager(ctx, a.ssh)
 	terminalWriterDone := make(chan struct{})
 	go func() {
 		defer close(terminalWriterDone)
@@ -211,6 +237,9 @@ func (a *agent) exchange(ctx context.Context, conn *websocket.Conn, interval tim
 		terminals.closeAll()
 		<-terminalWriterDone
 	}()
+	if a.ssh != nil {
+		go a.ssh.EmitStates()
+	}
 	received := make(chan readResult, 1)
 	go func() {
 		for {
@@ -246,6 +275,7 @@ func (a *agent) exchange(ctx context.Context, conn *websocket.Conn, interval tim
 	var timeout <-chan time.Time = deadline.C
 	desktopResults := make(chan proto.DesktopResult, 8)
 	desktopSlots := make(chan struct{}, 8)
+	sshCallSlots := make(chan struct{}, 16)
 	if err := a.sendState(ctx, conn, proto.Ping, inbound); err != nil {
 		return err
 	}
@@ -303,6 +333,10 @@ func (a *agent) exchange(ctx context.Context, conn *websocket.Conn, interval tim
 				}
 			}
 		case <-a.local.changed:
+		case out := <-a.sshEvents:
+			if err := write(ctx, conn, out.kind, out.payload, inbound); err != nil {
+				return err
+			}
 		case result := <-desktopResults:
 			kind := proto.RDPResult
 			if result.Kind == proto.BrowserExtensionStatusRequest {
@@ -341,8 +375,10 @@ func (a *agent) exchange(ctx context.Context, conn *websocket.Conn, interval tim
 			isDesktop := frame.Seq == 0 && (frame.Type == proto.BrowserExtensionStatusRequest ||
 				frame.Type == proto.RDPPreflight || frame.Type == proto.RDPUnlock || frame.Type == proto.RDPLock)
 			isPolicy := frame.Seq == 0 && frame.Type == proto.ConfigUpdate
+			isSSH := frame.Seq == 0 && (frame.Type == proto.SSHConnectMessage ||
+				frame.Type == proto.SSHDisconnectMessage || frame.Type == proto.SSHCallMessage)
 			if frame.Version != proto.Version || !state.IDPattern.MatchString(frame.ID) ||
-				(frame.Seq == 0 && frame.Type != proto.Pong && !isDesktop && !isPolicy) ||
+				(frame.Seq == 0 && frame.Type != proto.Pong && !isDesktop && !isPolicy && !isSSH) ||
 				(frame.Seq > 0 && !validTaskFrame(frame) && !validOperation(frame)) {
 				return errors.New("invalid controller message")
 			}
@@ -350,7 +386,11 @@ func (a *agent) exchange(ctx context.Context, conn *websocket.Conn, interval tim
 			if err != nil {
 				return err
 			}
-			if isPolicy {
+			if isSSH {
+				if err := a.handleSSHFrame(ctx, frame, sshCallSlots); err != nil {
+					return err
+				}
+			} else if isPolicy {
 				var policy proto.DesktopPolicy
 				if json.Unmarshal(frame.Payload, &policy) != nil {
 					return errors.New("invalid desktop policy")
@@ -398,6 +438,60 @@ func (a *agent) exchange(ctx context.Context, conn *websocket.Conn, interval tim
 			}
 		}
 	}
+}
+
+func (a *agent) handleSSHFrame(ctx context.Context, frame proto.Envelope, slots chan struct{}) error {
+	if a.ssh == nil {
+		return nil
+	}
+	switch frame.Type {
+	case proto.SSHConnectMessage:
+		var payload proto.SSHConnectPayload
+		if json.Unmarshal(frame.Payload, &payload) != nil || !state.IDPattern.MatchString(payload.SSHDeviceID) {
+			return errors.New("invalid ssh.connect payload")
+		}
+		a.ssh.Connect(payload)
+	case proto.SSHDisconnectMessage:
+		var payload proto.SSHDisconnectPayload
+		if json.Unmarshal(frame.Payload, &payload) != nil || !state.IDPattern.MatchString(payload.SSHDeviceID) {
+			return errors.New("invalid ssh.disconnect payload")
+		}
+		a.ssh.Disconnect(payload.SSHDeviceID)
+	case proto.SSHCallMessage:
+		var payload proto.SSHMCPCallPayload
+		if json.Unmarshal(frame.Payload, &payload) != nil || !state.IDPattern.MatchString(payload.CallID) ||
+			!state.IDPattern.MatchString(payload.TargetDeviceID) {
+			return errors.New("invalid ssh.mcp_call payload")
+		}
+		select {
+		case slots <- struct{}{}:
+			go func() {
+				defer func() { <-slots }()
+				res := a.ssh.ExecuteTool(ctx, payload.TargetDeviceID, proto.MCPCall{
+					CallID:    payload.CallID,
+					TaskID:    payload.TaskID,
+					Tool:      payload.Tool,
+					Arguments: payload.Arguments,
+					Approved:  payload.Approved,
+				})
+				a.enqueueSSHOutbound(proto.SSHResultMessage, proto.SSHMCPResultPayload{
+					CallID:         payload.CallID,
+					TargetDeviceID: payload.TargetDeviceID,
+					TaskID:         payload.TaskID,
+					Data:           res.Data,
+					Error:          res.Error,
+				})
+			}()
+		default:
+			a.enqueueSSHOutbound(proto.SSHResultMessage, proto.SSHMCPResultPayload{
+				CallID:         payload.CallID,
+				TargetDeviceID: payload.TargetDeviceID,
+				TaskID:         payload.TaskID,
+				Error:          string(proto.ErrBusy),
+			})
+		}
+	}
+	return nil
 }
 
 func (a *agent) sendState(ctx context.Context, conn *websocket.Conn, kind proto.MessageType, ack uint64) error {

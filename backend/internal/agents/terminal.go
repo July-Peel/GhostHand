@@ -5,10 +5,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"sync"
 	"time"
 
 	"ghosthand/backend/internal/workbench"
 	"ghosthand/proto"
+	"ghosthand/proto/sshrunner"
 )
 
 var (
@@ -25,14 +27,23 @@ type TerminalEvent struct {
 }
 
 type TerminalSession struct {
-	peer   *peer
-	id     string
-	events chan TerminalEvent
-	done   chan struct{}
-	opened bool
+	peer           *peer
+	service        *Service
+	id             string
+	targetDeviceID string
+	events         chan TerminalEvent
+	done           chan struct{}
+	opened         bool
+
+	// Direct server-side SSH terminal fields (used when peer == nil).
+	localRunner *sshrunner.Manager
+	localCmds   chan sshrunner.TerminalCommand
+	localCancel context.CancelFunc
+	localOnce   sync.Once
 }
 
-// ReserveTerminal binds the browser session to a single live connection generation.
+// ReserveTerminal binds the browser session to a live native Agent (Windows/Linux),
+// a host Agent managing a delegated SSH device, or the server's direct sshrunner.
 func (s *Service) ReserveTerminal(ctx context.Context, device string) (*TerminalSession, error) {
 	if device == workbench.FreeChatDeviceID {
 		return nil, ErrTerminalUnsupported
@@ -50,16 +61,64 @@ func (s *Service) ReserveTerminal(ctx context.Context, device string) (*Terminal
 	if err != nil {
 		return nil, err
 	}
-	if platform != proto.Windows || demo {
+	if (platform != proto.Windows && platform != proto.Linux) || demo {
 		return nil, ErrTerminalUnsupported
 	}
 	if state != proto.Online && state != proto.Unstable {
 		return nil, ErrTerminalOffline
 	}
+
+	// Check whether this Linux device is an SSH-managed node.
+	var hostAgentID sql.NullString
+	var sshEnabled bool
+	sshErr := s.store.QueryRowContext(ctx, `SELECT host_agent_id, enabled=1 FROM device_ssh_credentials WHERE device_id=?`, device).
+		Scan(&hostAgentID, &sshEnabled)
+	if sshErr == nil {
+		if !sshEnabled {
+			return nil, ErrTerminalOffline
+		}
+		if hostAgentID.Valid && hostAgentID.String != "" {
+			// Mode 2A: Delegated SSH — route terminal frames through the selected host Agent.
+			return s.reservePeerTerminal(hostAgentID.String, device, 0)
+		}
+		// Mode 2B: Direct server SSH — open PTY directly on s.sshRunner.
+		if s.sshRunner == nil {
+			return nil, ErrTerminalOffline
+		}
+		id, err := proto.NewID()
+		if err != nil {
+			return nil, err
+		}
+		s.sshLocalMu.Lock()
+		defer s.sshLocalMu.Unlock()
+		if len(s.sshLocalSess) >= proto.MaxTerminalSessions*4 {
+			return nil, ErrTerminalBusy
+		}
+		sess := &TerminalSession{
+			service:        s,
+			id:             id,
+			targetDeviceID: device,
+			events:         make(chan TerminalEvent, 32),
+			done:           make(chan struct{}),
+			localRunner:    s.sshRunner,
+			localCmds:      make(chan sshrunner.TerminalCommand, 32),
+		}
+		s.sshLocalSess[id] = sess
+		return sess, nil
+	}
+	if !errors.Is(sshErr, sql.ErrNoRows) {
+		return nil, sshErr
+	}
+
+	// Mode 1: Native Windows or Linux Agent connected directly via WebSocket.
+	return s.reservePeerTerminal(device, "", gen)
+}
+
+func (s *Service) reservePeerTerminal(peerDeviceID, targetDeviceID string, expectedGen uint64) (*TerminalSession, error) {
 	s.connectionMu.Lock()
-	p := s.connections[device]
+	p := s.connections[peerDeviceID]
 	s.connectionMu.Unlock()
-	if p == nil || p.gen != gen {
+	if p == nil || (expectedGen != 0 && p.gen != expectedGen) {
 		return nil, ErrTerminalOffline
 	}
 	if p.terminalFrames == nil {
@@ -79,7 +138,13 @@ func (s *Service) ReserveTerminal(ctx context.Context, device string) (*Terminal
 	if len(p.terminalSessions) >= proto.MaxTerminalSessions {
 		return nil, ErrTerminalBusy
 	}
-	session := &TerminalSession{peer: p, id: id, events: make(chan TerminalEvent, 32), done: make(chan struct{})}
+	session := &TerminalSession{
+		peer:           p,
+		id:             id,
+		targetDeviceID: targetDeviceID,
+		events:         make(chan TerminalEvent, 32),
+		done:           make(chan struct{}),
+	}
 	p.terminalSessions[id] = session
 	return session, nil
 }
@@ -104,20 +169,93 @@ func (s *TerminalSession) send(ctx context.Context, kind proto.MessageType, payl
 }
 
 func (s *TerminalSession) Open(ctx context.Context, shell proto.TerminalShell, cols, rows int) error {
-	err := s.send(ctx, proto.TerminalOpenMessage, proto.TerminalFrame{Shell: shell, Cols: cols, Rows: rows})
+	if s.localRunner != nil {
+		localCtx, cancel := context.WithCancel(s.service.ctx)
+		s.localCancel = cancel
+		s.opened = true
+		req := proto.TerminalFrame{
+			SessionID:      s.id,
+			TargetDeviceID: s.targetDeviceID,
+			Shell:          shell,
+			Cols:           cols,
+			Rows:           rows,
+		}
+		go func() {
+			defer s.finishLocal()
+			result := s.localRunner.OpenTerminal(localCtx, req, s.localCmds, func(text string) {
+				select {
+				case s.events <- TerminalEvent{Type: "output", Data: text}:
+				case <-s.done:
+				}
+			})
+			select {
+			case s.events <- TerminalEvent{Type: "exit", ExitCode: result.ExitCode, Error: result.Error}:
+			case <-s.done:
+			}
+		}()
+		return nil
+	}
+	err := s.send(ctx, proto.TerminalOpenMessage, proto.TerminalFrame{
+		TargetDeviceID: s.targetDeviceID,
+		Shell:          shell,
+		Cols:           cols,
+		Rows:           rows,
+	})
 	s.opened = err == nil
 	return err
 }
 
+func (s *TerminalSession) finishLocal() {
+	s.localOnce.Do(func() {
+		if s.localCancel != nil {
+			s.localCancel()
+		}
+		s.service.sshLocalMu.Lock()
+		delete(s.service.sshLocalSess, s.id)
+		s.service.sshLocalMu.Unlock()
+		close(s.done)
+	})
+}
+
 func (s *TerminalSession) Input(ctx context.Context, data string) error {
+	if s.localRunner != nil {
+		select {
+		case <-s.done:
+			return ErrTerminalOffline
+		case <-ctx.Done():
+			return ctx.Err()
+		case s.localCmds <- sshrunner.TerminalCommand{
+			Kind:  proto.TerminalInputMessage,
+			Frame: proto.TerminalFrame{SessionID: s.id, Data: data},
+		}:
+			return nil
+		}
+	}
 	return s.send(ctx, proto.TerminalInputMessage, proto.TerminalFrame{Data: data})
 }
 
 func (s *TerminalSession) Resize(ctx context.Context, cols, rows int) error {
+	if s.localRunner != nil {
+		select {
+		case <-s.done:
+			return ErrTerminalOffline
+		case <-ctx.Done():
+			return ctx.Err()
+		case s.localCmds <- sshrunner.TerminalCommand{
+			Kind:  proto.TerminalResizeMessage,
+			Frame: proto.TerminalFrame{SessionID: s.id, Cols: cols, Rows: rows},
+		}:
+			return nil
+		}
+	}
 	return s.send(ctx, proto.TerminalResizeMessage, proto.TerminalFrame{Cols: cols, Rows: rows})
 }
 
 func (s *TerminalSession) Close() {
+	if s.localRunner != nil {
+		s.finishLocal()
+		return
+	}
 	p := s.peer
 	p.terminalMu.Lock()
 	p.removeTerminal(s.id)

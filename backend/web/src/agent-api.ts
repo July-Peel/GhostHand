@@ -1,11 +1,55 @@
 import { post, request, requestError } from './api'
 
 export type Pairing = {
-  server: string; key: string; fingerprint: string; managed_by_env: boolean; qr_png: string; windows_install_command: string
+  server: string; key: string; fingerprint: string; managed_by_env: boolean; qr_png: string
+  windows_install_command: string; linux_install_command: string
 }
 export const windowsInstallerNames = ['GhostHand.Helper.exe', 'ghosthand-core.exe', 'ghosthand-launcher.exe'] as const
 export type WindowsInstallerName = typeof windowsInstallerNames[number]
 export type WindowsInstallerFile = { name: WindowsInstallerName; size: number }
+export const linuxInstallerNames = ['ghosthand-core'] as const
+export type LinuxInstallerName = typeof linuxInstallerNames[number]
+export type LinuxInstallerFile = { name: LinuxInstallerName; size: number }
+export type SSHAuthKind = 'password' | 'private_key'
+export type SSHCreateInput = {
+  name: string
+  group: string
+  host: string
+  port: number
+  username: string
+  auth_kind: SSHAuthKind
+  secret: string
+  host_agent_id: string
+}
+export type SSHCreateResult = {
+  device_id: string
+  name: string
+  conn_state: 'online' | 'unstable' | 'sleeping' | 'offline'
+  os_version: string
+  arch: string
+  last_error?: string
+}
+export type SSHConfigStatus = {
+  configured: boolean
+  host: string
+  port: number
+  username: string
+  auth_kind: SSHAuthKind
+  host_agent_id: string
+  host_agent_name?: string
+  host_key_fp?: string
+  enabled: boolean
+  last_error?: string
+}
+export type SSHUpdateInput = {
+  host: string
+  port: number
+  username: string
+  auth_kind: SSHAuthKind
+  secret: string
+  host_agent_id: string
+  enabled?: boolean
+}
 export type OperationKind = 'log.collect' | 'agent.restart' | 'helper.restart' | 'agent.update' | 'agent.rollback' | 'agent.uninstall'
 export type ConnectionHistory = {
   version: string
@@ -34,6 +78,7 @@ const devicePath = (id: string) => '/api/devices/' + encodeURIComponent(id)
 export const connectionKey = (id: string) => ['connection', id] as const
 export const browserExtensionKey = (id: string) => ['browser-extension', id] as const
 export const rdpKey = (id: string) => ['rdp', id] as const
+export const sshKey = (id: string) => ['ssh', id] as const
 
 export type BrowserExtensionStatus = {
   browser: 'chrome'
@@ -131,6 +176,41 @@ export const agentAPI = {
       xhr.send(file)
     })
   },
+  linuxInstallerFiles: (signal: AbortSignal) => request<LinuxInstallerFile[]>('/api/pairing/linux/files', { signal }),
+  uploadLinuxInstallerFile: async (name: LinuxInstallerName, file: File, csrf: string, onProgress: (percent: number) => void) => {
+    if (file.size > 256 * 1024 * 1024) throw new Error('单个二进制文件不能超过 256 MiB。')
+    const path = '/api/pairing/linux/files/' + encodeURIComponent(name)
+    return new Promise<LinuxInstallerFile>((resolve, reject) => {
+      const xhr = new XMLHttpRequest()
+      xhr.upload.onprogress = ({ loaded }) => {
+        if (file.size > 0) onProgress(Math.min(100, Math.floor(loaded / file.size * 100)))
+      }
+      xhr.upload.onload = () => onProgress(100)
+      xhr.onload = () => {
+        const body = xhr.response as (Partial<LinuxInstallerFile> & { error?: string }) | null
+        if (xhr.status >= 200 && xhr.status < 300 && body?.name === name && typeof body.size === 'number') {
+          resolve({ name, size: body.size })
+        }
+        else reject(requestError(path, xhr.status, body))
+      }
+      xhr.onerror = () => reject(requestError(path, xhr.status, null))
+      xhr.open('POST', path)
+      xhr.responseType = 'json'
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream')
+      xhr.setRequestHeader('X-CSRF-Token', csrf)
+      xhr.send(file)
+    })
+  },
+  createSSH: (input: SSHCreateInput, csrf: string) =>
+    request<SSHCreateResult>('/api/agents/ssh', post(input, csrf)),
+  sshStatus: (id: string, signal: AbortSignal) =>
+    request<SSHConfigStatus>(devicePath(id) + '/ssh', { signal }),
+  updateSSH: (id: string, input: SSHUpdateInput, csrf: string) =>
+    request<SSHConfigStatus>(devicePath(id) + '/ssh/config', post(input, csrf)),
+  reconnectSSH: (id: string, csrf: string) =>
+    request<void>(devicePath(id) + '/ssh/reconnect', post({}, csrf)),
+  disconnectSSH: (id: string, csrf: string) =>
+    request<void>(devicePath(id) + '/ssh/disconnect', post({}, csrf)),
   history: (id: string, signal: AbortSignal) =>
     request<ConnectionHistory>(devicePath(id) + '/connection', { signal }),
   browserExtension: (id: string, signal: AbortSignal) =>

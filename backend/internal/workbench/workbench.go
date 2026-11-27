@@ -53,6 +53,8 @@ type Device struct {
 	TaskProtocol bool            `json:"task_protocol"`
 	Demo         bool            `json:"is_demo"`
 	AutoApprove  bool            `json:"auto_approve"`
+	SSHManaged   bool            `json:"ssh_managed,omitempty"`
+	Revoked      bool            `json:"revoked,omitempty"`
 }
 
 type Message struct {
@@ -140,8 +142,14 @@ func commandFor(capability proto.CapabilityID) Command {
 	return Command{Title: string(capability), Step: "读取设备信息"}
 }
 
+type SSHExecutor interface {
+	IsSSHDevice(ctx context.Context, deviceID string) bool
+	ExecuteSSHTool(ctx context.Context, deviceID string, call proto.MCPCall) (proto.MCPResult, error)
+}
+
 type Service struct {
 	desktopUnlocker DesktopUnlocker
+	sshExecutor     SSHExecutor
 	store           *db.Store
 	demo            bool
 	fileDir         string
@@ -152,6 +160,10 @@ type Service struct {
 	mcpWindowMu     sync.Mutex
 	mcpWindows      map[string]mcpWindow
 	refreshSeq      atomic.Int64
+}
+
+func (s *Service) SetSSHExecutor(executor SSHExecutor) {
+	s.sshExecutor = executor
 }
 
 func New(store *db.Store, config *settings.Service, dataDir string, demo bool) (*Service, error) {
@@ -169,7 +181,8 @@ const deviceFields = `
 	d.id, d.name, d.platform, d.arch, d.os_version, d.group_name, d.conn_state, d.helper_state,
 	d.desktop_state, CASE WHEN EXISTS (SELECT 1 FROM tasks t WHERE t.device_id=d.id AND t.state='waiting_user')
 	THEN 'waiting_user' WHEN EXISTS (SELECT 1 FROM tasks t WHERE t.device_id=d.id AND t.state IN ('running','paused','cancelling'))
-	THEN 'running' ELSE 'idle' END, d.battery_pct, d.charging, d.last_seen_at, d.task_protocol>=1, d.is_demo, d.auto_approve=1
+	THEN 'running' ELSE 'idle' END, d.battery_pct, d.charging, d.last_seen_at, d.task_protocol>=1, d.is_demo, d.auto_approve=1,
+	EXISTS (SELECT 1 FROM device_ssh_credentials s WHERE s.device_id=d.id)
 `
 
 type scanner interface {
@@ -184,7 +197,7 @@ func scanDevice(row scanner) (Device, error) {
 
 func scanDeviceFields(row scanner, d *Device, extra ...any) error {
 	fields := []any{&d.ID, &d.Name, &d.Platform, &d.Arch, &d.OSVersion, &d.Group, &d.ConnState,
-		&d.HelperState, &d.DesktopState, &d.TaskState, &d.BatteryPct, &d.Charging, &d.LastSeenAt, &d.TaskProtocol, &d.Demo, &d.AutoApprove}
+		&d.HelperState, &d.DesktopState, &d.TaskState, &d.BatteryPct, &d.Charging, &d.LastSeenAt, &d.TaskProtocol, &d.Demo, &d.AutoApprove, &d.SSHManaged}
 	return row.Scan(append(fields, extra...)...)
 }
 
@@ -209,11 +222,7 @@ func (s *Service) SetAutoApprove(ctx context.Context, userID int64, deviceID str
 		}
 		now := time.Now().UnixMilli()
 		if enabled {
-			if _, err := tx.ExecContext(ctx, `UPDATE confirmations SET decision='approved', decided_at=?
-				WHERE decision='pending' AND task_id IN (SELECT id FROM tasks WHERE device_id=? AND state IN ('waiting_user','paused'))`, now, deviceID); err != nil {
-				return err
-			}
-			if _, err := tx.ExecContext(ctx, `UPDATE tasks SET state='running' WHERE device_id=? AND state='waiting_user'`, deviceID); err != nil {
+			if err := approveTargetConfirmations(ctx, tx, deviceID, now); err != nil {
 				return err
 			}
 		}
@@ -226,7 +235,8 @@ func (s *Service) SetAutoApprove(ctx context.Context, userID int64, deviceID str
 }
 
 func (s *Service) Devices(ctx context.Context) ([]Device, error) {
-	rows, err := s.store.QueryContext(ctx, `SELECT `+deviceFields+`
+	rows, err := s.store.QueryContext(ctx, `SELECT `+deviceFields+`,
+		EXISTS(SELECT 1 FROM device_credentials c WHERE c.device_id=d.id AND c.revoked_at IS NOT NULL)
 		FROM devices d WHERE (d.is_demo=0 OR ?) AND d.id<>?
 		ORDER BY CASE d.conn_state WHEN 'online' THEN 0 WHEN 'unstable' THEN 1 WHEN 'sleeping' THEN 2 ELSE 3 END,
 		         d.group_name, d.name, d.id
@@ -237,8 +247,8 @@ func (s *Service) Devices(ctx context.Context) ([]Device, error) {
 	defer rows.Close()
 	devices := make([]Device, 0)
 	for rows.Next() {
-		device, err := scanDevice(rows)
-		if err != nil {
+		var device Device
+		if err := scanDeviceFields(rows, &device, &device.Revoked); err != nil {
 			return nil, err
 		}
 		devices = append(devices, device)
@@ -522,8 +532,10 @@ func (s *Service) ClearMessages(ctx context.Context, userID int64, deviceID stri
 		if err := rows.Err(); err != nil {
 			return err
 		}
+		var isSSH bool
+		_ = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM device_ssh_credentials WHERE device_id=?)", deviceID).Scan(&isSSH)
 		for _, item := range active {
-			if item.assigned {
+			if item.assigned && !isSSH {
 				if err := enqueueTaskCancel(ctx, tx, deviceID, item.id, item.force, true); err != nil {
 					return err
 				}
