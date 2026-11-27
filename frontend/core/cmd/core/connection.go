@@ -115,8 +115,9 @@ func (a *agent) session(ctx context.Context) error {
 	platform := proto.Platform(runtime.GOOS)
 	hello := proto.HelloPayload{
 		DeviceID: cfg.DeviceID, Token: cfg.Token, Platform: platform, AgentVersion: version,
-		DesktopOperations: platform == proto.Windows,
-		LastAck:           lastAck, Fresh: fresh, CapsHash: proto.TaskCapabilitiesHash(platform), RunningTasks: running, State: snapshot,
+		DesktopOperations:  platform == proto.Windows,
+		TerminalOperations: platform == proto.Windows,
+		LastAck:            lastAck, Fresh: fresh, CapsHash: proto.TaskCapabilitiesHash(platform), RunningTasks: running, State: snapshot,
 		TaskInventory: true, PendingTaskResults: pendingResults,
 	}
 	if a.canUninstall {
@@ -189,12 +190,38 @@ type readResult struct {
 
 func (a *agent) exchange(ctx context.Context, conn *websocket.Conn, interval time.Duration, inbound, sent uint64, taskHeartbeat bool) error {
 	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	terminals := newTerminalManager(ctx)
+	terminalWriterDone := make(chan struct{})
+	go func() {
+		defer close(terminalWriterDone)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case event := <-terminals.events:
+				if write(ctx, conn, event.kind, event.frame, 0) != nil {
+					_ = conn.CloseNow()
+					return
+				}
+			}
+		}
+	}()
+	defer func() {
+		cancel()
+		terminals.closeAll()
+		<-terminalWriterDone
+	}()
 	received := make(chan readResult, 1)
 	go func() {
 		for {
 			var frame proto.Envelope
 			err := wsjson.Read(ctx, conn, &frame)
+			if err == nil && frame.Seq == 0 && isTerminalCommand(frame.Type) {
+				err = terminals.receive(frame)
+				if err == nil {
+					continue
+				}
+			}
 			select {
 			case received <- readResult{frame, err}:
 			case <-ctx.Done():

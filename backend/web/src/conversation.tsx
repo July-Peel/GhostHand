@@ -11,6 +11,8 @@ import { RDPSection } from './rdp-ui'
 import { MarkdownContent } from './markdown'
 import { acceptedChatImages, maxChatImages, prepareChatImage } from './chat-images'
 import type { PendingImage } from './chat-images'
+import { TerminalModal, terminalShellNames } from './terminal-modal'
+import type { TerminalShell } from './terminal-modal'
 
 const timeFormat = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
 const stateText: Record<TaskCard['state'], string> = {
@@ -40,7 +42,10 @@ export function Conversation({ device, commands, session, opened, back }: {
   back: () => void
 }) {
   const isFreeChat = device.id === FREE_CHAT_ID
+  const isWindowsDevice = !isFreeChat && !device.is_demo && device.platform === 'windows'
+  const terminalOnline = device.conn_state === 'online' || device.conn_state === 'unstable'
   const chatBusy = isFreeChat && device.task_state !== 'idle'
+  const [activeTerminal, setActiveTerminal] = useState<TerminalShell | null>(null)
   const [details, setDetails] = useState(false)
   const [confirmClear, setConfirmClear] = useState(false)
   const [draft, setDraft] = useState('')
@@ -251,7 +256,20 @@ export function Conversation({ device, commands, session, opened, back }: {
         </div>
         <div className="chat-header-actions">
           {device.task_state === 'running' && <span className="active-task"><LoaderCircle size={14} className="spin" /> {isFreeChat ? '思考中' : '执行中'}</span>}
-          {!isFreeChat && !device.is_demo && device.platform === 'windows' && (
+          {isWindowsDevice && (['cmd', 'powershell'] as const).map(shell => (
+            <button
+              key={shell}
+              type="button"
+              className="terminal-launch-button"
+              disabled={!terminalOnline}
+              title={terminalOnline ? `打开远程 ${terminalShellNames[shell]} 终端` : `设备离线，无法打开 ${terminalShellNames[shell]} 终端`}
+              onClick={() => setActiveTerminal(shell)}
+            >
+              <Terminal size={13} aria-hidden="true" />
+              <span>{terminalShellNames[shell]}</span>
+            </button>
+          ))}
+          {isWindowsDevice && (
             <button
               type="button"
               className={'policy-toggle' + (device.auto_approve ? ' is-auto' : '')}
@@ -420,6 +438,12 @@ export function Conversation({ device, commands, session, opened, back }: {
         {!device.is_demo && device.platform === 'windows' && <RDPSection device={device} session={session} />}
         {!device.is_demo && <DeviceOperations device={device} session={session} />}
       </Details>}
+      {activeTerminal && <TerminalModal
+        deviceID={device.id}
+        deviceName={device.name}
+        shell={activeTerminal}
+        onClose={() => setActiveTerminal(null)}
+      />}
     </>
   )
 }

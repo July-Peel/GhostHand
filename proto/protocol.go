@@ -135,6 +135,7 @@ type HelloPayload struct {
 	RunningTasks       []RunningTask `json:"running_tasks"`
 	TaskInventory      bool          `json:"task_inventory,omitempty"`
 	DesktopOperations  bool          `json:"desktop_operations,omitempty"`
+	TerminalOperations bool          `json:"terminal_operations,omitempty"`
 	PendingTaskResults []string      `json:"pending_task_results,omitempty"`
 	State              DeviceState   `json:"state"`
 }

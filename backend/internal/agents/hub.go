@@ -27,6 +27,10 @@ type peer struct {
 	desktopDone          chan struct{}
 	desktopPending       sync.Map
 	desktopPolicyChanged chan struct{}
+	terminalFrames       chan proto.Envelope
+	terminalDone         chan struct{}
+	terminalMu           sync.Mutex
+	terminalSessions     map[string]*TerminalSession
 	conn                 *websocket.Conn
 	id                   string
 	gen                  uint64
@@ -111,6 +115,11 @@ func (s *Service) attach(ctx context.Context, conn *websocket.Conn, hello proto.
 	p := &peer{conn: conn, id: hello.DeviceID, interval: time.Duration(interval) * time.Second, secureTransport: secure,
 		desktopOperations: hello.DesktopOperations && hello.Platform == proto.Windows,
 		desktopRequests:   make(chan desktopRequest), desktopDone: make(chan struct{}), desktopPolicyChanged: make(chan struct{}, 1)}
+	if hello.TerminalOperations && hello.Platform == proto.Windows {
+		p.terminalFrames = make(chan proto.Envelope, 32)
+		p.terminalDone = make(chan struct{})
+		p.terminalSessions = make(map[string]*TerminalSession)
+	}
 	welcome := proto.WelcomePayload{HeartbeatSec: interval, ServerTime: now.UnixMilli(), TaskHeartbeat: hello.TaskInventory}
 	err := s.store.Write(ctx, func(tx *sql.Tx) error {
 		c, hash, err := authenticate(ctx, tx, p.id, hello.Token)
@@ -268,11 +277,20 @@ type frameRead struct {
 func (s *Service) servePeer(ctx context.Context, p *peer, sent uint64) string {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	if p.terminalFrames != nil {
+		go p.sendTerminals(ctx)
+	}
 	in := make(chan frameRead, 1)
 	go func() {
 		for {
 			var frame proto.Envelope
 			err := wsjson.Read(ctx, p.conn, &frame)
+			if err == nil && frame.Seq == 0 && (frame.Type == proto.TerminalOutputMessage || frame.Type == proto.TerminalExitMessage) {
+				err = p.deliverTerminal(frame)
+				if err == nil {
+					continue
+				}
+			}
 			select {
 			case in <- frameRead{frame, err}:
 			case <-ctx.Done():
@@ -547,6 +565,7 @@ func (s *Service) markState(p *peer, state proto.ConnState) {
 
 func (s *Service) detach(p *peer, reason string) {
 	_ = p.conn.CloseNow()
+	p.detachTerminals()
 	s.connectionMu.Lock()
 	if s.connections[p.id] == p {
 		delete(s.connections, p.id)

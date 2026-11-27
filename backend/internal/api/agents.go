@@ -24,6 +24,7 @@ func (s *Server) agentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/agent/pair", s.redeemPairing)
 	mux.HandleFunc("GET "+proto.AgentSocketPath, s.agents.Connect)
 	mux.HandleFunc("GET /api/devices/{device}/connection", s.require(s.connectionHistory))
+	mux.HandleFunc("GET /api/devices/{device}/terminal/ws", s.require(s.terminalSocket))
 	mux.HandleFunc("POST /api/devices/{device}/rename", s.require(s.renameDevice))
 	mux.HandleFunc("GET /api/devices/{device}/browser-extension", s.require(s.getBrowserExtension))
 	mux.HandleFunc("POST /api/devices/{device}/browser-extension", s.require(s.changeBrowserExtension))
