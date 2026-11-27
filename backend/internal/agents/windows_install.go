@@ -1,8 +1,10 @@
 package agents
 
 import (
+	"context"
 	"crypto/sha256"
 	"debug/pe"
+	_ "embed"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -10,9 +12,28 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 )
 
 const MaxWindowsInstallerFileSize = 256 << 20
+
+//go:embed FreeRDP.zip
+var freeRDPBundle []byte
+
+var freeRDPSHA256 = sync.OnceValue(func() string {
+	sum := sha256.Sum256(freeRDPBundle)
+	return hex.EncodeToString(sum[:])
+})
+
+func (s *Service) FreeRDPBundle(ctx context.Context, device, token string) ([]byte, string, error) {
+	if _, _, err := authenticate(ctx, s.store, device, token); err != nil {
+		return nil, "", err
+	}
+	if len(freeRDPBundle) == 0 {
+		return nil, "", ErrMissing
+	}
+	return freeRDPBundle, freeRDPSHA256(), nil
+}
 
 var windowsInstallerNames = []string{"GhostHand.Helper.exe", "ghosthand-core.exe", "ghosthand-launcher.exe"}
 

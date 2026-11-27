@@ -76,14 +76,18 @@ export class ApiError extends Error {
   }
 }
 
+export function requestError(path: string, status: number, body: { error?: string } | null): ApiError {
+  if (status === 401 && path !== '/api/login' && path !== '/api/session') {
+    window.dispatchEvent(new Event('ghosthand:unauthorized'))
+  }
+  return new ApiError(status, body?.error ?? '无法完成请求，请稍后重试。')
+}
+
 export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init)
   if (!response.ok) {
-    if (response.status === 401 && path !== '/api/login' && path !== '/api/session') {
-      window.dispatchEvent(new Event('ghosthand:unauthorized'))
-    }
     const body = await response.json().catch(() => null) as { error?: string } | null
-    throw new ApiError(response.status, body?.error ?? '无法完成请求，请稍后重试。')
+    throw requestError(path, response.status, body)
   }
   if (response.status === 204) return undefined as T
   return await response.json() as T

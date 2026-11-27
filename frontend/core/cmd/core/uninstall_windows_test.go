@@ -65,3 +65,27 @@ func TestBrowserPreferencesContain(t *testing.T) {
 		t.Fatalf("removed unpacked extension path should not be installed: installed=%v err=%v", installed, err)
 	}
 }
+
+func TestExtractFreeRDPArchive(t *testing.T) {
+	bundlePath := filepath.Clean(`..\..\..\..\backend\internal\agents\FreeRDP.zip`)
+	file, err := os.Open(bundlePath)
+	if err != nil {
+		t.Fatalf("open embedded FreeRDP.zip: %v", err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage := t.TempDir()
+	if err := extractFreeRDPArchive(file, info.Size(), stage); err != nil {
+		t.Fatalf("extractFreeRDPArchive: %v", err)
+	}
+	client := filepath.Join(stage, "wfreerdp.exe")
+	if stat, err := os.Stat(client); err != nil || !stat.Mode().IsRegular() {
+		t.Fatalf("expected extracted wfreerdp.exe: stat=%v err=%v", stat, err)
+	}
+	if !isSDLFreeRDP(client) {
+		t.Fatal("expected bundled wfreerdp.exe to be detected as SDL FreeRDP")
+	}
+}

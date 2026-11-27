@@ -288,8 +288,10 @@ func (m *UnlockManager) operate(ctx context.Context, user int64, device string, 
 		return proto.DesktopResult{}, err
 	}
 	ttl := 45 * time.Second
-	if kind == proto.RDPLock || kind == proto.RDPPreflight {
+	if kind == proto.RDPLock {
 		ttl = 15 * time.Second
+	} else if kind == proto.RDPPreflight {
+		ttl = 30 * time.Second
 	}
 	op := &rdpOperation{id: id, kind: kind, revision: status.revision, generation: p.gen,
 		expires: time.Now().Add(ttl), done: make(chan struct{}), manual: source == "manual", tasks: make(map[string]struct{})}

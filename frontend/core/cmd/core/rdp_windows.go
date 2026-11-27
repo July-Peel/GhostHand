@@ -36,6 +36,7 @@ func (a *agent) rdpOperation(ctx context.Context, result proto.DesktopResult, re
 	defer a.rdpMu.Unlock()
 	switch result.Kind {
 	case proto.RDPPreflight:
+		a.ensureFreeRDPClient(ctx)
 		detail, _, _, code := rdpPreflight(ctx, request.Port, true)
 		result.Code = code
 		result.Detail, _ = json.Marshal(detail)
@@ -229,6 +230,7 @@ func (a *agent) unlockConsole(ctx context.Context, req proto.DesktopRequest, pro
 		detail.SessionID, detail.AlreadyUnlocked = console.ID, true
 		return detail, ""
 	}
+	a.ensureFreeRDPClient(ctx)
 	preflight, client, fingerprint, code := rdpPreflight(ctx, req.Port, false)
 	if code != "" {
 		return detail, code

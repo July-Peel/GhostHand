@@ -156,7 +156,7 @@ func TestDeviceManagementWithOnlineNode(t *testing.T) {
 	}
 	request("POST", "/rdp/config", `{"username":"worker","password":"fixture-rdp-password"}`, true, true, http.StatusNoContent)
 	body := request("GET", "/rdp", "", true, false, http.StatusOK)
-	if !strings.Contains(body, `"configured":true`) || strings.Contains(body, "password") {
+	if !strings.Contains(body, `"configured":true`) || strings.Contains(body, `"password"`) || strings.Contains(body, "fixture-rdp-password") {
 		t.Fatal("credential status missing or exposes password")
 	}
 }

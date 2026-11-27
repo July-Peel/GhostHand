@@ -2,14 +2,14 @@ import { useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Command } from 'cmdk'
-import { ChevronRight, LoaderCircle, LogOut, Monitor, Package, Plus, Search, Settings } from 'lucide-react'
+import { ChevronRight, LoaderCircle, LogOut, Monitor, Plus, Search, Settings } from 'lucide-react'
 import { create } from 'zustand'
 import { api, devicesKey, errorText, messagesKey, sessionKey } from './api'
 import type { Device, Session } from './api'
 import { Conversation } from './conversation'
 import { Battery, Connection, DeviceIcon, Panel } from './device-ui'
 import { SettingsPanel } from './settings'
-import { PairingPanel, ReleasesPanel } from './agent-ui'
+import { PairingPanel } from './agent-ui'
 import { connectionKey, rdpKey } from './agent-api'
 
 const useWorkspace = create<{
@@ -96,7 +96,7 @@ export function Workspace({ session, brand, themeButton, onPasswordChanged }: {
   const [filter, setFilter] = useState('')
   const [palette, setPalette] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
-  const [agentPanel, setAgentPanel] = useState<'pairing' | 'releases' | null>(null)
+  const [pairingOpen, setPairingOpen] = useState(false)
   const selected = useWorkspace(state => state.selected)
   const select = useWorkspace(state => state.select)
   const query = useQuery({ queryKey: devicesKey, queryFn: ({ signal }) => api.devices(signal) })
@@ -127,14 +127,14 @@ export function Workspace({ session, brand, themeButton, onPasswordChanged }: {
   useEffect(() => {
     function openPalette(event: KeyboardEvent) {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
-        if (settingsOpen || agentPanel) return
+        if (settingsOpen || pairingOpen) return
         event.preventDefault()
         setPalette(value => !value)
       }
     }
     window.addEventListener('keydown', openPalette)
     return () => window.removeEventListener('keydown', openPalette)
-  }, [settingsOpen, agentPanel])
+  }, [settingsOpen, pairingOpen])
 
   return (
     <div className="workspace">
@@ -143,9 +143,7 @@ export function Workspace({ session, brand, themeButton, onPasswordChanged }: {
         <div className="topbar-actions">
           {themeButton}
           <button type="button" className="icon-button" aria-label="接入设备" title="接入设备"
-            onClick={() => setAgentPanel('pairing')}><Plus size={18} /></button>
-          <button type="button" className="icon-button" aria-label="版本管理" title="版本管理"
-            onClick={() => setAgentPanel('releases')}><Package size={17} /></button>
+            onClick={() => setPairingOpen(true)}><Plus size={18} /></button>
           <button
             type="button" className="icon-button" aria-label="系统设置" title="系统设置"
             onClick={() => setSettingsOpen(true)}
@@ -204,8 +202,7 @@ export function Workspace({ session, brand, themeButton, onPasswordChanged }: {
           )}
         </main>
       </div>
-      {agentPanel === 'pairing' && <PairingPanel session={session} close={() => setAgentPanel(null)} />}
-      {agentPanel === 'releases' && <ReleasesPanel session={session} devices={devices} close={() => setAgentPanel(null)} />}
+      {pairingOpen && <PairingPanel session={session} close={() => setPairingOpen(false)} />}
       {settingsOpen && (
         <SettingsPanel session={session} close={() => setSettingsOpen(false)} onPasswordChanged={onPasswordChanged} />
       )}

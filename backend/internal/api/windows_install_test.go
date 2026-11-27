@@ -15,6 +15,7 @@ import (
 	"ghosthand/backend/internal/agents"
 	"ghosthand/backend/internal/auth"
 	"ghosthand/backend/internal/db"
+	"ghosthand/proto"
 )
 
 func TestWindowsInstaller(t *testing.T) {
@@ -106,4 +107,29 @@ func TestWindowsInstaller(t *testing.T) {
 	}
 	request("POST", "/api/pairing/rotate", nil, "admin", http.StatusOK)
 	request("GET", downloadPath, nil, firstKey, http.StatusUnauthorized)
+
+	request("GET", "/api/agent/components/freerdp", nil, "", http.StatusUnauthorized)
+	token, err := proto.NewToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	enrolled, err := fleet.Enroll(ctx, proto.Enrollment{
+		Key: fleet.NodeKey(), MachineID: "machine-freerdp-test-0001", Token: token,
+		Name: "WinNode", Platform: proto.Windows, Arch: "amd64", OSVersion: "Windows 10.0.19045",
+	}, "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	freerdpReq := httptest.NewRequestWithContext(ctx, http.MethodGet, origin+"/api/agent/components/freerdp", nil)
+	freerdpReq.Header.Set("Authorization", "Bearer "+token)
+	freerdpReq.Header.Set("X-GhostHand-Device", enrolled.DeviceID)
+	freerdpResp := httptest.NewRecorder()
+	handler.ServeHTTP(freerdpResp, freerdpReq)
+	if freerdpResp.Code != http.StatusOK {
+		t.Fatalf("GET /api/agent/components/freerdp got %d: %s", freerdpResp.Code, freerdpResp.Body)
+	}
+	wantHash := fmt.Sprintf("%x", sha256.Sum256(freerdpResp.Body.Bytes()))
+	if gotHash := freerdpResp.Header().Get("X-GhostHand-SHA256"); gotHash != wantHash || freerdpResp.Body.Len() == 0 {
+		t.Fatalf("FreeRDP bundle hash header=%q want=%q len=%d", gotHash, wantHash, freerdpResp.Body.Len())
+	}
 }

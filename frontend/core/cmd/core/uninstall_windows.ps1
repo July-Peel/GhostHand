@@ -66,10 +66,11 @@ Invoke-CleanupWithRetry {
 }
 
 $versions = if ($dataRoot) { [IO.Path]::Combine($dataRoot, 'versions') } else { $null }
-foreach ($process in (Get-Process -Name 'ghosthand-launcher', 'ghosthand-core', 'GhostHand.Helper' -ErrorAction SilentlyContinue)) {
+$freerdpDir = [IO.Path]::Combine($bootstrap, 'FreeRDP')
+foreach ($process in (Get-Process -Name 'ghosthand-launcher', 'ghosthand-core', 'GhostHand.Helper', 'wfreerdp' -ErrorAction SilentlyContinue)) {
     if (-not $process.Path) { continue }
     $directory = [IO.Path]::GetDirectoryName($process.Path)
-    if ($directory -eq $bootstrap -or
+    if ($directory -eq $bootstrap -or $directory -eq $freerdpDir -or
         ($versions -and [IO.Path]::GetDirectoryName($directory) -eq $versions -and [IO.Path]::GetFileName($directory) -match '^[0-7][0-9A-HJKMNP-TV-Z]{25}$')) {
         Stop-Process -InputObject $process -Force -ErrorAction SilentlyContinue
     }
@@ -94,6 +95,9 @@ try {
             Assert-OrdinaryPath $bootstrap
             foreach ($name in 'ghosthand-launcher.exe', 'ghosthand-core.exe', 'GhostHand.Helper.exe') {
                 [IO.File]::Delete([IO.Path]::Combine($bootstrap, $name))
+            }
+            if ([IO.Directory]::Exists($freerdpDir)) {
+                Remove-ProductTree $freerdpDir
             }
             if (-not [IO.Directory]::GetFileSystemEntries($bootstrap).Length) {
                 [IO.Directory]::Delete($bootstrap)

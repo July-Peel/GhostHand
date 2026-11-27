@@ -1,13 +1,19 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"debug/pe"
 	_ "embed"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
+	"io/fs"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -21,6 +27,12 @@ import (
 	"golang.org/x/sys/windows"
 
 	"ghosthand/proto"
+)
+
+const (
+	maxFreeRDPArchiveSize   = 64 << 20
+	maxFreeRDPExtractedSize = 128 << 20
+	maxFreeRDPArchiveFiles  = 32
 )
 
 //go:embed rdp_preflight_windows.ps1
@@ -61,16 +73,236 @@ func rdpNetworkPolicy(ctx context.Context, port int, probeFirewall bool) rdpNetw
 	return result
 }
 
+func freeRDPDirs() []string {
+	var dirs []string
+	if dir, err := windows.KnownFolderPath(windows.FOLDERID_ProgramFiles, 0); err == nil && dir != "" {
+		dirs = append(dirs, filepath.Join(dir, "GhostHand", "FreeRDP"))
+	}
+	if exe, err := os.Executable(); err == nil && exe != "" {
+		alt := filepath.Join(filepath.Dir(exe), "FreeRDP")
+		if len(dirs) == 0 || !strings.EqualFold(dirs[0], alt) {
+			dirs = append(dirs, alt)
+		}
+	}
+	return dirs
+}
+
 func freeRDPClient() string {
-	dir, err := windows.KnownFolderPath(windows.FOLDERID_ProgramFiles, 0)
+	for _, dir := range freeRDPDirs() {
+		client := filepath.Join(dir, "wfreerdp.exe")
+		if info, err := os.Lstat(client); err == nil && info.Mode().IsRegular() && ordinaryFreeRDPPath(dir) && ordinaryFreeRDPPath(client) {
+			return client
+		}
+	}
+	return ""
+}
+
+func ordinaryFreeRDPPath(path string) bool {
+	p, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return false
+	}
+	attr, err := windows.GetFileAttributes(p)
+	return err == nil && attr&windows.FILE_ATTRIBUTE_REPARSE_POINT == 0
+}
+
+func freeRDPInstallRoot(corePath string) (string, error) {
+	var candidates []string
+	if dir, err := windows.KnownFolderPath(windows.FOLDERID_ProgramFiles, 0); err == nil && dir != "" {
+		if ordinaryFreeRDPPath(dir) {
+			candidates = append(candidates, filepath.Join(dir, "GhostHand"))
+		}
+	}
+	if corePath != "" {
+		alt := filepath.Dir(corePath)
+		if len(candidates) == 0 || !strings.EqualFold(candidates[0], alt) {
+			candidates = append(candidates, alt)
+		}
+	}
+	for _, root := range candidates {
+		if err := os.MkdirAll(root, 0755); err != nil {
+			continue
+		}
+		if ordinaryFreeRDPPath(root) {
+			return root, nil
+		}
+	}
+	return "", errors.New("no writable GhostHand installation directory for FreeRDP")
+}
+
+func (a *agent) ensureFreeRDPClient(ctx context.Context) string {
+	if client := freeRDPClient(); client != "" {
+		return client
+	}
+	cfg := a.cfg.Load()
+	if cfg == nil || cfg.Server == "" || cfg.DeviceID == "" || cfg.Token == "" {
+		return ""
+	}
+	root, err := freeRDPInstallRoot(a.corePath)
+	if err != nil {
+		slog.Warn("prepare FreeRDP directory failed", "error", err)
+		return ""
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, cfg.Server+"/api/agent/components/freerdp", nil)
 	if err != nil {
 		return ""
 	}
-	client := filepath.Join(dir, "GhostHand", "FreeRDP", "wfreerdp.exe")
-	if info, err := os.Lstat(client); err == nil && info.Mode().IsRegular() {
-		return client
+	authorized(req, *cfg)
+	resp, err := a.client.Do(req)
+	if err != nil {
+		slog.Warn("download FreeRDP archive failed", "error", err)
+		return ""
 	}
-	return ""
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		slog.Warn("controller returned non-OK for FreeRDP archive", "status", resp.StatusCode)
+		return ""
+	}
+	expectedHash := strings.ToLower(strings.TrimSpace(resp.Header.Get("X-GhostHand-SHA256")))
+	if raw, err := hex.DecodeString(expectedHash); err != nil || len(raw) != sha256.Size {
+		slog.Warn("missing or invalid FreeRDP archive checksum header")
+		return ""
+	}
+	archiveFile, err := os.CreateTemp(root, ".freerdp-download-*.zip")
+	if err != nil {
+		slog.Warn("create FreeRDP temporary archive failed", "error", err)
+		return ""
+	}
+	archivePath := archiveFile.Name()
+	defer os.Remove(archivePath)
+	defer archiveFile.Close()
+
+	hash := sha256.New()
+	size, err := io.Copy(io.MultiWriter(archiveFile, hash), io.LimitReader(resp.Body, maxFreeRDPArchiveSize+1))
+	if err != nil || size == 0 || size > maxFreeRDPArchiveSize {
+		slog.Warn("read FreeRDP archive failed", "size", size, "error", err)
+		return ""
+	}
+	if actualHash := hex.EncodeToString(hash.Sum(nil)); actualHash != expectedHash {
+		slog.Warn("FreeRDP archive checksum mismatch", "expected", expectedHash, "actual", actualHash)
+		return ""
+	}
+	stageDir, err := os.MkdirTemp(root, ".freerdp-stage-*")
+	if err != nil {
+		slog.Warn("create FreeRDP staging directory failed", "error", err)
+		return ""
+	}
+	defer os.RemoveAll(stageDir)
+	if err := extractFreeRDPArchive(archiveFile, size, stageDir); err != nil {
+		slog.Warn("extract FreeRDP archive failed", "error", err)
+		return ""
+	}
+	_ = archiveFile.Close()
+	targetDir := filepath.Join(root, "FreeRDP")
+	if _, err := os.Lstat(targetDir); err == nil {
+		if !ordinaryFreeRDPPath(targetDir) {
+			slog.Warn("refusing to replace non-ordinary FreeRDP directory", "path", targetDir)
+			return ""
+		}
+		if err := os.RemoveAll(targetDir); err != nil {
+			slog.Warn("remove existing FreeRDP directory failed", "error", err)
+			return ""
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return ""
+	}
+	if err := os.Rename(stageDir, targetDir); err != nil {
+		slog.Warn("activate FreeRDP directory failed", "error", err)
+		return ""
+	}
+	client := freeRDPClient()
+	if client != "" {
+		slog.Info("FreeRDP client automatically deployed", "path", client)
+	}
+	return client
+}
+
+func extractFreeRDPArchive(archiveFile *os.File, size int64, stageDir string) error {
+	reader, err := zip.NewReader(archiveFile, size)
+	if err != nil {
+		return err
+	}
+	if len(reader.File) == 0 || len(reader.File) > maxFreeRDPArchiveFiles {
+		return errors.New("unexpected number of files in FreeRDP archive")
+	}
+	var totalBytes int64
+	var hasClient bool
+	for _, entry := range reader.File {
+		rel := filepath.Clean(filepath.FromSlash(entry.Name))
+		if rel == "." || !filepath.IsLocal(rel) {
+			return errors.New("invalid path in FreeRDP archive")
+		}
+		if entry.FileInfo().IsDir() {
+			if err := os.MkdirAll(filepath.Join(stageDir, rel), 0755); err != nil {
+				return err
+			}
+			continue
+		}
+		if !entry.Mode().IsRegular() || entry.UncompressedSize64 > maxFreeRDPExtractedSize {
+			return errors.New("invalid entry in FreeRDP archive")
+		}
+		if strings.EqualFold(rel, "wfreerdp.exe") {
+			rel = "wfreerdp.exe"
+		}
+		dest := filepath.Join(stageDir, rel)
+		if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
+			return err
+		}
+		src, err := entry.Open()
+		if err != nil {
+			return err
+		}
+		out, err := os.OpenFile(dest, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0755)
+		if err != nil {
+			src.Close()
+			return err
+		}
+		remaining := maxFreeRDPExtractedSize - totalBytes
+		written, copyErr := io.Copy(out, io.LimitReader(src, remaining+1))
+		src.Close()
+		totalBytes += written
+		if copyErr != nil || totalBytes > maxFreeRDPExtractedSize {
+			out.Close()
+			return errors.New("FreeRDP archive extraction exceeded size limit")
+		}
+		if rel == "wfreerdp.exe" {
+			if !isFreeRDPAMD64Executable(out) {
+				out.Close()
+				return errors.New("wfreerdp.exe is not a valid Windows x64 executable")
+			}
+			hasClient = true
+		}
+		if err := errors.Join(out.Sync(), out.Close()); err != nil {
+			return err
+		}
+	}
+	if !hasClient {
+		return errors.New("FreeRDP archive does not contain wfreerdp.exe")
+	}
+	return nil
+}
+
+func isFreeRDPAMD64Executable(file io.ReaderAt) bool {
+	var dos [64]byte
+	if _, err := file.ReadAt(dos[:], 0); err != nil || string(dos[:2]) != "MZ" {
+		return false
+	}
+	offset := int64(binary.LittleEndian.Uint32(dos[60:]))
+	var header [26]byte
+	if _, err := file.ReadAt(header[:], offset); err != nil || string(header[:4]) != "PE\x00\x00" {
+		return false
+	}
+	flags := binary.LittleEndian.Uint16(header[22:24])
+	return binary.LittleEndian.Uint16(header[4:6]) == pe.IMAGE_FILE_MACHINE_AMD64 &&
+		binary.LittleEndian.Uint16(header[24:26]) == 0x20b &&
+		flags&pe.IMAGE_FILE_EXECUTABLE_IMAGE != 0 && flags&pe.IMAGE_FILE_DLL == 0
+}
+
+func isSDLFreeRDP(client string) bool {
+	data, err := os.ReadFile(client)
+	return err == nil && bytes.Contains(data, []byte("sdl-connection-dialog"))
 }
 
 func (a *agent) rdpCredentials(ctx context.Context, req proto.DesktopRequest) (proto.RDPCredential, proto.ErrorCode) {
@@ -118,6 +350,9 @@ func rdpLoginAndTransfer(ctx context.Context, client, fingerprint, account strin
 		"/cert:deny,fingerprint:sha256:" + fingerprint, "/proxy:ignore", "/log-level:ERROR",
 		"/size:1024x768", "/bpp:16", "/audio-mode:2", "-clipboard", "-auto-reconnect",
 	}
+	if isSDLFreeRDP(client) {
+		args = append(args, "-sdl-connection-dialog")
+	}
 	if len(password) == 0 {
 		args = append(args, "/p")
 	} else {
@@ -125,6 +360,7 @@ func rdpLoginAndTransfer(ctx context.Context, client, fingerprint, account strin
 	}
 	cmd := exec.CommandContext(clientCtx, client, args...)
 	cmd.Dir = filepath.Dir(client)
+	cmd.Env = append(os.Environ(), "SDL_VIDEODRIVER=dummy", "SDL_AUDIODRIVER=dummy")
 	cmd.WaitDelay = 2 * time.Second
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: windows.CREATE_NO_WINDOW}
 	var logs rdpClientOutput

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -32,14 +33,12 @@ func (s *Server) agentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/devices/{device}/rdp/unlock", s.require(s.rdpOperation(proto.RDPUnlock)))
 	mux.HandleFunc("POST /api/devices/{device}/rdp/lock", s.require(s.rdpOperation(proto.RDPLock)))
 	mux.HandleFunc("POST /api/agent/rdp/{operation}/credential", s.rdpCredential)
+	mux.HandleFunc("GET /api/agent/components/freerdp", s.downloadFreeRDP)
 	mux.HandleFunc("POST /api/devices/{device}/operations", s.require(s.queueOperation))
 	mux.HandleFunc("POST /api/devices/{device}/revoke", s.require(s.revokeDevice))
 	mux.HandleFunc("POST /api/devices/{device}/restore", s.require(s.restoreDevice))
 	mux.HandleFunc("POST /api/devices/{device}/delete", s.require(s.deleteDevice))
 	mux.HandleFunc("GET /api/devices/{device}/logs/{operation}", s.require(s.readLog))
-	mux.HandleFunc("GET /api/releases", s.require(s.listReleases))
-	mux.HandleFunc("POST /api/releases", s.require(s.createRelease))
-	mux.HandleFunc("POST /api/releases/{release}/rollout", s.require(s.rollout))
 	mux.HandleFunc("GET /api/agent/releases/{release}", s.downloadRelease)
 	mux.HandleFunc("POST /api/agent/logs/{operation}/ticket", s.logTicket)
 	mux.HandleFunc("POST /api/agent/logs/{operation}/upload", s.uploadLog)
@@ -169,45 +168,6 @@ func (s *Server) deleteDevice(w http.ResponseWriter, r *http.Request, session au
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (s *Server) listReleases(w http.ResponseWriter, r *http.Request, _ auth.Session, _ string) {
-	result, err := s.agents.Releases(r.Context())
-	if err != nil {
-		agentError(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, result)
-}
-
-func (s *Server) createRelease(w http.ResponseWriter, r *http.Request, session auth.Session, _ string) {
-	if r.Header.Get("Content-Type") != "application/zip" {
-		fail(w, http.StatusUnsupportedMediaType, "请上传 ZIP 版本包。")
-		return
-	}
-	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(5 * time.Minute))
-	body := http.MaxBytesReader(w, r.Body, proto.MaxReleaseSize+1)
-	defer body.Close()
-	query := r.URL.Query()
-	release, err := s.agents.SaveRelease(r.Context(), session.UserID, query.Get("version"), query.Get("component"), query.Get("sha256"), body)
-	if err != nil {
-		agentError(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusCreated, release)
-}
-
-func (s *Server) rollout(w http.ResponseWriter, r *http.Request, session auth.Session, _ string) {
-	var scope agents.Rollout
-	if !readJSON(w, r, &scope) {
-		return
-	}
-	count, err := s.agents.Rollout(r.Context(), session.UserID, r.PathValue("release"), scope)
-	if err != nil {
-		agentError(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusAccepted, map[string]int{"count": count})
-}
-
 func bearer(r *http.Request) string {
 	token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if !ok {
@@ -216,6 +176,7 @@ func bearer(r *http.Request) string {
 	return token
 }
 
+// downloadRelease serves updates queued before release management was removed.
 func (s *Server) downloadRelease(w http.ResponseWriter, r *http.Request) {
 	path, err := s.agents.PackagePath(r.Context(), r.Header.Get("X-GhostHand-Device"), bearer(r), r.PathValue("release"))
 	if err != nil {
@@ -224,6 +185,23 @@ func (s *Server) downloadRelease(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/zip")
 	http.ServeFile(w, r, path)
+}
+
+func (s *Server) downloadFreeRDP(w http.ResponseWriter, r *http.Request) {
+	token := bearer(r)
+	if token == "" {
+		token = r.Header.Get("X-GhostHand-Token")
+	}
+	bundle, digest, err := s.agents.FreeRDPBundle(r.Context(), r.Header.Get("X-GhostHand-Device"), token)
+	if err != nil {
+		agentError(w, r, err)
+		return
+	}
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(2 * time.Minute))
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", `attachment; filename="FreeRDP.zip"`)
+	w.Header().Set("X-GhostHand-SHA256", digest)
+	http.ServeContent(w, r, "FreeRDP.zip", time.Time{}, bytes.NewReader(bundle))
 }
 
 func (s *Server) logTicket(w http.ResponseWriter, r *http.Request) {
@@ -273,11 +251,11 @@ func agentError(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.Is(err, agents.ErrDeviceOnline):
 		fail(w, http.StatusConflict, "设备当前仍在线，请先断开连接或吊销凭证后再删除。")
 	case errors.Is(err, agents.ErrConflict):
-		fail(w, http.StatusConflict, "相同版本已存在，或目标设备已有冲突的待处理操作。")
+		fail(w, http.StatusConflict, "目标设备已有冲突的待处理操作。")
 	case errors.As(err, &tooLarge):
 		fail(w, http.StatusRequestEntityTooLarge, "文件超出大小限制。")
 	case errors.Is(err, agents.ErrInvalid):
-		fail(w, http.StatusBadRequest, "请求参数、版本包内容或 SHA-256 无效。")
+		fail(w, http.StatusBadRequest, "请求参数无效。")
 	default:
 		internalError(w, r, err)
 	}

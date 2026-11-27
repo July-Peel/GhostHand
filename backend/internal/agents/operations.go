@@ -1,22 +1,14 @@
 package agents
 
 import (
-	"archive/zip"
 	"context"
-	"crypto/ed25519"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strings"
 	"time"
-	"unicode/utf8"
 
 	"ghosthand/backend/internal/workbench"
 	"ghosthand/proto"
@@ -257,13 +249,13 @@ func (s *Service) Queue(ctx context.Context, user int64, id string, input Operat
 		if input.Kind == proto.AgentUninstall && (platform != proto.Windows || !proto.SupportsUninstall(capsHash)) {
 			return ErrUninstallUnsupported
 		}
-		operationID, err = queue(ctx, tx, user, id, input.Kind, input.Hours, nil)
+		operationID, err = queue(ctx, tx, user, id, input.Kind, input.Hours)
 		return err
 	})
 	return operationID, err
 }
 
-func queue(ctx context.Context, tx *sql.Tx, user int64, device string, kind proto.MessageType, hours int, release *proto.Release) (string, error) {
+func queue(ctx context.Context, tx *sql.Tx, user int64, device string, kind proto.MessageType, hours int) (string, error) {
 	var busy bool
 	err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM device_operations WHERE device_id=? AND state='queued'
 		AND (kind IN (?, 'agent.uninstall') OR ?='agent.uninstall'
@@ -279,58 +271,27 @@ func queue(ctx context.Context, tx *sql.Tx, user int64, device string, kind prot
 	if err != nil {
 		return "", err
 	}
-	if _, err := workbench.Enqueue(ctx, tx, device, kind, proto.Operation{ID: id, Hours: hours, Release: release}); err != nil {
+	if _, err := workbench.Enqueue(ctx, tx, device, kind, proto.Operation{ID: id, Hours: hours}); err != nil {
 		return "", err
 	}
 	now := time.Now().UnixMilli()
-	var releaseID any
-	if release != nil {
-		releaseID = release.ID
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO device_operations(id,device_id,kind,release_id,created_at) VALUES (?,?,?,?,?)`,
-		id, device, kind, releaseID, now); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO device_operations(id,device_id,kind,created_at) VALUES (?,?,?,?)`,
+		id, device, kind, now); err != nil {
 		return "", err
 	}
-	detail, _ := json.Marshal(map[string]any{"operation_id": id, "hours": hours, "release_id": releaseID})
+	detail, _ := json.Marshal(map[string]any{"operation_id": id, "hours": hours})
 	if err := audit(ctx, tx, user, device, string(kind), string(detail), now); err != nil {
 		return "", err
 	}
 	return id, workbench.RecordChange(ctx, tx, device)
 }
 
-var versionPattern = regexp.MustCompile("^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
-
-const releaseFields = "id,version,platform,arch,component,size,sha256,signature"
-
-func scanRelease(row interface{ Scan(...any) error }) (r proto.Release, err error) {
-	err = row.Scan(&r.ID, &r.Version, &r.Platform, &r.Arch, &r.Component, &r.Size, &r.SHA256, &r.Signature)
-	return
-}
-
-func (s *Service) Releases(ctx context.Context) ([]proto.Release, error) {
-	rows, err := s.store.QueryContext(ctx, "SELECT "+releaseFields+" FROM agent_releases ORDER BY created_at DESC,id DESC")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	result := []proto.Release{}
-	for rows.Next() {
-		entry, err := scanRelease(rows)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, entry)
-	}
-	return result, rows.Err()
-}
-
-func storeFile(dir string, body io.Reader, limit int64) (fileName, digest string, size int64, err error) {
+func storeFile(dir string, body io.Reader, limit int64) (string, error) {
 	file, err := os.CreateTemp(dir, ".incoming-*")
 	if err != nil {
-		return "", "", 0, err
+		return "", err
 	}
-	hash := sha256.New()
-	size, err = io.Copy(io.MultiWriter(file, hash), io.LimitReader(body, limit+1))
+	size, err := io.Copy(file, io.LimitReader(body, limit+1))
 	if err == nil && (size == 0 || size > limit) {
 		err = ErrInvalid
 	}
@@ -340,139 +301,9 @@ func storeFile(dir string, body io.Reader, limit int64) (fileName, digest string
 	err = errors.Join(err, file.Close())
 	if err != nil {
 		_ = os.Remove(file.Name())
-		return "", "", 0, err
+		return "", err
 	}
-	return file.Name(), hex.EncodeToString(hash.Sum(nil)), size, nil
-}
-
-func (s *Service) SaveRelease(ctx context.Context, user int64, version, component, expectedHash string, body io.Reader) (proto.Release, error) {
-	if !versionPattern.MatchString(version) || (component != "core" && component != "helper_win") || len(expectedHash) != 64 {
-		return proto.Release{}, ErrInvalid
-	}
-	dir := filepath.Join(s.dir, "packages")
-	temp, digest, size, err := storeFile(dir, body, proto.MaxReleaseSize)
-	if err != nil {
-		return proto.Release{}, err
-	}
-	defer os.Remove(temp)
-	if !strings.EqualFold(expectedHash, digest) || !validPackage(temp, component) {
-		return proto.Release{}, ErrInvalid
-	}
-	id, err := proto.NewID()
-	if err != nil {
-		return proto.Release{}, err
-	}
-	release := proto.Release{ID: id, Version: version, Platform: proto.Windows, Arch: "amd64", Component: component, Size: size, SHA256: digest}
-	release.Signature = base64.RawURLEncoding.EncodeToString(ed25519.Sign(s.key, release.SignedBytes()))
-	path := filepath.Join(dir, id+".zip")
-	if err := os.Rename(temp, path); err != nil {
-		return proto.Release{}, err
-	}
-	err = s.store.Write(ctx, func(tx *sql.Tx) error {
-		now := time.Now().UnixMilli()
-		result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO agent_releases(`+releaseFields+`,created_at)
-			VALUES (?,?,?,?,?,?,?,?,?)`, id, version, release.Platform, release.Arch, component, size, digest, release.Signature, now)
-		if err != nil {
-			return err
-		}
-		count, err := result.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if count == 0 {
-			return ErrConflict
-		}
-		return audit(ctx, tx, user, nil, "release.create", "{\"release_id\":\""+id+"\"}", now)
-	})
-	if err != nil {
-		_ = os.Remove(path)
-	}
-	return release, err
-}
-
-func validPackage(path, component string) bool {
-	archive, err := zip.OpenReader(path)
-	if err != nil {
-		return false
-	}
-	defer archive.Close()
-	required := "ghosthand-core.exe"
-	if component == "helper_win" {
-		required = "GhostHand.Helper.exe"
-	}
-	seen := make(map[string]bool)
-	for _, file := range archive.File {
-		if !file.Mode().IsRegular() || file.UncompressedSize64 > proto.MaxReleaseSize ||
-			(file.Name != required && !(component == "core" && file.Name == "GhostHand.Helper.exe")) || seen[file.Name] {
-			return false
-		}
-		src, err := file.Open()
-		if err != nil {
-			return false
-		}
-		var header [2]byte
-		_, err = io.ReadFull(src, header[:])
-		src.Close()
-		if err != nil || string(header[:]) != "MZ" {
-			return false
-		}
-		seen[file.Name] = true
-	}
-	return seen[required]
-}
-
-type Rollout struct {
-	DeviceID string `json:"device_id,omitempty"`
-	Group    string `json:"group,omitempty"`
-	All      bool   `json:"all,omitempty"`
-}
-
-func (s *Service) Rollout(ctx context.Context, user int64, id string, scope Rollout) (int, error) {
-	if scope.DeviceID == "" && scope.Group == "" && !scope.All ||
-		scope.DeviceID != "" && (scope.Group != "" || scope.All) || scope.Group != "" && scope.All ||
-		utf8.RuneCountInString(scope.Group) > 80 {
-		return 0, ErrInvalid
-	}
-	count := 0
-	err := s.store.Write(ctx, func(tx *sql.Tx) error {
-		release, err := scanRelease(tx.QueryRowContext(ctx, "SELECT "+releaseFields+" FROM agent_releases WHERE id=?", id))
-		if errors.Is(err, sql.ErrNoRows) {
-			return ErrMissing
-		}
-		if err != nil {
-			return err
-		}
-		rows, err := tx.QueryContext(ctx, `SELECT d.id FROM devices d JOIN device_credentials c ON d.id=c.device_id
-			WHERE c.revoked_at IS NULL AND d.platform=? AND d.arch=? AND (? OR d.id=? OR (?<>'' AND d.group_name=?))`,
-			release.Platform, release.Arch, scope.All, scope.DeviceID, scope.Group, scope.Group)
-		if err != nil {
-			return err
-		}
-		var devices []string
-		for rows.Next() {
-			var device string
-			if err := rows.Scan(&device); err != nil {
-				rows.Close()
-				return err
-			}
-			devices = append(devices, device)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return err
-		}
-		if len(devices) == 0 {
-			return ErrMissing
-		}
-		for _, device := range devices {
-			if _, err := queue(ctx, tx, user, device, proto.AgentUpdate, 0, &release); err != nil {
-				return err
-			}
-		}
-		count = len(devices)
-		return nil
-	})
-	return count, err
+	return file.Name(), nil
 }
 
 func (s *Service) PackagePath(ctx context.Context, device, token, id string) (string, error) {
@@ -537,7 +368,7 @@ func (s *Service) SaveLog(ctx context.Context, id, token string, body io.Reader)
 		return err
 	}
 	dir := filepath.Join(s.dir, "logs")
-	temp, _, _, err := storeFile(dir, body, proto.MaxLogSize)
+	temp, err := storeFile(dir, body, proto.MaxLogSize)
 	if err != nil {
 		return err
 	}

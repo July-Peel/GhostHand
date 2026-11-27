@@ -1,8 +1,8 @@
-import { useId, useState } from 'react'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useId, useRef, useState } from 'react'
+import { useIsMutating, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { LoaderCircle, RefreshCw } from 'lucide-react'
-import { agentAPI, browserExtensionKey, connectionKey, releasesKey, windowsInstallerNames } from './agent-api'
-import type { OperationKind, Release, Rollout, WindowsInstallerName } from './agent-api'
+import { agentAPI, browserExtensionKey, connectionKey, windowsInstallerNames } from './agent-api'
+import type { OperationKind, WindowsInstallerFile, WindowsInstallerName } from './agent-api'
 import { errorText } from './api'
 import type { Device, Session } from './api'
 import { Panel } from './device-ui'
@@ -77,20 +77,61 @@ export function BrowserExtensionSection({ device, session }: { device: Device; s
 }
 
 const pairingPlatforms = ['Windows', 'Linux', 'Android'] as const
+const windowsInstallerFilesKey = ['pairing', 'windows-files'] as const
+
+function WindowsInstallerFileRow({ name, saved, statusLoaded, csrf }: {
+  name: WindowsInstallerName
+  saved: WindowsInstallerFile | undefined
+  statusLoaded: boolean
+  csrf: string
+}) {
+  const client = useQueryClient()
+  const input = useRef<HTMLInputElement>(null)
+  const [progress, setProgress] = useState(0)
+  const mutationKey = ['pairing', 'windows-upload', name] as const
+  const upload = useMutation({
+    mutationKey,
+    mutationFn: (file: File) => agentAPI.uploadWindowsInstallerFile(name, file, csrf, setProgress),
+    onSuccess: async savedFile => {
+      await client.cancelQueries({ queryKey: windowsInstallerFilesKey, exact: true })
+      client.setQueryData<WindowsInstallerFile[]>(windowsInstallerFilesKey, files =>
+        files && [...files.filter(file => file.name !== name), savedFile])
+      void client.invalidateQueries({ queryKey: windowsInstallerFilesKey, exact: true })
+    },
+  })
+  const uploading = useIsMutating({ mutationKey, exact: true }) > 0
+  const percent = upload.isPending ? progress : undefined
+  const action = saved ? '替换' : '上传'
+
+  return <li>
+    {uploading && <div className="pairing-file-fill" aria-hidden="true" style={{ width: `${percent ?? 0}%` }} />}
+    <div className="pairing-file-label">
+      <strong>{name}</strong>
+      <span aria-live="polite">{saved ? `已上传 · ${(saved.size / (1024 * 1024)).toFixed(1)} MiB` : statusLoaded ? '未上传' : '—'}</span>
+    </div>
+    <input type="file" ref={input} accept=".exe" hidden onChange={event => {
+      const file = event.currentTarget.files?.[0]
+      event.currentTarget.value = ''
+      if (!file || uploading) return
+      setProgress(0)
+      upload.mutate(file)
+    }} />
+    {uploading ? <span className="pairing-file-progress" role="progressbar" aria-label={`${name} 上传进度`}
+      aria-valuenow={percent} aria-valuetext={percent === 100 ? '100%，正在保存' : undefined}>
+      {percent === undefined ? '上传中…' : percent === 100 ? '100% · 保存中' : `${percent}%`}
+    </span> : <button type="button" className="secondary-button" aria-label={`${action} ${name}`}
+      onClick={() => input.current?.click()}>{action}</button>}
+    {upload.isError && <p role="alert">{errorText(upload.error)}</p>}
+  </li>
+}
 
 export function PairingPanel({ session, close }: { session: Session; close: () => void }) {
   const client = useQueryClient()
   const panelId = useId()
   const [platform, setPlatform] = useState<typeof pairingPlatforms[number]>('Windows')
   const keyQuery = ['pairing'] as const
-  const filesQuery = ['pairing', 'windows-files'] as const
   const pairing = useQuery({ queryKey: keyQuery, queryFn: ({ signal }) => agentAPI.getPairing(signal), gcTime: 0 })
-  const files = useQuery({ queryKey: filesQuery, queryFn: ({ signal }) => agentAPI.windowsInstallerFiles(signal) })
-  const upload = useMutation({
-    mutationFn: async ({ name, file }: { name: WindowsInstallerName; file: File }) =>
-      agentAPI.uploadWindowsInstallerFile(name, file, session.csrf_token),
-    onSuccess: () => client.invalidateQueries({ queryKey: filesQuery }),
-  })
+  const files = useQuery({ queryKey: windowsInstallerFilesKey, queryFn: ({ signal }) => agentAPI.windowsInstallerFiles(signal) })
   const [confirmRotate, setConfirmRotate] = useState(false)
   const [copied, setCopied] = useState<'key' | 'svc' | null>(null)
   const rotate = useMutation({
@@ -138,26 +179,8 @@ export function PairingPanel({ session, close }: { session: Session; close: () =
           {files.isPending && <p role="status">正在读取上传状态…</p>}
           {files.isError && <p role="alert">{errorText(files.error)} <button type="button" className="text-button" onClick={() => void files.refetch()}>重试</button></p>}
           <ul className="pairing-files">
-            {windowsInstallerNames.map(name => {
-              const saved = files.data?.find(file => file.name === name)
-              const current = upload.variables?.name === name
-              const inputId = panelId + '-' + name
-              return <li key={name}>
-                <div><strong>{name}</strong>
-                  <span aria-live="polite">{saved ? `已上传 · ${(saved.size / (1024 * 1024)).toFixed(1)} MiB` : files.isSuccess ? '未上传' : '—'}</span>
-                </div>
-                <input type="file" id={inputId} accept=".exe" hidden onChange={event => {
-                  const file = event.currentTarget.files?.[0]
-                  event.currentTarget.value = ''
-                  if (file) upload.mutate({ name, file })
-                }} />
-                <button type="button" className="secondary-button" disabled={upload.isPending}
-                  aria-label={(saved ? '替换 ' : '上传 ') + name} onClick={() => document.getElementById(inputId)?.click()}>
-                  {current && upload.isPending ? '正在上传…' : saved ? '替换' : '上传'}
-                </button>
-                {current && upload.isError && <p role="alert">{errorText(upload.error)}</p>}
-              </li>
-            })}
+            {windowsInstallerNames.map(name => <WindowsInstallerFileRow key={name} name={name}
+              saved={files.data?.find(file => file.name === name)} statusLoaded={files.isSuccess} csrf={session.csrf_token} />)}
           </ul>
           {pairing.isPending && <p role="status">正在读取服务端接入密钥…</p>}
           {pairing.isError && <p role="alert">{errorText(pairing.error)} <button type="button" className="text-button" onClick={() => void pairing.refetch()}>重试</button></p>}
@@ -308,90 +331,5 @@ export function DeviceOperations({ device, session }: { device: Device; session:
         </ul>}
       </section>
     </>
-  )
-}
-
-export function ReleasesPanel({ session, devices, close }: { session: Session; devices: Device[]; close: () => void }) {
-  const client = useQueryClient()
-  const releases = useQuery({ queryKey: releasesKey, queryFn: ({ signal }) => agentAPI.releases(signal) })
-  const [file, setFile] = useState<File | null>(null)
-  const [version, setVersion] = useState('')
-  const [component, setComponent] = useState<Release['component']>('core')
-  const [selected, setSelected] = useState<Release | null>(null)
-  const [scope, setScope] = useState<'device' | 'group' | 'all'>('device')
-  const [target, setTarget] = useState('')
-  const [count, setCount] = useState<number | null>(null)
-  const windows = devices.filter(device => !device.is_demo && device.platform === 'windows' && device.arch === 'amd64')
-  const groups = [...new Set(windows.map(device => device.group).filter(Boolean))]
-
-  const upload = useMutation({
-    mutationFn: (packageFile: File) => agentAPI.upload(version.trim(), component, packageFile, session.csrf_token),
-    onSuccess: () => {
-      setVersion('')
-      void client.invalidateQueries({ queryKey: releasesKey })
-    },
-  })
-  const rollout = useMutation({
-    mutationFn: ({ release, group }: { release: Release; group: Rollout }) =>
-      agentAPI.rollout(release.id, group, session.csrf_token),
-    onSuccess: result => { setCount(result.count); setSelected(null) },
-  })
-  return (
-    <Panel title="版本管理" className="settings-panel" close={close}>
-      <section className="agent-section">
-        <form className="settings-form" onSubmit={event => { event.preventDefault(); if (file) upload.mutate(file) }}>
-          <h3>上传 Windows x64 版本</h3>
-          <label>组件<select value={component} onChange={event => setComponent(event.target.value as Release['component'])}>
-            <option value="core">Core，可附带执行器</option><option value="helper_win">执行器</option>
-          </select></label>
-          <label>版本号<input required value={version} maxLength={64} pattern={'[A-Za-z0-9][A-Za-z0-9._+\\-]{0,63}'}
-            onChange={event => setVersion(event.target.value)} /></label>
-          <label>ZIP 版本包<input required type="file" accept=".zip" onChange={event => setFile(event.target.files?.[0] ?? null)} /></label>
-          <p>{component === 'core' ? 'ZIP 根目录需要 ghosthand-core.exe，可同时放入 GhostHand.Helper.exe。' : '将单文件发布的 GhostHand.Helper.exe 放在 ZIP 根目录。'}</p>
-          <button type="submit" className="primary-button" disabled={upload.isPending}>{upload.isPending ? '正在校验并上传…' : '上传并签名'}</button>
-          {upload.isError && <p role="alert">{file && file.size > 96 * 1024 * 1024 ? '版本包不能超过 96 MiB。' : errorText(upload.error)}</p>}
-        </form>
-      </section>
-      <section className="agent-section">
-        <h3>已签名版本</h3>
-        {releases.isError && <p role="alert">{errorText(releases.error)}</p>}
-        {releases.data?.length === 0 && <p>暂无版本。</p>}
-        {count !== null && <p role="status">已向 {count} 台设备下发升级。</p>}
-        <ul className="agent-list">{releases.data?.map(release => (
-          <li key={release.id}>
-            <strong>{release.component === 'core' ? 'Core' : '执行器'} {release.version}</strong>
-            <code title={release.sha256}>{release.sha256}</code>
-            <button type="button" className="secondary-button" onClick={() => {
-              setSelected(release); setScope('device'); setTarget(''); setCount(null); rollout.reset()
-            }}>部署版本</button>
-          </li>
-        ))}</ul>
-        {selected && (
-          <form className="settings-form agent-confirm" onSubmit={event => {
-            event.preventDefault()
-            const rolloutScope: Rollout = scope === 'all' ? { all: true } : scope === 'group' ? { group: target } : { device_id: target }
-            rollout.mutate({ release: selected, group: rolloutScope })
-          }}>
-            <h3>部署 {selected.version}</h3>
-            <label>范围<select value={scope} onChange={event => {
-              const next = event.target.value
-              if (next === 'device' || next === 'group' || next === 'all') setScope(next)
-              setTarget('')
-            }}><option value="device">单台设备</option><option value="group">指定分组</option><option value="all">全部匹配的设备</option></select></label>
-            {scope === 'device' && <label>设备<select required value={target} onChange={event => setTarget(event.target.value)}>
-              <option value="">选择设备</option>{windows.map(device => <option key={device.id} value={device.id}>{device.name}</option>)}
-            </select></label>}
-            {scope === 'group' && <label>分组<select required value={target} onChange={event => setTarget(event.target.value)}>
-              <option value="">选择分组</option>{groups.map(group => <option key={group}>{group}</option>)}
-            </select></label>}
-            <div className="agent-actions">
-              <button type="submit" className="primary-button" disabled={rollout.isPending || (scope !== 'all' && !target)}>确认部署</button>
-              <button type="button" className="text-button" onClick={() => setSelected(null)}>取消</button>
-            </div>
-            {rollout.isError && <p role="alert">{errorText(rollout.error)}</p>}
-          </form>
-        )}
-      </section>
-    </Panel>
   )
 }
