@@ -81,14 +81,17 @@ func ReconcileTasks(ctx context.Context, tx *sql.Tx, device string, hello proto.
 		}
 		switch state {
 		case proto.Cancelling, proto.Cancelled, proto.Expired, proto.Failed, proto.Succeeded, proto.Unknown:
+			force := control == "force"
 			var queued bool
 			if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM outbox WHERE device_id=?
-				AND json_extract(envelope_json,'$.payload.task_id')=? AND json_extract(envelope_json,'$.type') IN ('task.cancel','mcp.task_finish'))`,
-				device, id).Scan(&queued); err != nil {
+				AND json_extract(envelope_json,'$.payload.task_id')=? AND (
+					(json_extract(envelope_json,'$.type')='task.cancel' AND (NOT ? OR json_extract(envelope_json,'$.payload.force')=1))
+					OR (? AND json_extract(envelope_json,'$.type')='mcp.task_finish')))`,
+				device, id, force, state != proto.Cancelling).Scan(&queued); err != nil {
 				return err
 			}
 			if !queued {
-				if _, err := Enqueue(ctx, tx, device, proto.TaskCancel, proto.TaskControl{TaskID: id, Force: control == "force"}); err != nil {
+				if err := enqueueTaskCancel(ctx, tx, device, id, force, false); err != nil {
 					return err
 				}
 			}

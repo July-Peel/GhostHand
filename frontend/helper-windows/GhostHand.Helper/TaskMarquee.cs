@@ -195,10 +195,17 @@ internal sealed class TaskMarquee : IDisposable
         task = id;
         currentState = state;
         paused = state == "paused";
-        toggle.IsEnabled = state != "waiting_user";
+        toggle.IsEnabled = state is "running" or "paused";
+        stop.IsEnabled = state != "cancelling";
         toggle.Content = paused ? "继续" : "暂停";
 
-        statusBadgeText.Text = paused ? "已暂停" : state == "waiting_user" ? "等待确认" : "正在执行";
+        statusBadgeText.Text = state switch
+        {
+            "paused" => "已暂停",
+            "waiting_user" => "等待确认",
+            "cancelling" => "终止中",
+            _ => "正在执行"
+        };
         ApplyBadgePalette();
 
         var cleanTitle = string.IsNullOrWhiteSpace(title) ? "设备任务" : title.Trim();
@@ -329,6 +336,11 @@ internal sealed class TaskMarquee : IDisposable
             statusBadgeBgBrush.Color = Color.FromArgb(65, 245, 158, 11);
             statusBadgeFgBrush.Color = Color.FromRgb(253, 224, 71);
         }
+        else if (currentState == "cancelling")
+        {
+            statusBadgeBgBrush.Color = Color.FromArgb(65, 225, 29, 72);
+            statusBadgeFgBrush.Color = Color.FromRgb(254, 205, 211);
+        }
         else
         {
             statusBadgeBgBrush.Color = Color.FromArgb(60, 79, 70, 229);
@@ -352,6 +364,11 @@ internal sealed class TaskMarquee : IDisposable
         {
             primaryA = Color.FromRgb(245, 158, 11);  // Amber
             primaryB = Color.FromRgb(239, 68, 68);   // Coral red
+        }
+        else if (currentState == "cancelling")
+        {
+            primaryA = Color.FromRgb(225, 29, 72);
+            primaryB = Color.FromRgb(251, 113, 133);
         }
         else
         {

@@ -76,10 +76,16 @@ func (a *agent) executeBrainTask(ctx, process context.Context, assigned localTas
 				break
 			}
 			err := a.local.changeTask(assigned.TaskID, func(t *localTask) error {
+				if t.Desired == "cancel" || t.Desired == "force" || t.Finish != nil {
+					return context.Canceled
+				}
 				t.LastCall, t.Call, t.CallStarted = call.CallID, nil, false
 				t.TicketRequest, t.Ticket = "", proto.ScreenshotTicket{}
 				return a.local.enqueueInLock(proto.MCPToolResult, result)
 			})
+			if errors.Is(err, context.Canceled) {
+				break
+			}
 			if err != nil {
 				return err
 			}
@@ -98,6 +104,10 @@ func (a *agent) executeBrainTask(ctx, process context.Context, assigned localTas
 
 func (a *agent) executeTool(ctx context.Context, call proto.MCPCall, wake <-chan struct{}) proto.MCPResult {
 	result := proto.MCPResult{CallID: call.CallID, TaskID: call.TaskID}
+	if ctx.Err() != nil {
+		result.Error = string(proto.ErrCancelled)
+		return result
+	}
 	if proto.IsBrowserTool(call.Tool) {
 		return a.executeBrowserTool(ctx, call, wake)
 	}

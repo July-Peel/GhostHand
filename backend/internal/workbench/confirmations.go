@@ -23,48 +23,37 @@ func (s *Service) requestConfirmation(ctx context.Context, t brainTask, summary,
 	if err != nil {
 		return false, err
 	}
-	for {
-		if err := s.awaitBrain(ctx, t.id); err != nil {
-			return false, err
+	err = s.writeBrainReady(ctx, t.id, func(tx *sql.Tx) error {
+		now := time.Now().UnixMilli()
+		var step int
+		if err := tx.QueryRowContext(ctx, `UPDATE tasks SET state='waiting_user' WHERE id=? RETURNING step_index`, t.id).Scan(&step); err != nil {
+			return err
 		}
-		err = s.store.Write(ctx, func(tx *sql.Tx) error {
-			if err := checkBrainReady(ctx, tx, t.id); err != nil {
+		if attachment != "" {
+			var exists bool
+			if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM attachments WHERE id=? AND task_id=?)", attachment, t.id).Scan(&exists); err != nil {
 				return err
 			}
-			now := time.Now().UnixMilli()
-			var step int
-			if err := tx.QueryRowContext(ctx, `UPDATE tasks SET state='waiting_user' WHERE id=? RETURNING step_index`, t.id).Scan(&step); err != nil {
-				return err
+			if !exists {
+				attachment = ""
 			}
-			if attachment != "" {
-				var exists bool
-				if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM attachments WHERE id=? AND task_id=?)", attachment, t.id).Scan(&exists); err != nil {
-					return err
-				}
-				if !exists {
-					attachment = ""
-				}
-			}
-			card := ConfirmationCard{ID: id, TaskID: t.id, Summary: summary, RiskAction: risk, AttachmentID: attachment}
-			raw, _ := json.Marshal(card)
-			if _, err := tx.ExecContext(ctx, "INSERT INTO confirmations(id,task_id,summary,created_at) VALUES (?,?,?,?)", id, t.id, summary, now); err != nil {
-				return err
-			}
-			if _, err := tx.ExecContext(ctx, `INSERT INTO chat_messages(device_id,sender,type,task_id,payload_json,created_at)
-				VALUES (?,'agent','confirm_card',?,?,?)`, t.device, t.id, string(raw), now); err != nil {
-				return err
-			}
-			if _, err := Enqueue(ctx, tx, t.device, proto.MCPTaskDisplay, proto.TaskDisplay{
-				TaskID: t.id, Title: t.title, StepIndex: step, StepTotal: step, StepName: "等待管理员确认", State: proto.WaitingUser,
-			}); err != nil {
-				return err
-			}
-			return RecordChange(ctx, tx, t.device)
-		})
-		if !errors.Is(err, errBrainWait) {
-			break
 		}
-	}
+		card := ConfirmationCard{ID: id, TaskID: t.id, Summary: summary, RiskAction: risk, AttachmentID: attachment}
+		raw, _ := json.Marshal(card)
+		if _, err := tx.ExecContext(ctx, "INSERT INTO confirmations(id,task_id,summary,created_at) VALUES (?,?,?,?)", id, t.id, summary, now); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO chat_messages(device_id,sender,type,task_id,payload_json,created_at)
+			VALUES (?,'agent','confirm_card',?,?,?)`, t.device, t.id, string(raw), now); err != nil {
+			return err
+		}
+		if _, err := Enqueue(ctx, tx, t.device, proto.MCPTaskDisplay, proto.TaskDisplay{
+			TaskID: t.id, Title: t.title, StepIndex: step, StepTotal: step, StepName: "等待管理员确认", State: proto.WaitingUser,
+		}); err != nil {
+			return err
+		}
+		return RecordChange(ctx, tx, t.device)
+	})
 	if err != nil {
 		return false, err
 	}
@@ -91,8 +80,8 @@ func (s *Service) requestConfirmation(ctx context.Context, t brainTask, summary,
 }
 
 func (s *Service) Decide(ctx context.Context, user int64, device, id string, approve bool) error {
-	return s.store.Write(ctx, func(tx *sql.Tx) error {
-		var task, decision string
+	var task, decision string
+	err := s.store.Write(ctx, func(tx *sql.Tx) error {
 		var state proto.TaskState
 		err := tx.QueryRowContext(ctx, `SELECT c.task_id,c.decision,t.state FROM confirmations c JOIN tasks t ON t.id=c.task_id
 			WHERE c.id=? AND t.device_id=?`, id, device).Scan(&task, &decision, &state)
@@ -109,19 +98,35 @@ func (s *Service) Decide(ctx context.Context, user int64, device, id string, app
 		if decision == value {
 			return nil
 		}
-		if decision != "pending" || state != proto.WaitingUser {
+		if decision != "pending" || (state != proto.WaitingUser && state != proto.Paused) {
 			return ErrTaskControl
 		}
 		now := time.Now().UnixMilli()
 		if _, err := tx.ExecContext(ctx, "UPDATE confirmations SET decision=?,decided_at=? WHERE id=?", value, now, id); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, "UPDATE tasks SET state='running' WHERE id=?", task); err != nil {
-			return err
+		if !approve {
+			if err := enqueueTaskCancel(ctx, tx, device, task, false, false); err != nil {
+				return err
+			}
+			if err := addReply(ctx, tx, device, task, errBrainDenied.Error(), now); err != nil {
+				return err
+			}
+			if err := finishTask(ctx, tx, task, proto.Cancelled, proto.ErrCancelled, now); err != nil {
+				return err
+			}
+		} else if state == proto.WaitingUser {
+			if _, err := tx.ExecContext(ctx, "UPDATE tasks SET state='running' WHERE id=?", task); err != nil {
+				return err
+			}
 		}
 		if err := auditTask(ctx, tx, user, device, task, "task.confirm."+value, now); err != nil {
 			return err
 		}
 		return RecordChange(ctx, tx, device)
 	})
+	if err == nil && !approve {
+		s.cancelBrainSession(device, task)
+	}
+	return err
 }

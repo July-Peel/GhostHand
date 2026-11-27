@@ -19,20 +19,21 @@ type pendingOperation struct {
 }
 
 type journal struct {
-	mu          sync.Mutex
-	fresh       bool
-	inbound     uint64
-	outboundAck uint64
-	outboxSeq   uint64
-	outbox      []proto.Envelope
-	inbox       map[string]struct{}
-	inboxOrder  []inboxEntry
-	operations  map[uint64]pendingOperation
-	opOrder     []uint64
-	tasksMap    map[string]localTask
-	taskResults map[string]json.RawMessage
-	resultOrder []string
-	changed     chan struct{}
+	mu                 sync.Mutex
+	fresh              bool
+	inbound            uint64
+	outboundAck        uint64
+	outboxSeq          uint64
+	outbox             []proto.Envelope
+	inbox              map[string]struct{}
+	inboxOrder         []inboxEntry
+	operations         map[uint64]pendingOperation
+	opOrder            []uint64
+	tasksMap           map[string]localTask
+	forceHelperPending bool
+	taskResults        map[string]json.RawMessage
+	resultOrder        []string
+	changed            chan struct{}
 }
 
 type inboxEntry struct {
@@ -64,6 +65,7 @@ func (j *journal) resetForFreshSession() {
 	j.operations = make(map[uint64]pendingOperation)
 	j.opOrder = nil
 	j.tasksMap = make(map[string]localTask)
+	j.forceHelperPending = false
 	j.taskResults = make(map[string]json.RawMessage)
 	j.resultOrder = nil
 }

@@ -29,6 +29,7 @@ type MediaCard struct {
 
 type activeTask struct {
 	state      proto.TaskState
+	control    string
 	capability proto.CapabilityID
 	step       int
 	attempt    int
@@ -41,12 +42,12 @@ func ApplyTaskReport(ctx context.Context, tx *sql.Tx, device string, frame proto
 		return ErrTaskMessage
 	}
 	var task activeTask
-	err := tx.QueryRowContext(ctx, `SELECT t.state,t.capability,t.step_index,COALESCE(e.attempt,0),COALESCE(e.seq,0)
+	err := tx.QueryRowContext(ctx, `SELECT t.state,t.control,t.capability,t.step_index,COALESCE(e.attempt,0),COALESCE(e.seq,0)
 		FROM tasks t LEFT JOIN task_events e ON e.task_id=t.id AND e.seq=(
 			SELECT MAX(seq) FROM task_events WHERE task_id=t.id AND attempt>0)
 		WHERE t.id=? AND t.device_id=? AND t.assign_seq IS NOT NULL
 		AND t.state IN ('queued','dispatched','running','paused','waiting_user','cancelling')`, ref.TaskID, device).
-		Scan(&task.state, &task.capability, &task.step, &task.attempt, &task.eventSeq)
+		Scan(&task.state, &task.control, &task.capability, &task.step, &task.attempt, &task.eventSeq)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -67,31 +68,10 @@ func ApplyTaskReport(ctx context.Context, tx *sql.Tx, device string, frame proto
 	case proto.TaskHeartbeat:
 		var report proto.TaskStatus
 		if json.Unmarshal(frame.Payload, &report) != nil ||
-			(report.State != proto.Running && report.State != proto.Paused && report.State != proto.Cancelling) {
+			report.HeartbeatOnly || (report.State != proto.Running && report.State != proto.Paused && report.State != proto.Cancelling) {
 			return ErrTaskMessage
 		}
-		if err := touchTask(ctx, tx, ref.TaskID, now); err != nil {
-			return err
-		}
-		if task.state == report.State || (task.state != proto.Running && task.state != proto.Paused &&
-			!(task.state == proto.WaitingUser && report.State == proto.Cancelling)) {
-			return nil
-		}
-		if report.State == proto.Cancelling {
-			if _, err := tx.ExecContext(ctx, "UPDATE tasks SET state='cancelling',control='cancel',cancel_at=? WHERE id=?",
-				now, ref.TaskID); err != nil {
-				return err
-			}
-			return addTaskEvent(ctx, tx, ref.TaskID, "control", "cancelling", "设备端请求终止任务", now)
-		}
-		detail := "任务已继续"
-		if report.State == proto.Paused {
-			detail = "任务已暂停"
-		}
-		if _, err := tx.ExecContext(ctx, "UPDATE tasks SET state=?,control='' WHERE id=?", report.State, ref.TaskID); err != nil {
-			return err
-		}
-		return addTaskEvent(ctx, tx, ref.TaskID, "control", string(report.State), detail, now)
+		return applyControlReport(ctx, tx, task, report, now)
 	case proto.TaskProgress:
 		var report proto.TaskProgressPayload
 		if json.Unmarshal(frame.Payload, &report) != nil || report.StepIndex < 1 ||
@@ -119,8 +99,8 @@ func ApplyTaskReport(ctx context.Context, tx *sql.Tx, device string, frame proto
 		default:
 			return ErrTaskMessage
 		}
-		if task.state == proto.Cancelling && result.State != proto.Succeeded {
-			result.State, result.ErrorCode = proto.Cancelled, proto.ErrCancelled
+		if task.state == proto.Cancelling {
+			result.State, result.ErrorCode, result.Result = proto.Cancelled, proto.ErrCancelled, nil
 		}
 		if result.State == proto.Succeeded && task.capability != proto.BrainTask {
 			if err := publishResult(ctx, tx, device, task.capability, result, now); err != nil {
@@ -157,9 +137,55 @@ func ApplyTaskReport(ctx context.Context, tx *sql.Tx, device string, frame proto
 		if task.capability != proto.BrainTask {
 			return ErrTaskMessage
 		}
-		return recordToolResult(ctx, tx, device, ref.TaskID, frame.Payload, now)
+		if task.state != proto.Cancelling {
+			return recordToolResult(ctx, tx, device, ref.TaskID, frame.Payload, now)
+		}
 	}
 	return nil
+}
+
+func applyControlReport(ctx context.Context, tx *sql.Tx, task activeTask, report proto.TaskStatus, now int64) error {
+	if err := touchTask(ctx, tx, report.TaskID, now); err != nil {
+		return err
+	}
+	if !brainActive(task.state) {
+		return nil
+	}
+	if report.State == proto.Cancelling {
+		if _, err := tx.ExecContext(ctx, "UPDATE tasks SET state='cancelling',control='cancel',cancel_at=? WHERE id=?",
+			now, report.TaskID); err != nil {
+			return err
+		}
+		if err := closeTaskConfirmations(ctx, tx, report.TaskID, now); err != nil {
+			return err
+		}
+		return addTaskEvent(ctx, tx, report.TaskID, "control", "cancelling", "设备端请求终止任务", now)
+	}
+	if task.state == proto.WaitingUser && report.State == proto.Running {
+		return nil
+	}
+	next := report.State
+	action, detail := "resume", "任务已继续"
+	if report.State == proto.Paused {
+		action, detail = "pause", "任务已暂停"
+	} else if task.state == proto.Paused {
+		var waiting bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM confirmations WHERE task_id=? AND decision='pending')`,
+			report.TaskID).Scan(&waiting); err != nil {
+			return err
+		}
+		if waiting {
+			next = proto.WaitingUser
+		}
+	}
+	if task.state == next && task.control != action {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE tasks SET state=?,control=CASE WHEN control=? THEN '' ELSE control END WHERE id=?",
+		next, action, report.TaskID); err != nil {
+		return err
+	}
+	return addTaskEvent(ctx, tx, report.TaskID, "control", string(report.State), detail, now)
 }
 
 func recordProgress(ctx context.Context, tx *sql.Tx, task activeTask, report proto.TaskProgressPayload, now int64) error {

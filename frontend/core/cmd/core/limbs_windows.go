@@ -351,6 +351,9 @@ func runWinProcess(ctx context.Context, timeout time.Duration, exe string, argv 
 	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = &stderrBuf
 
+	if err := runCtx.Err(); err != nil {
+		return winProcResult{launchErr: err}
+	}
 	if err := cmd.Start(); err != nil {
 		return winProcResult{launchErr: fmt.Errorf("启动进程失败: %w", err)}
 	}
@@ -370,16 +373,19 @@ func runWinProcess(ctx context.Context, timeout time.Duration, exe string, argv 
 		select {
 		case waitErr = <-done:
 		case <-time.After(2 * time.Second):
+			_ = cmd.Process.Kill()
 		}
 	}
 
 	exitCode := exitCodeFromError(waitErr)
+	stdout, stdoutTruncated := stdoutBuf.output()
+	stderr, stderrTruncated := stderrBuf.output()
 	return winProcResult{
 		exitCode:  exitCode,
-		stdout:    stdoutBuf.String(),
-		stderr:    stderrBuf.String(),
+		stdout:    stdout,
+		stderr:    stderr,
 		duration:  time.Since(started).Milliseconds(),
-		truncated: stdoutBuf.truncated || stderrBuf.truncated,
+		truncated: stdoutTruncated || stderrTruncated,
 		timedOut:  timedOut,
 		runAs:     currentPrivilegeLabel(),
 	}
@@ -437,6 +443,11 @@ func runWithToken(ctx context.Context, exe string, argv []string, rawCmdLine, cw
 	}
 	var pi windows.ProcessInformation
 	flags := uint32(windows.CREATE_NO_WINDOW | windows.CREATE_UNICODE_ENVIRONMENT | windows.CREATE_BREAKAWAY_FROM_JOB)
+	if err := ctx.Err(); err != nil {
+		windows.CloseHandle(outW)
+		windows.CloseHandle(errW)
+		return winProcResult{launchErr: err}, true
+	}
 	err = windows.CreateProcessAsUser(token, exePtr, cmdPtr, nil, nil, true, flags, envBlock, cwdPtr, &si, &pi)
 	windows.CloseHandle(outW)
 	windows.CloseHandle(errW)
@@ -492,11 +503,13 @@ func runWithToken(ctx context.Context, exe string, argv []string, rawCmdLine, cw
 
 	var exitCode uint32
 	_ = windows.GetExitCodeProcess(pi.Process, &exitCode)
+	stdout, stdoutTruncated := stdoutBuf.output()
+	stderr, stderrTruncated := stderrBuf.output()
 	return winProcResult{
 		exitCode:  int(exitCode),
-		stdout:    stdoutBuf.String(),
-		stderr:    stderrBuf.String(),
-		truncated: stdoutBuf.truncated || stderrBuf.truncated,
+		stdout:    stdout,
+		stderr:    stderr,
+		truncated: stdoutTruncated || stderrTruncated,
 		timedOut:  timedOut,
 	}, true
 }
@@ -561,11 +574,10 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (b *cappedBuffer) String() string {
+func (b *cappedBuffer) output() (string, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	s := b.buf.String()
-	return strings.ToValidUTF8(s, "\uFFFD")
+	return strings.ToValidUTF8(b.buf.String(), "\uFFFD"), b.truncated
 }
 
 func marshalShellResult(res winProcResult, shell, scriptPath string) (json.RawMessage, error) {

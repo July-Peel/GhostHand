@@ -64,8 +64,29 @@ func (p *host) helperLink() *helperLink {
 }
 
 func (p *host) overlay(update taskOverlay) {
+	p.overlayMu.Lock()
+	defer p.overlayMu.Unlock()
+	if update.Visible {
+		if p.taskOverlay.TaskID == update.TaskID && p.taskOverlay.State == proto.Cancelling && update.State != proto.Cancelling {
+			return
+		}
+		p.taskOverlay = update
+	} else if p.taskOverlay.TaskID == update.TaskID {
+		p.taskOverlay = taskOverlay{}
+	}
 	if ipc := p.helperLink(); ipc != nil {
 		_ = ipc.send(0, "task.overlay", update, nil)
+	}
+}
+
+func (p *host) markOverlayCancelling(task string) {
+	p.overlayMu.Lock()
+	defer p.overlayMu.Unlock()
+	if p.taskOverlay.TaskID == task {
+		p.taskOverlay.State = proto.Cancelling
+		if ipc := p.helperLink(); ipc != nil {
+			_ = ipc.send(0, "task.overlay", p.taskOverlay, nil)
+		}
 	}
 }
 
@@ -134,27 +155,23 @@ func (p *host) callHelperSession(ctx context.Context, session uint32, task, meth
 		defer timeout.Stop()
 		select {
 		case <-reply:
+			return captureReply{}, ctx.Err()
 		case <-ipc.done:
-			select {
-			case <-ipc.stopped:
-			case <-timeout.C:
-			}
 		case <-timeout.C:
 			_ = ipc.conn.Close()
 		}
+		ipc.waitStopped()
 		return captureReply{}, ctx.Err()
 	case <-ipc.done:
-		deadline := time.NewTimer(2 * time.Second)
-		defer deadline.Stop()
-		select {
-		case <-ipc.stopped:
-		case <-deadline.C:
-		}
+		ipc.waitStopped()
 		if err := ctx.Err(); err != nil {
 			return captureReply{}, err
 		}
 		return captureReply{}, taskFailure{proto.ErrHelperUnavailable, errors.New("Helper disconnected")}
 	case result := <-reply:
+		if err := ctx.Err(); err != nil {
+			return captureReply{}, err
+		}
 		if result.Error != "" {
 			code := proto.ErrInternal
 			switch result.Error {
@@ -166,9 +183,20 @@ func (p *host) callHelperSession(ctx context.Context, session uint32, task, meth
 				code = proto.ErrCapUnsupported
 			case "E_BUSY":
 				code = proto.ErrBusy
+			case "E_CANCELLED":
+				return captureReply{}, context.Canceled
 			}
 			return captureReply{}, taskFailure{code, errors.New(result.Error)}
 		}
 		return result, nil
+	}
+}
+
+func (l *helperLink) waitStopped() {
+	timeout := time.NewTimer(2 * time.Second)
+	defer timeout.Stop()
+	select {
+	case <-l.stopped:
+	case <-timeout.C:
 	}
 }

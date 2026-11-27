@@ -221,6 +221,8 @@ func read(ctx context.Context, desk *workbench.Service, user int64, device, tool
 		return nil, nil, err
 	case errors.Is(err, context.DeadlineExceeded):
 		return nil, nil, errors.New("等待设备诊断结果超时。")
+	case errors.Is(err, context.Canceled):
+		return nil, nil, errors.New("设备任务已取消。")
 	case err != nil:
 		return nil, nil, errors.New("设备诊断未完成。")
 	}

@@ -20,6 +20,8 @@ type host struct {
 	sentPct       *int
 	sentAC        *bool
 	ipc           *helperLink
+	overlayMu     sync.Mutex
+	taskOverlay   taskOverlay
 	controls      chan overlayControl
 	wake          chan struct{}
 	changed       chan struct{}

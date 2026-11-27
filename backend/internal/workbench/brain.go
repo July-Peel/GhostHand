@@ -217,6 +217,15 @@ func (s *Service) unregisterBrainSession(deviceID, taskID string) {
 	}
 }
 
+func (s *Service) cancelBrainSession(deviceID, taskID string) {
+	s.brainMu.Lock()
+	cancel := s.brainSessions[deviceID][taskID]
+	s.brainMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
 func (s *Service) cancelDeviceBrainSessions(deviceID string) {
 	s.brainMu.Lock()
 	tasks := s.brainSessions[deviceID]
@@ -255,9 +264,7 @@ func (s *Service) runBrain(parent context.Context, task brainTask) {
 	if strings.TrimSpace(reply) == "" {
 		reply = "模型未返回总结。"
 	}
-	finish, cancelFinish := context.WithTimeout(parent, 8*time.Second)
-	defer cancelFinish()
-	if err := s.finishBrain(finish, task, reply, state); err != nil {
+	if err := s.completeBrain(ctx, parent, task, reply, state); err != nil {
 		slog.Error("finish AI task", "task", task.id, "error", err)
 	}
 }
@@ -320,6 +327,23 @@ func (s *Service) awaitBrain(ctx context.Context, id string) error {
 	return ctx.Err()
 }
 
+func (s *Service) writeBrainReady(ctx context.Context, id string, write func(*sql.Tx) error) error {
+	for {
+		if err := s.awaitBrain(ctx, id); err != nil {
+			return err
+		}
+		err := s.store.Write(ctx, func(tx *sql.Tx) error {
+			if err := checkBrainReady(ctx, tx, id); err != nil {
+				return err
+			}
+			return write(tx)
+		})
+		if !errors.Is(err, errBrainWait) {
+			return err
+		}
+	}
+}
+
 func (s *Service) deviceAutoApprove(ctx context.Context, device string) bool {
 	var auto bool
 	_ = s.store.QueryRowContext(ctx, "SELECT auto_approve=1 FROM devices WHERE id=?", device).Scan(&auto)
@@ -359,10 +383,10 @@ func (s *Service) runLoop(ctx context.Context, task brainTask, unlock *taskUnloc
 	step, attempts := 0, 0
 	var observedWindow toolWindow
 	for round := 0; round <= brain.MaxSteps; round++ {
-		if err := s.awaitBrain(ctx, task.id); err != nil {
+		if err := s.showBrain(ctx, task, step, "等待模型返回"); err != nil {
 			return "", err
 		}
-		if err := s.showBrain(ctx, task, step, "等待模型返回"); err != nil && !errors.Is(err, errBrainWait) {
+		if err := s.awaitBrain(ctx, task.id); err != nil {
 			return "", err
 		}
 		turn, err := session.Next(ctx)

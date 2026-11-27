@@ -42,10 +42,7 @@ func (u *taskUnlock) retry(ctx context.Context, result proto.MCPResult, step int
 		return result, err
 	}
 	if t.source != "mcp" {
-		if err := s.store.Write(ctx, func(tx *sql.Tx) error {
-			if err := checkBrainReady(ctx, tx, t.id); err != nil {
-				return err
-			}
+		if err := s.writeBrainReady(ctx, t.id, func(tx *sql.Tx) error {
 			if _, err := tx.ExecContext(ctx, `INSERT INTO chat_messages(device_id,sender,type,task_id,text,created_at)
 				VALUES (?,'system','text',?,'检测到 Windows 桌面已锁屏，正在自动解锁…',?)`,
 				t.device, t.id, time.Now().UnixMilli()); err != nil {
@@ -55,6 +52,9 @@ func (u *taskUnlock) retry(ctx context.Context, result proto.MCPResult, step int
 		}); err != nil {
 			return result, err
 		}
+	}
+	if err := s.awaitBrain(ctx, t.id); err != nil {
+		return result, err
 	}
 	u.attempts++
 	outcome, err := s.desktopUnlocker.AutoUnlock(ctx, u.user, t.device, t.id, t.source)

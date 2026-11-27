@@ -12,10 +12,10 @@ import (
 )
 
 type taskWorker struct {
-	cancel context.CancelFunc
-	wake   chan struct{}
-	forced bool
-	lane   proto.Lane
+	cancel   context.CancelFunc
+	wake     chan struct{}
+	stopping bool
+	lane     proto.Lane
 }
 
 type taskCompletion struct {
@@ -43,6 +43,9 @@ func (a *agent) runTasks(ctx context.Context) {
 			slog.Error("read task journal", "error", err)
 			return
 		}
+		if a.local.takeHelperForce() {
+			a.platform.forceHelper()
+		}
 		ui, bg := 0, 0
 		for _, worker := range active {
 			if worker.lane == proto.UILane {
@@ -53,14 +56,17 @@ func (a *agent) runTasks(ctx context.Context) {
 		}
 		for _, task := range tasks {
 			if worker := active[task.TaskID]; worker != nil {
-				signal(worker.wake)
-				if task.Desired == "force" && !worker.forced {
-					worker.forced = true
-					a.platform.forceHelper()
-				}
-				if task.Desired == "cancel" || task.Desired == "force" || (task.Finish != nil && task.CallStarted) {
+				stopping := task.Desired == "cancel" || task.Desired == "force"
+				if stopping || (task.Finish != nil && task.CallStarted) {
 					worker.cancel()
 				}
+				if stopping && !worker.stopping {
+					worker.stopping = true
+					if worker.lane == proto.UILane {
+						a.platform.markOverlayCancelling(task.TaskID)
+					}
+				}
+				signal(worker.wake)
 			}
 		}
 		for _, task := range tasks {
@@ -143,12 +149,18 @@ func (a *agent) executeTask(ctx, process context.Context, task localTask, wake <
 		return a.local.finishTask(task.TaskID, result)
 	}
 	if err := a.local.changeTask(task.TaskID, func(record *localTask) error {
+		if record.Desired == "cancel" || record.Desired == "force" {
+			return context.Canceled
+		}
 		if record.State == proto.Queued {
 			record.State = proto.Running
 			return a.local.enqueueInLock(proto.TaskAccepted, proto.TaskRef{TaskID: task.TaskID})
 		}
 		return nil
 	}); err != nil {
+		if errors.Is(err, context.Canceled) {
+			return a.local.finishTask(task.TaskID, proto.TaskResultPayload{State: proto.Cancelled, ErrorCode: proto.ErrCancelled})
+		}
 		return err
 	}
 	if task.Capability == proto.BrainTask {
@@ -297,10 +309,8 @@ func (j *journal) applyLocalControl(record *localTask) error {
 			next = proto.Paused
 		}
 		record.Desired = ""
-		if next != record.State {
-			record.State = next
-			return j.enqueueInLock(proto.TaskHeartbeat, proto.TaskStatus{TaskID: record.TaskID, State: next, StepIndex: record.Step})
-		}
+		record.State = next
+		return j.enqueueInLock(proto.TaskHeartbeat, proto.TaskStatus{TaskID: record.TaskID, State: next, StepIndex: record.Step})
 	}
 	return nil
 }

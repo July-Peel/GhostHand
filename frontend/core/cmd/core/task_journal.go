@@ -123,6 +123,9 @@ func (j *journal) receiveTaskLocked(frame proto.Envelope) error {
 		action := "cancel"
 		if control.Force && task.Lane == proto.UILane {
 			action = "force"
+			if task.Desired != "force" {
+				j.forceHelperPending = true
+			}
 		}
 		setTaskDesired(&task, action)
 	case proto.UploadTicket:
@@ -176,6 +179,14 @@ func (j *journal) tasks() ([]localTask, error) {
 		tasks = append(tasks, task)
 	}
 	return tasks, nil
+}
+
+func (j *journal) takeHelperForce() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	pending := j.forceHelperPending
+	j.forceHelperPending = false
+	return pending
 }
 
 var errLocalTaskMissing = errors.New("local task no longer active")

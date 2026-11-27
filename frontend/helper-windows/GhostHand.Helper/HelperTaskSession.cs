@@ -181,6 +181,10 @@ internal sealed class HelperTaskSession(StreamReader reader, StreamWriter writer
 
         try
         {
+            if (cancel.IsCancellationRequested)
+            {
+                result = new { error = "E_CANCELLED" };
+            }
             await SendAsync(new { jsonrpc = "2.0", id, result }, lifetime.Token);
         }
         catch (Exception error) when (error is OperationCanceledException or IOException or ObjectDisposedException)

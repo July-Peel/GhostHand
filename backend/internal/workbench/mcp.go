@@ -155,28 +155,33 @@ func (s *Service) callMCP(ctx context.Context, user int64, device, tool string, 
 	if err != nil {
 		return result, err
 	}
-	wait, cancel := context.WithTimeout(ctx, ttl)
+	wait, cancel := context.WithTimeout(ctx, brainTaskTTL)
 	defer cancel()
+	deadline := taskDeadline{expires: time.Now().Add(ttl)}
 	for wait.Err() == nil {
 		changed := s.store.Changed()
 		var state proto.TaskState
 		var raw sql.NullString
 		err = s.store.QueryRowContext(wait, `SELECT state,(SELECT result_json FROM brain_calls WHERE task_id=tasks.id ORDER BY created_at DESC,id DESC LIMIT 1)
 			FROM tasks WHERE id=?`, taskID).Scan(&state, &raw)
+		if errors.Is(err, sql.ErrNoRows) {
+			return result, context.Canceled
+		}
 		if err != nil {
 			break
 		}
 		switch state {
-		case proto.Failed, proto.Expired, proto.Cancelled, proto.Unknown, proto.Succeeded:
+		case proto.Cancelling, proto.Cancelled:
+			return result, context.Canceled
+		case proto.Failed, proto.Expired, proto.Unknown, proto.Succeeded:
 			if raw.Valid && (state == proto.Succeeded || state == proto.Failed) {
 				err := json.Unmarshal([]byte(raw.String), &result)
 				return result, err
 			}
 			return result, errors.New("设备任务已结束，未返回诊断结果。")
 		}
-		select {
-		case <-changed:
-		case <-wait.Done():
+		if err = deadline.wait(wait, changed, state == proto.Paused); err != nil {
+			break
 		}
 	}
 	cleanup, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
@@ -190,18 +195,17 @@ func (s *Service) callMCP(ctx context.Context, user int64, device, tool string, 
 
 func (s *Service) runMCP(parent context.Context, task brainTask) {
 	var command mcpCommand
-	ttl := mcpTaskTTL
-	if json.Unmarshal([]byte(task.prompt), &command) == nil {
-		ttl = mcpTTL(command.Tool, command.Args, command.Quiet)
-	}
+	valid := json.Unmarshal([]byte(task.prompt), &command) == nil
 	task.quiet = command.Quiet
 	unlock := taskUnlock{service: s, task: task}
 	defer unlock.finish(parent)
-	ctx, cancel := context.WithTimeout(parent, ttl)
+	ctx, cancel := context.WithTimeout(parent, brainTaskTTL)
 	defer cancel()
+	s.registerBrainSession(task.device, task.id, cancel)
+	defer s.unregisterBrainSession(task.device, task.id)
 	go s.watchBrain(ctx, cancel, task.id)
 	state, message := proto.Failed, "外部 MCP 调用失败。"
-	if command.Tool != "" && IsMCPToolAllowed(command.Tool) {
+	if valid && IsMCPToolAllowed(command.Tool) {
 		attempt := 1
 		result, err := s.callDevice(ctx, task, 1, attempt, command.Tool, command.Args, toolLabel(command.Tool), "", true)
 		if err == nil {
@@ -214,9 +218,7 @@ func (s *Service) runMCP(parent context.Context, task brainTask) {
 	if parent.Err() != nil {
 		return
 	}
-	finish, cancelFinish := context.WithTimeout(parent, 5*time.Second)
-	defer cancelFinish()
-	if err := s.finishBrain(finish, task, message, state); err != nil {
+	if err := s.completeBrain(ctx, parent, task, message, state); err != nil {
 		slog.Error("finish MCP task", "task", task.id, "error", err)
 	}
 }

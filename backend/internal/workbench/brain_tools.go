@@ -11,10 +11,7 @@ import (
 )
 
 func (s *Service) showBrain(ctx context.Context, t brainTask, step int, label string) error {
-	return s.store.Write(ctx, func(tx *sql.Tx) error {
-		if err := checkBrainReady(ctx, tx, t.id); err != nil {
-			return err
-		}
+	return s.writeBrainReady(ctx, t.id, func(tx *sql.Tx) error {
 		_, err := Enqueue(ctx, tx, t.device, proto.MCPTaskDisplay, proto.TaskDisplay{
 			TaskID: t.id, Title: t.title, StepIndex: step, StepTotal: step, StepName: label, State: proto.Running,
 		})
@@ -40,49 +37,78 @@ func toolTimeout(tool string, args json.RawMessage) time.Duration {
 	return timeout
 }
 
+type taskDeadline struct {
+	expires  time.Time
+	pausedAt time.Time
+}
+
+func (d *taskDeadline) wait(ctx context.Context, changed <-chan struct{}, paused bool) error {
+	now := time.Now()
+	var due <-chan time.Time
+	if paused {
+		if d.pausedAt.IsZero() {
+			d.pausedAt = now
+		}
+	} else {
+		if !d.pausedAt.IsZero() {
+			d.expires = d.expires.Add(now.Sub(d.pausedAt))
+			d.pausedAt = time.Time{}
+		}
+		remaining := d.expires.Sub(now)
+		if remaining <= 0 {
+			return context.DeadlineExceeded
+		}
+		timer := time.NewTimer(remaining)
+		defer timer.Stop()
+		due = timer.C
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-changed:
+	case <-due:
+	}
+	return nil
+}
+
 func (s *Service) callDevice(ctx context.Context, t brainTask, step, attempt int, tool string, args json.RawMessage, label, window string, approved bool) (proto.MCPResult, error) {
 	id, err := proto.NewID()
 	if err != nil {
 		return proto.MCPResult{}, err
 	}
 	timeout := toolTimeout(tool, args)
-	now := time.Now().UnixMilli()
 	display := proto.TaskDisplay{TaskID: t.id, Title: t.title, StepIndex: step, StepTotal: step, StepName: label, State: proto.Running}
 	call := proto.MCPCall{CallID: id, TaskID: t.id, Tool: tool, Arguments: args, Display: display, Approved: approved, Window: window}
-	for {
-		if err := s.awaitBrain(ctx, t.id); err != nil {
-			return proto.MCPResult{}, err
+	err = s.writeBrainReady(ctx, t.id, func(tx *sql.Tx) error {
+		now := time.Now().UnixMilli()
+		if _, err := tx.ExecContext(ctx, "INSERT INTO brain_calls(id,task_id,tool,created_at) VALUES (?,?,?,?)", id, t.id, tool, now); err != nil {
+			return err
 		}
-		err = s.store.Write(ctx, func(tx *sql.Tx) error {
-			if err := checkBrainReady(ctx, tx, t.id); err != nil {
-				return err
-			}
-			if _, err := tx.ExecContext(ctx, "INSERT INTO brain_calls(id,task_id,tool,created_at) VALUES (?,?,?,?)", id, t.id, tool, now); err != nil {
-				return err
-			}
-			payload, _ := json.Marshal(proto.TaskProgressPayload{TaskID: t.id, StepIndex: step, StepTotal: step,
-				StepKey: tool, StepName: label, Status: "running", Attempt: attempt, Detail: label, TimeoutMS: timeout.Milliseconds()})
-			if err := ApplyTaskReport(ctx, tx, t.device, proto.Envelope{Type: proto.TaskProgress, Payload: payload}, now); err != nil {
-				return err
-			}
-			if _, err := Enqueue(ctx, tx, t.device, proto.MCPToolCall, call); err != nil {
-				return err
-			}
-			return RecordChange(ctx, tx, t.device)
-		})
-		if !errors.Is(err, errBrainWait) {
-			break
+		payload, _ := json.Marshal(proto.TaskProgressPayload{TaskID: t.id, StepIndex: step, StepTotal: step,
+			StepKey: tool, StepName: label, Status: "running", Attempt: attempt, Detail: label, TimeoutMS: timeout.Milliseconds()})
+		if err := ApplyTaskReport(ctx, tx, t.device, proto.Envelope{Type: proto.TaskProgress, Payload: payload}, now); err != nil {
+			return err
 		}
-	}
+		if _, err := Enqueue(ctx, tx, t.device, proto.MCPToolCall, call); err != nil {
+			return err
+		}
+		return RecordChange(ctx, tx, t.device)
+	})
 	if err != nil {
 		return proto.MCPResult{}, err
 	}
-	wait, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	for wait.Err() == nil {
+	// A call can be queued on the device without starting before a pause checkpoint.
+	deadline := taskDeadline{expires: time.Now().Add(timeout)}
+	for ctx.Err() == nil {
 		changed := s.store.Changed()
+		var state proto.TaskState
 		var result sql.NullString
-		if err := s.store.QueryRowContext(wait, "SELECT result_json FROM brain_calls WHERE id=? AND task_id=?", id, t.id).Scan(&result); err != nil {
+		err := s.store.QueryRowContext(ctx, `SELECT t.state,c.result_json FROM brain_calls c JOIN tasks t ON t.id=c.task_id
+			WHERE c.id=? AND t.id=?`, id, t.id).Scan(&state, &result)
+		if errors.Is(err, sql.ErrNoRows) || (err == nil && !brainActive(state)) {
+			return proto.MCPResult{}, errBrainInactive
+		}
+		if err != nil {
 			return proto.MCPResult{}, err
 		}
 		if result.Valid {
@@ -90,12 +116,11 @@ func (s *Service) callDevice(ctx context.Context, t brainTask, step, attempt int
 			err := json.Unmarshal([]byte(result.String), &value)
 			return value, err
 		}
-		select {
-		case <-wait.Done():
-		case <-changed:
+		if err := deadline.wait(ctx, changed, state == proto.Paused); err != nil {
+			return proto.MCPResult{}, err
 		}
 	}
-	return proto.MCPResult{}, wait.Err()
+	return proto.MCPResult{}, ctx.Err()
 }
 
 func recordToolResult(ctx context.Context, tx *sql.Tx, device, task string, raw json.RawMessage, now int64) error {
@@ -149,14 +174,42 @@ func recordToolResult(ctx context.Context, tx *sql.Tx, device, task string, raw 
 	return touchTask(ctx, tx, task, now)
 }
 
+func (s *Service) completeBrain(ctx, parent context.Context, t brainTask, reply string, state proto.TaskState) error {
+	for parent.Err() == nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return nil
+		}
+		if state == proto.Succeeded && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			state, reply = proto.Failed, "任务超时。请核对设备上的实际结果。"
+		}
+		changed := s.store.Changed()
+		finish, cancel := context.WithTimeout(parent, 8*time.Second)
+		err := s.finishBrain(finish, t, reply, state)
+		cancel()
+		if !errors.Is(err, errBrainWait) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+		case <-changed:
+		}
+	}
+	return nil
+}
+
 func (s *Service) finishBrain(ctx context.Context, t brainTask, reply string, state proto.TaskState) error {
 	return s.store.Write(ctx, func(tx *sql.Tx) error {
 		var current proto.TaskState
-		if err := tx.QueryRowContext(ctx, "SELECT state FROM tasks WHERE id=?", t.id).Scan(&current); err != nil {
+		var control string
+		err := tx.QueryRowContext(ctx, "SELECT state,control FROM tasks WHERE id=?", t.id).Scan(&current, &control)
+		if errors.Is(err, sql.ErrNoRows) || (err == nil && !brainActive(current)) {
+			return nil
+		}
+		if err != nil {
 			return err
 		}
-		if !brainActive(current) {
-			return nil
+		if state == proto.Succeeded && (current != proto.Running || control != "") {
+			return errBrainWait
 		}
 		now := time.Now().UnixMilli()
 		code := proto.ErrorCode("")

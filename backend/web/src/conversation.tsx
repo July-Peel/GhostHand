@@ -342,13 +342,13 @@ function TaskMessage({ card, device, session }: { card: TaskCard; device: Device
     },
   })
   const [now, setNow] = useState(Date.now)
-  const ticking = card.state === 'running' || card.state === 'paused' || card.state === 'cancelling'
+  const ticking = ['running', 'paused', 'waiting_user', 'cancelling'].includes(card.state)
   useEffect(() => {
     if (!ticking) return
     const timer = window.setInterval(() => setNow(Date.now()), 500)
     return () => window.clearInterval(timer)
   }, [ticking])
-  const awaitingForce = card.lane === 'ui' && card.control !== 'force' &&
+  const awaitingForce = !device.is_demo && card.lane === 'ui' && card.control !== 'force' && ticking &&
     (card.stalled || (card.state === 'cancelling' && card.cancel_at !== null && now >= card.cancel_at + 5000))
   const canCancel = !device.is_demo && ['dispatched', 'running', 'paused', 'waiting_user'].includes(card.state)
   const offline = device.conn_state === 'offline' || device.conn_state === 'sleeping'

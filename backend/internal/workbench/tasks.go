@@ -102,7 +102,7 @@ func (s *Service) dispatchTask(ctx context.Context) error {
 		}
 		if assignment.ExpiresAt <= now {
 			if seq.Valid {
-				if err := cancelQueuedAssignment(ctx, tx, device, assignment.TaskID, seq.Int64); err != nil {
+				if err := enqueueTaskCancel(ctx, tx, device, assignment.TaskID, false, true); err != nil {
 					return err
 				}
 			}
@@ -155,7 +155,7 @@ func RequeueUnacknowledged(ctx context.Context, tx *sql.Tx, device string) error
 }
 
 func (s *Service) Control(ctx context.Context, userID int64, device, task, action string) error {
-	return s.store.Write(ctx, func(tx *sql.Tx) error {
+	err := s.store.Write(ctx, func(tx *sql.Tx) error {
 		var state proto.TaskState
 		var lane proto.Lane
 		var capability proto.CapabilityID
@@ -202,11 +202,11 @@ func (s *Service) Control(ctx context.Context, userID int64, device, task, actio
 			return nil
 		case action == "cancel" && state == proto.Queued:
 			if seq.Valid {
-				if err := cancelQueuedAssignment(ctx, tx, device, task, seq.Int64); err != nil {
+				if err := enqueueTaskCancel(ctx, tx, device, task, false, true); err != nil {
 					return err
 				}
 			}
-			if err := finishTask(ctx, tx, task, proto.Cancelled, "", now); err != nil {
+			if err := finishTask(ctx, tx, task, proto.Cancelled, proto.ErrCancelled, now); err != nil {
 				return err
 			}
 		default:
@@ -222,17 +222,28 @@ func (s *Service) Control(ctx context.Context, userID int64, device, task, actio
 		}
 		return RecordChange(ctx, tx, device)
 	})
+	if err == nil && (action == "cancel" || action == "force") {
+		s.cancelBrainSession(device, task)
+	}
+	return err
 }
 
-func cancelQueuedAssignment(ctx context.Context, tx *sql.Tx, device, task string, seq int64) error {
-	// Reuse the unacknowledged sequence without assigning expired or withdrawn work.
+func enqueueTaskCancel(ctx context.Context, tx *sql.Tx, device, task string, force, withdraw bool) error {
+	control := proto.TaskControl{TaskID: task, Force: force}
+	payload, err := json.Marshal(control)
+	if err != nil {
+		return err
+	}
+	// Preserve sequence numbers while withdrawing work the node has not acknowledged.
 	if _, err := tx.ExecContext(ctx, `UPDATE outbox SET envelope_json=json_set(envelope_json,
-		'$.type', ?, '$.payload', json_object('task_id',?)) WHERE device_id=? AND seq=?`,
-		proto.TaskCancel, task, device, seq); err != nil {
+		'$.type', 'task.cancel', '$.payload', json(?)) WHERE device_id=?
+		AND json_extract(envelope_json,'$.payload.task_id')=?
+		AND (json_extract(envelope_json,'$.type')='mcp.tool_call' OR (? AND json_extract(envelope_json,'$.type')='task.assign'))`,
+		string(payload), device, task, withdraw); err != nil {
 		return err
 	}
 	// A peer may already have received the original frame before it acknowledged it.
-	_, err := Enqueue(ctx, tx, device, proto.TaskCancel, proto.TaskControl{TaskID: task})
+	_, err = Enqueue(ctx, tx, device, proto.TaskCancel, control)
 	return err
 }
 
@@ -274,11 +285,22 @@ func requestControl(ctx context.Context, tx *sql.Tx, device, task string, state 
 	default:
 		return ErrTaskControl
 	}
-	if _, err := Enqueue(ctx, tx, device, kind, control); err != nil {
+	var err error
+	if kind == proto.TaskCancel {
+		err = enqueueTaskCancel(ctx, tx, device, task, control.Force, false)
+	} else {
+		_, err = Enqueue(ctx, tx, device, kind, control)
+	}
+	if err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, "UPDATE tasks SET state=?,control=?,cancel_at=? WHERE id=?", state, action, cancelAt, task); err != nil {
 		return err
+	}
+	if state == proto.Cancelling {
+		if err := closeTaskConfirmations(ctx, tx, task, now); err != nil {
+			return err
+		}
 	}
 	details := map[string]string{"pause": "请求在当前步骤结束后暂停", "resume": "请求继续任务",
 		"cancel": "请求终止任务", "force": "请求强制终止任务"}
@@ -296,7 +318,7 @@ func finishTask(ctx context.Context, tx *sql.Tx, task string, state proto.TaskSt
 		WHERE task_id=? AND status='running' AND attempt>0`, state, now, task); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, "UPDATE confirmations SET decision='cancelled',decided_at=? WHERE task_id=? AND decision='pending'", now, task); err != nil {
+	if err := closeTaskConfirmations(ctx, tx, task, now); err != nil {
 		return err
 	}
 	details := map[proto.TaskState]string{
@@ -304,4 +326,9 @@ func finishTask(ctx context.Context, tx *sql.Tx, task string, state proto.TaskSt
 		proto.Failed: "任务执行失败", proto.Unknown: "执行结果待核实",
 	}
 	return addTaskEvent(ctx, tx, task, "result", string(state), details[state], now)
+}
+
+func closeTaskConfirmations(ctx context.Context, tx *sql.Tx, task string, now int64) error {
+	_, err := tx.ExecContext(ctx, "UPDATE confirmations SET decision='cancelled',decided_at=? WHERE task_id=? AND decision='pending'", now, task)
+	return err
 }

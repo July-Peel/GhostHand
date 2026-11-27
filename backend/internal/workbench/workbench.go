@@ -199,7 +199,7 @@ func (s *Service) SetAutoApprove(ctx context.Context, userID int64, deviceID str
 		now := time.Now().UnixMilli()
 		if enabled {
 			if _, err := tx.ExecContext(ctx, `UPDATE confirmations SET decision='approved', decided_at=?
-				WHERE decision='pending' AND task_id IN (SELECT id FROM tasks WHERE device_id=? AND state='waiting_user')`, now, deviceID); err != nil {
+				WHERE decision='pending' AND task_id IN (SELECT id FROM tasks WHERE device_id=? AND state IN ('waiting_user','paused'))`, now, deviceID); err != nil {
 				return err
 			}
 			if _, err := tx.ExecContext(ctx, `UPDATE tasks SET state='running' WHERE device_id=? AND state='waiting_user'`, deviceID); err != nil {
@@ -375,6 +375,7 @@ func (s *Service) Send(ctx context.Context, userID int64, deviceID, text string)
 func (s *Service) ClearMessages(ctx context.Context, userID int64, deviceID string) error {
 	type localFile struct{ key, thumb string }
 	var localFiles []localFile
+	var stopped []string
 	err := s.store.Write(ctx, func(tx *sql.Tx) error {
 		var exists bool
 		if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM devices WHERE id=? AND (is_demo=0 OR ?))",
@@ -385,7 +386,7 @@ func (s *Service) ClearMessages(ctx context.Context, userID int64, deviceID stri
 			return ErrDeviceNotFound
 		}
 
-		rows, err := tx.QueryContext(ctx, `SELECT t.id, t.lane, t.assign_seq
+		rows, err := tx.QueryContext(ctx, `SELECT t.id, t.control='force'
 			FROM tasks t JOIN devices d ON d.id=t.device_id
 			WHERE t.device_id=? AND d.is_demo=0 AND t.assign_seq IS NOT NULL
 			AND t.state IN ('queued','dispatched','running','paused','waiting_user','cancelling')`, deviceID)
@@ -393,14 +394,13 @@ func (s *Service) ClearMessages(ctx context.Context, userID int64, deviceID stri
 			return err
 		}
 		type activeAssign struct {
-			id   string
-			lane proto.Lane
-			seq  int64
+			id    string
+			force bool
 		}
 		var active []activeAssign
 		for rows.Next() {
 			var item activeAssign
-			if err := rows.Scan(&item.id, &item.lane, &item.seq); err != nil {
+			if err := rows.Scan(&item.id, &item.force); err != nil {
 				rows.Close()
 				return err
 			}
@@ -411,17 +411,10 @@ func (s *Service) ClearMessages(ctx context.Context, userID int64, deviceID stri
 			return err
 		}
 		for _, item := range active {
-			if _, err := tx.ExecContext(ctx, `UPDATE outbox SET envelope_json=json_set(envelope_json,
-				'$.type', ?, '$.payload', json_object('task_id',?)) WHERE device_id=? AND seq=?`,
-				proto.TaskCancel, item.id, deviceID, item.seq); err != nil {
+			if err := enqueueTaskCancel(ctx, tx, deviceID, item.id, item.force, true); err != nil {
 				return err
 			}
-			if _, err := Enqueue(ctx, tx, deviceID, proto.TaskCancel, proto.TaskControl{
-				TaskID: item.id,
-				Force:  item.lane == proto.UILane,
-			}); err != nil {
-				return err
-			}
+			stopped = append(stopped, item.id)
 		}
 
 		attRows, err := tx.QueryContext(ctx, `SELECT a.storage_key, a.thumb_key
@@ -458,7 +451,9 @@ func (s *Service) ClearMessages(ctx context.Context, userID int64, deviceID stri
 	if err != nil {
 		return err
 	}
-	s.cancelDeviceBrainSessions(deviceID)
+	for _, task := range stopped {
+		s.cancelBrainSession(deviceID, task)
+	}
 	local := storage.Local{Directory: s.fileDir}
 	for _, f := range localFiles {
 		_ = local.Delete(ctx, f.key)

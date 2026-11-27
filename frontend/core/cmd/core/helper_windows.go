@@ -356,12 +356,17 @@ func (h *helperProcess) serve(ctx context.Context, p *host, registered chan stru
 			waiting: make(map[int]chan captureReply), mcp: request.Params.MCP, browserBridge: request.Params.BrowserBridge,
 			lockDesktop: request.Params.LockDesktop, session: h.session}
 		if request.Params.Tasks {
+			p.overlayMu.Lock()
 			p.mu.Lock()
 			p.ipc = link
 			p.mu.Unlock()
+			if p.taskOverlay.Visible {
+				_ = link.send(0, "task.overlay", p.taskOverlay, nil)
+			}
+			p.overlayMu.Unlock()
 		}
 		signal(registered)
-		err = p.readHelper(link, reader)
+		err = p.readHelper(ctx, link, reader)
 		p.mu.Lock()
 		if p.ipc == link {
 			p.ipc = nil
@@ -375,7 +380,7 @@ func (h *helperProcess) serve(ctx context.Context, p *host, registered chan stru
 	return ctx.Err()
 }
 
-func (p *host) readHelper(link *helperLink, reader *bufio.Scanner) error {
+func (p *host) readHelper(ctx context.Context, link *helperLink, reader *bufio.Scanner) error {
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		var frame struct {
@@ -406,7 +411,8 @@ func (p *host) readHelper(link *helperLink, reader *bufio.Scanner) error {
 			}
 			select {
 			case p.controls <- control:
-			default:
+			case <-ctx.Done():
+				return ctx.Err()
 			}
 		case frame.Method == "" && frame.ID > 0:
 			var reply captureReply
