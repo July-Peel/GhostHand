@@ -99,7 +99,7 @@ func (t *windowsTerminal) startShell(ctx context.Context, shell proto.TerminalSh
 	args := ""
 	if shell == proto.TerminalShellPowerShell {
 		exe = filepath.Join(system32, "WindowsPowerShell", "v1.0", "powershell.exe")
-		args = " -NoLogo"
+		args = " -NoLogo -ExecutionPolicy Bypass"
 	}
 	app, err := windows.UTF16PtrFromString(exe)
 	if err != nil {
@@ -110,31 +110,21 @@ func (t *windowsTerminal) startShell(ctx context.Context, shell proto.TerminalSh
 		return err
 	}
 	cwd := os.Getenv("USERPROFILE")
-	var token windows.Token
-	var env *uint16
 	if isCurrentSystem() {
 		if _, user, ok := interactiveSession(); ok {
-			defer user.Close()
-			token = user
-			if elevated, duplicated := elevateUserToken(user, false); duplicated {
-				token = elevated
-				defer elevated.Close()
+			if dir, err := user.GetUserProfileDirectory(); err == nil && dir != "" {
+				cwd = dir
 			}
-			cwd, err = token.GetUserProfileDirectory()
-			if err != nil {
-				return fmt.Errorf("获取桌面用户目录：%w", err)
-			}
-			if err := windows.CreateEnvironmentBlock(&env, token, false); err != nil {
-				return fmt.Errorf("获取桌面用户环境：%w", err)
-			}
-			defer windows.DestroyEnvironmentBlock(env)
+			user.Close()
 		}
 	}
 	if cwd == "" {
-		cwd, err = windows.GetCurrentProcessToken().GetUserProfileDirectory()
-		if err != nil {
-			return fmt.Errorf("获取当前用户目录：%w", err)
+		if dir, err := windows.GetCurrentProcessToken().GetUserProfileDirectory(); err == nil && dir != "" {
+			cwd = dir
 		}
+	}
+	if info, err := os.Stat(cwd); err != nil || !info.IsDir() {
+		cwd = system32
 	}
 	directory, err := windows.UTF16PtrFromString(cwd)
 	if err != nil {
@@ -151,16 +141,13 @@ func (t *windowsTerminal) startShell(ctx context.Context, shell proto.TerminalSh
 	}
 	startup := windows.StartupInfoEx{ProcThreadAttributeList: attrs.List()}
 	startup.Cb = uint32(unsafe.Sizeof(startup))
+	startup.Flags = windows.STARTF_USESTDHANDLES
 	var pi windows.ProcessInformation
 	const flags = windows.EXTENDED_STARTUPINFO_PRESENT | windows.CREATE_UNICODE_ENVIRONMENT | windows.CREATE_SUSPENDED
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if token != 0 {
-		err = windows.CreateProcessAsUser(token, app, commandLine, nil, nil, false, flags, env, directory, &startup.StartupInfo, &pi)
-	} else {
-		err = windows.CreateProcess(app, commandLine, nil, nil, false, flags, nil, directory, &startup.StartupInfo, &pi)
-	}
+	err = windows.CreateProcess(app, commandLine, nil, nil, false, flags, nil, directory, &startup.StartupInfo, &pi)
 	if err != nil {
 		return fmt.Errorf("启动 Shell：%w", err)
 	}
