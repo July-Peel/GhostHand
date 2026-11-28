@@ -33,6 +33,9 @@ func New(desk *workbench.Service) Gateway {
 		device := r.URL.Query().Get("device")
 		server := mcp.NewServer(&mcp.Implementation{Name: "ghosthand", Version: "0.4.5"}, nil)
 		addDevicesTool(server, desk)
+		for _, tool := range workbench.MCPSSHConnectionTools {
+			addTool(server, desk, user, device, tool)
+		}
 		for _, tool := range proto.DeviceTools {
 			if workbench.IsMCPToolAllowed(tool.Name) {
 				addTool(server, desk, user, device, tool)

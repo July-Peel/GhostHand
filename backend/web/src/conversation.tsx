@@ -1,13 +1,13 @@
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { ClipboardEvent, DragEvent, FormEvent, KeyboardEvent, ReactNode } from 'react'
 import { useInfiniteQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Activity, ArrowLeft, ArrowUp, BatteryCharging, Camera, Check, ChevronDown, CircleAlert, Copy, Download, Info, LoaderCircle, Plus, Send, Shield, Terminal, Trash2, X, Zap } from 'lucide-react'
+import { Activity, ArrowLeft, ArrowUp, BatteryCharging, Camera, Check, ChevronDown, CircleAlert, Copy, Download, Info, LoaderCircle, Plug, PlugZap, Plus, Send, Shield, Terminal, Trash2, X, Zap } from 'lucide-react'
 import { api, devicesKey, errorText, FREE_CHAT_ID, messagesKey } from './api'
 import type { Command, ConfirmCard, Device, MediaCard, Message, Session, StatusCard, TaskAction, TaskCard } from './api'
 import { Battery, Connection, Details, DeviceIcon, Panel, desktops } from './device-ui'
 import { detectMentionQuery, deviceMentionTokens, renderDeviceMentions } from './device-mentions'
 import { BrowserExtensionSection, DeviceOperations, SSHSection } from './agent-ui'
-import { agentAPI, connectionKey } from './agent-api'
+import { agentAPI, connectionKey, sshKey } from './agent-api'
 import { RDPSection } from './rdp-ui'
 import { MarkdownContent } from './markdown'
 import { acceptedChatImages, maxChatImages, prepareChatImage } from './chat-images'
@@ -46,6 +46,7 @@ export function Conversation({ device, devices, commands, session, opened, back 
   const isFreeChat = device.id === FREE_CHAT_ID
   const isWindowsDevice = !isFreeChat && !device.is_demo && device.platform === 'windows'
   const isLinuxDevice = !isFreeChat && !device.is_demo && device.platform === 'linux'
+  const isSSHDevice = isLinuxDevice && device.ssh_managed
   const isAgentAICapable = isWindowsDevice || isLinuxDevice
   const terminalOnline = device.conn_state === 'online' || device.conn_state === 'unstable'
   const chatBusy = isFreeChat && device.task_state !== 'idle'
@@ -117,6 +118,16 @@ export function Conversation({ device, devices, commands, session, opened, back 
       void client.invalidateQueries({ queryKey: devicesKey })
       void client.invalidateQueries({ queryKey: key })
     },
+  })
+
+  const sshConnection = useMutation({
+    mutationFn: (disconnect: boolean) => disconnect
+      ? agentAPI.disconnectSSH(device.id, session.csrf_token)
+      : agentAPI.reconnectSSH(device.id, session.csrf_token),
+    onSettled: () => Promise.all([
+      client.invalidateQueries({ queryKey: devicesKey }),
+      client.invalidateQueries({ queryKey: sshKey(device.id) }),
+    ]),
   })
 
   const clear = useMutation({
@@ -340,6 +351,15 @@ export function Conversation({ device, devices, commands, session, opened, back 
         </div>
         <div className="chat-header-actions">
           {device.task_state === 'running' && <span className="active-task"><LoaderCircle size={14} className="spin" /> {isFreeChat ? '思考中' : '执行中'}</span>}
+          {isSSHDevice && (
+            <button type="button" className="terminal-launch-button" disabled={sshConnection.isPending || device.revoked}
+              title={terminalOnline ? '断开 SSH 连接' : '连接 SSH 设备'}
+              onClick={() => sshConnection.mutate(terminalOnline)}>
+              {sshConnection.isPending ? <LoaderCircle size={13} className="spin" aria-hidden="true" />
+                : terminalOnline ? <PlugZap size={13} aria-hidden="true" /> : <Plug size={13} aria-hidden="true" />}
+              <span>{sshConnection.isPending ? (sshConnection.variables ? '正在断开…' : '正在连接…') : (terminalOnline ? '断开' : '连接')}</span>
+            </button>
+          )}
           {isWindowsDevice && (['cmd', 'powershell'] as const).map(shell => (
             <button
               key={shell}
@@ -394,6 +414,7 @@ export function Conversation({ device, devices, commands, session, opened, back 
           {!isFreeChat && <button type="button" className="icon-button" title="设备详情" aria-label="设备详情" onClick={() => setDetails(true)}><Info size={19} /></button>}
         </div>
       </header>
+      {isSSHDevice && sshConnection.isError && <p className="inline-error ssh-connection-error" role="alert"><CircleAlert size={15} />{errorText(sshConnection.error)}</p>}
       <div
         className="conversation-scroll"
         ref={scroller}

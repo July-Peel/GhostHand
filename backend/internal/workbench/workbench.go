@@ -144,6 +144,8 @@ func commandFor(capability proto.CapabilityID) Command {
 
 type SSHExecutor interface {
 	IsSSHDevice(ctx context.Context, deviceID string) bool
+	ConnectSSH(ctx context.Context, userID int64, deviceID string) error
+	DisconnectSSH(ctx context.Context, userID int64, deviceID string) error
 	ExecuteSSHTool(ctx context.Context, deviceID string, call proto.MCPCall) (proto.MCPResult, error)
 }
 

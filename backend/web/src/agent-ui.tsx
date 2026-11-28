@@ -381,7 +381,7 @@ export function PairingPanel({ session, devices, onSelectDevice, close }: {
       <div role="tabpanel" id={panelId + '-SSH'} aria-labelledby={panelId + '-tab-SSH'} hidden={platform !== 'SSH'}>
         <section className="agent-section">
           <h3>SSH 零客户端接入 Linux</h3>
-          <p>无需在目标 Linux 上安装客户端，可选择由某台已连接设备的 Agent 在本地直接完成 SSH 登录，或由服务端直接登录。</p>
+          <p>无需在目标 Linux 上安装客户端。添加设备后，在聊天页点击「连接」，由所选宿主 Agent 或服务端发起 SSH 登录。</p>
           <form className="rdp-form" onSubmit={event => {
             event.preventDefault()
             if (!createSSH.isPending) createSSH.mutate()
@@ -446,7 +446,7 @@ export function PairingPanel({ session, devices, onSelectDevice, close }: {
             {createSSH.isError && <p role="alert">{errorText(createSSH.error)}</p>}
             <div className="agent-actions">
               <button type="submit" className="primary-button" disabled={createSSH.isPending || !sshName.trim() || !sshHost.trim() || !sshUsername.trim() || !sshSecret}>
-                {createSSH.isPending ? <><LoaderCircle size={15} className="spin" /> 正在连接…</> : '连接并接入'}
+                {createSSH.isPending ? <><LoaderCircle size={15} className="spin" /> 正在添加…</> : '添加 SSH 设备'}
               </button>
             </div>
           </form>
@@ -505,7 +505,6 @@ export function SSHSection({ device, devices, session }: { device: Device; devic
       auth_kind: authKind,
       secret,
       host_agent_id: hostAgentID,
-      enabled: true,
     }, session.csrf_token),
     onSuccess: updated => {
       setSecret('')
@@ -528,7 +527,7 @@ export function SSHSection({ device, devices, session }: { device: Device; devic
       {data.last_error && <p role="alert">{data.last_error}</p>}
       <div className="agent-actions">
         <button type="button" className="secondary-button" disabled={busy} onClick={() => reconnect.mutate()}>
-          {reconnect.isPending ? '正在重连…' : '重新连接'}
+          {reconnect.isPending ? '正在连接…' : (device.conn_state === 'online' || device.conn_state === 'unstable' ? '重新连接' : '连接')}
         </button>
         <button type="button" className="text-button" disabled={busy || !data.enabled} onClick={() => disconnect.mutate()}>
           {disconnect.isPending ? '正在断开…' : '断开连接'}
@@ -589,10 +588,10 @@ export function SSHSection({ device, devices, session }: { device: Device; devic
             </select>
           </label>
           {save.isError && <p role="alert">{errorText(save.error)}</p>}
-          {save.isSuccess && <p role="status">SSH 配置已保存并触发重连。</p>}
+          {save.isSuccess && <p role="status">SSH 配置已保存，可按需连接。</p>}
           <div className="agent-actions">
             <button type="submit" className="secondary-button" disabled={busy || !host.trim() || !username.trim()}>
-              {save.isPending ? '保存中…' : '保存并重连'}
+              {save.isPending ? '保存中…' : '保存配置'}
             </button>
           </div>
         </form>

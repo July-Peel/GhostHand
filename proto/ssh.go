@@ -17,6 +17,7 @@ const (
 
 type SSHConnectPayload struct {
 	SSHDeviceID string `json:"ssh_device_id"`
+	AttemptID   string `json:"attempt_id,omitempty"` // An explicit login that ends when the SSH connection drops.
 	Host        string `json:"host"`
 	Port        int    `json:"port"`
 	Username    string `json:"username"`
@@ -31,6 +32,7 @@ type SSHDisconnectPayload struct {
 
 type SSHStatePayload struct {
 	SSHDeviceID string    `json:"ssh_device_id"`
+	AttemptID   string    `json:"attempt_id,omitempty"`
 	State       ConnState `json:"state"`
 	OSVersion   string    `json:"os_version,omitempty"`
 	Arch        string    `json:"arch,omitempty"`

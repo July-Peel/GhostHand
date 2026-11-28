@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"net/http"
@@ -13,6 +14,30 @@ import (
 	"ghosthand/backend/internal/workbench"
 	"ghosthand/proto"
 )
+
+type sshConnectionStub struct {
+	device string
+	user   int64
+	state  proto.ConnState
+}
+
+func (s *sshConnectionStub) IsSSHDevice(_ context.Context, device string) bool {
+	return device == "ssh1"
+}
+
+func (s *sshConnectionStub) ConnectSSH(_ context.Context, user int64, device string) error {
+	s.user, s.device, s.state = user, device, proto.Online
+	return nil
+}
+
+func (s *sshConnectionStub) DisconnectSSH(_ context.Context, user int64, device string) error {
+	s.user, s.device, s.state = user, device, proto.Offline
+	return nil
+}
+
+func (s *sshConnectionStub) ExecuteSSHTool(context.Context, string, proto.MCPCall) (proto.MCPResult, error) {
+	panic("SSH connection management must run on the controller")
+}
 
 func TestMCPGatewayExposesAllToolsAndResources(t *testing.T) {
 	ctx := t.Context()
@@ -31,6 +56,8 @@ func TestMCPGatewayExposesAllToolsAndResources(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	ssh := &sshConnectionStub{}
+	desk.SetSSHExecutor(ssh)
 
 	toolsJSON, _ := json.Marshal(proto.DeviceTools)
 	resJSON, _ := json.Marshal(proto.DeviceResources)
@@ -47,21 +74,28 @@ func TestMCPGatewayExposesAllToolsAndResources(t *testing.T) {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO device_credentials(device_id,token_hash,rotated_at) VALUES ('win1','hash',1)`); err != nil {
 			return err
 		}
-		return nil
+		if _, err := tx.ExecContext(ctx, `INSERT INTO devices
+			(id,name,platform,arch,os_version,group_name,conn_state,helper_state,desktop_state,last_seen_at)
+			VALUES ('ssh1','SSH Test','linux','amd64','Linux','default','offline','none','headless',1)`); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `INSERT INTO device_credentials(device_id,token_hash,rotated_at) VALUES ('ssh1','ssh-hash',1)`)
+		return err
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	gw := New(desk)
-	callMCP := func(method string) map[string]any {
+	callMCP := func(path, method string, params map[string]any) map[string]any {
+		t.Helper()
 		body, _ := json.Marshal(map[string]any{
 			"jsonrpc": "2.0",
 			"id":      1,
 			"method":  method,
-			"params":  map[string]any{},
+			"params":  params,
 		})
-		req := httptest.NewRequest(http.MethodPost, "/api/mcp?device=win1", bytes.NewReader(body))
+		req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json, text/event-stream")
 		req = WithUser(req, 1)
@@ -77,15 +111,41 @@ func TestMCPGatewayExposesAllToolsAndResources(t *testing.T) {
 		return out
 	}
 
-	toolsResp := callMCP("tools/list")
+	toolsResp := callMCP("/api/mcp?device=win1", "tools/list", nil)
 	toolsList := toolsResp["result"].(map[string]any)["tools"].([]any)
-	if len(toolsList) != len(proto.DeviceTools)+1 {
-		t.Fatalf("exposed MCP tools = %d, want %d including devices_list", len(toolsList), len(proto.DeviceTools)+1)
+	wantTools := len(proto.DeviceTools) + len(workbench.MCPSSHConnectionTools) + 1
+	if len(toolsList) != wantTools {
+		t.Fatalf("exposed MCP tools = %d, want %d including devices_list and SSH connection tools", len(toolsList), wantTools)
 	}
 
-	resResp := callMCP("resources/list")
+	resResp := callMCP("/api/mcp?device=win1", "resources/list", nil)
 	resList := resResp["result"].(map[string]any)["resources"].([]any)
 	if len(resList) != len(proto.DeviceResources) {
 		t.Fatalf("exposed MCP resources = %d, want %d", len(resList), len(proto.DeviceResources))
 	}
+
+	callSSH := func(path, tool string, args map[string]string) map[string]any {
+		t.Helper()
+		response := callMCP(path, "tools/call", map[string]any{"name": tool, "arguments": args})
+		result, ok := response["result"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s response: %v", tool, response)
+		}
+		return result
+	}
+	checkConnection := func(result map[string]any, want proto.ConnState) {
+		t.Helper()
+		data, _ := result["structuredContent"].(map[string]any)
+		if data["device_id"] != "ssh1" || data["conn_state"] != string(want) || ssh.user != 1 || ssh.device != "ssh1" || ssh.state != want {
+			t.Fatalf("SSH tool result=%v, executor=%+v, want device ssh1, user 1, state %s", result, ssh, want)
+		}
+	}
+	checkConnection(callSSH("/api/mcp", "ssh_connect", map[string]string{"device_id": "SSH Test"}), proto.Online)
+	if result := callSSH("/api/mcp?device=win1", "ssh_disconnect", map[string]string{}); result["isError"] != true || ssh.state != proto.Online {
+		t.Fatalf("SSH tool accepted a native Agent: %+v", result)
+	}
+	if result := callSSH("/api/mcp?device=ssh1", "ssh_disconnect", map[string]string{"host": "unused"}); result["isError"] != true || ssh.state != proto.Online {
+		t.Fatalf("SSH tool accepted an extra parameter: %+v", result)
+	}
+	checkConnection(callSSH("/api/mcp?device=ssh1", "ssh_disconnect", map[string]string{}), proto.Offline)
 }

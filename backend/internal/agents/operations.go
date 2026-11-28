@@ -72,8 +72,9 @@ func (s *Service) History(ctx context.Context, id string) (RealtimeDevice, error
 }
 
 func (s *Service) Revoke(ctx context.Context, user int64, id string) error {
+	s.sshMu.Lock()
+	defer s.sshMu.Unlock()
 	s.connectionMu.Lock()
-	defer s.connectionMu.Unlock()
 	err := s.store.Write(ctx, func(tx *sql.Tx) error {
 		now := time.Now().UnixMilli()
 		result, err := tx.ExecContext(ctx, "UPDATE device_credentials SET revoked_at=?,pending_hash=NULL WHERE device_id=? AND revoked_at IS NULL", now, id)
@@ -96,6 +97,9 @@ func (s *Service) Revoke(ctx context.Context, user int64, id string) error {
 		if _, err := tx.ExecContext(ctx, "UPDATE devices SET conn_state='offline' WHERE id=?", id); err != nil {
 			return err
 		}
+		if _, err := tx.ExecContext(ctx, "UPDATE device_ssh_credentials SET enabled=0 WHERE device_id=?", id); err != nil {
+			return err
+		}
 		if err := audit(ctx, tx, user, id, "device.revoke", "{}", now); err != nil {
 			return err
 		}
@@ -105,7 +109,12 @@ func (s *Service) Revoke(ctx context.Context, user int64, id string) error {
 		if p := s.connections[id]; p != nil {
 			_ = p.conn.CloseNow()
 		}
-		go s.disconnectSSHIfManaged(context.Background(), id)
+	}
+	s.connectionMu.Unlock()
+	if err == nil {
+		if attempt := s.sshAttempts[id]; attempt != nil {
+			s.stopSSHAttempt(id, attempt, errors.New("设备凭据已吊销"))
+		}
 	}
 	return err
 }
@@ -136,15 +145,15 @@ func (s *Service) DeleteDevice(ctx context.Context, user int64, id string) ([]wo
 	if id == workbench.FreeChatDeviceID {
 		return nil, ErrMissing
 	}
+	s.sshMu.Lock()
+	defer s.sshMu.Unlock()
 	s.connectionMu.Lock()
-	defer s.connectionMu.Unlock()
 	if s.connections[id] != nil {
+		s.connectionMu.Unlock()
 		return nil, ErrDeviceOnline
 	}
 	var files []workbench.AttachmentFiles
 	var logIDs []string
-	var sshHostAgent sql.NullString
-	var isSSH bool
 	err := s.store.Write(ctx, func(tx *sql.Tx) error {
 		var connState proto.ConnState
 		var name string
@@ -158,10 +167,6 @@ func (s *Service) DeleteDevice(ctx context.Context, user int64, id string) ([]wo
 		if connState == proto.Online {
 			return ErrDeviceOnline
 		}
-		if err := tx.QueryRowContext(ctx, "SELECT host_agent_id FROM device_ssh_credentials WHERE device_id=?", id).Scan(&sshHostAgent); err == nil {
-			isSSH = true
-		}
-
 		files, err = workbench.DeviceAttachmentFiles(ctx, tx, id)
 		if err != nil {
 			return err
@@ -197,12 +202,12 @@ func (s *Service) DeleteDevice(ctx context.Context, user int64, id string) ([]wo
 		detail, _ := json.Marshal(map[string]string{"deleted_device_id": id, "name": name})
 		return audit(ctx, tx, user, nil, "device.delete", string(detail), time.Now().UnixMilli())
 	})
+	s.connectionMu.Unlock()
 	if err != nil {
 		return nil, err
 	}
-	if isSSH {
-		s.dispatchSSHDisconnect(sshHostAgent.String, id)
-		s.closeLocalSSHTerminals(id)
+	if attempt := s.sshAttempts[id]; attempt != nil {
+		s.stopSSHAttempt(id, attempt, errors.New("SSH 设备已删除"))
 	}
 	logDir := filepath.Join(s.dir, "logs")
 	for _, opID := range logIDs {

@@ -31,6 +31,7 @@ type TerminalSession struct {
 	service        *Service
 	id             string
 	targetDeviceID string
+	sshAttempt     *sshAttempt
 	events         chan TerminalEvent
 	done           chan struct{}
 	opened         bool
@@ -38,6 +39,7 @@ type TerminalSession struct {
 	// Direct server-side SSH terminal fields (used when peer == nil).
 	localRunner *sshrunner.Manager
 	localCmds   chan sshrunner.TerminalCommand
+	localCtx    context.Context
 	localCancel context.CancelFunc
 	localOnce   sync.Once
 }
@@ -50,11 +52,12 @@ func (s *Service) ReserveTerminal(ctx context.Context, device string) (*Terminal
 	}
 	var platform proto.Platform
 	var state proto.ConnState
-	var demo bool
+	var demo, sshManaged bool
 	var gen uint64
-	err := s.store.QueryRowContext(ctx, `SELECT d.platform,d.is_demo,d.conn_state,d.conn_gen FROM devices d
+	err := s.store.QueryRowContext(ctx, `SELECT d.platform,d.is_demo,d.conn_state,d.conn_gen,
+		EXISTS(SELECT 1 FROM device_ssh_credentials WHERE device_id=d.id) FROM devices d
 		LEFT JOIN device_credentials c ON c.device_id=d.id WHERE d.id=? AND c.revoked_at IS NULL`, device).
-		Scan(&platform, &demo, &state, &gen)
+		Scan(&platform, &demo, &state, &gen, &sshManaged)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrMissing
 	}
@@ -68,20 +71,16 @@ func (s *Service) ReserveTerminal(ctx context.Context, device string) (*Terminal
 		return nil, ErrTerminalOffline
 	}
 
-	// Check whether this Linux device is an SSH-managed node.
-	var hostAgentID sql.NullString
-	var sshEnabled bool
-	sshErr := s.store.QueryRowContext(ctx, `SELECT host_agent_id, enabled=1 FROM device_ssh_credentials WHERE device_id=?`, device).
-		Scan(&hostAgentID, &sshEnabled)
-	if sshErr == nil {
-		if !sshEnabled {
+	if sshManaged {
+		s.sshMu.Lock()
+		defer s.sshMu.Unlock()
+		attempt := s.sshAttempts[device]
+		if attempt == nil || !attempt.online {
 			return nil, ErrTerminalOffline
 		}
-		if hostAgentID.Valid && hostAgentID.String != "" {
-			// Mode 2A: Delegated SSH — route terminal frames through the selected host Agent.
-			return s.reservePeerTerminal(hostAgentID.String, device, 0)
+		if attempt.host != nil {
+			return s.reservePeerTerminal(attempt.host, device, attempt)
 		}
-		// Mode 2B: Direct server SSH — open PTY directly on s.sshRunner.
 		if s.sshRunner == nil {
 			return nil, ErrTerminalOffline
 		}
@@ -94,33 +93,33 @@ func (s *Service) ReserveTerminal(ctx context.Context, device string) (*Terminal
 		if len(s.sshLocalSess) >= proto.MaxTerminalSessions*4 {
 			return nil, ErrTerminalBusy
 		}
+		localCtx, cancel := context.WithCancel(s.ctx)
 		sess := &TerminalSession{
 			service:        s,
 			id:             id,
 			targetDeviceID: device,
+			sshAttempt:     attempt,
 			events:         make(chan TerminalEvent, 32),
 			done:           make(chan struct{}),
 			localRunner:    s.sshRunner,
 			localCmds:      make(chan sshrunner.TerminalCommand, 32),
+			localCtx:       localCtx,
+			localCancel:    cancel,
 		}
 		s.sshLocalSess[id] = sess
 		return sess, nil
 	}
-	if !errors.Is(sshErr, sql.ErrNoRows) {
-		return nil, sshErr
-	}
 
-	// Mode 1: Native Windows or Linux Agent connected directly via WebSocket.
-	return s.reservePeerTerminal(device, "", gen)
-}
-
-func (s *Service) reservePeerTerminal(peerDeviceID, targetDeviceID string, expectedGen uint64) (*TerminalSession, error) {
 	s.connectionMu.Lock()
-	p := s.connections[peerDeviceID]
+	p := s.connections[device]
 	s.connectionMu.Unlock()
-	if p == nil || (expectedGen != 0 && p.gen != expectedGen) {
+	if p == nil || p.gen != gen {
 		return nil, ErrTerminalOffline
 	}
+	return s.reservePeerTerminal(p, "", nil)
+}
+
+func (s *Service) reservePeerTerminal(p *peer, targetDeviceID string, attempt *sshAttempt) (*TerminalSession, error) {
 	if p.terminalFrames == nil {
 		return nil, ErrTerminalUnsupported
 	}
@@ -140,8 +139,10 @@ func (s *Service) reservePeerTerminal(peerDeviceID, targetDeviceID string, expec
 	}
 	session := &TerminalSession{
 		peer:           p,
+		service:        s,
 		id:             id,
 		targetDeviceID: targetDeviceID,
+		sshAttempt:     attempt,
 		events:         make(chan TerminalEvent, 32),
 		done:           make(chan struct{}),
 	}
@@ -168,10 +169,24 @@ func (s *TerminalSession) send(ctx context.Context, kind proto.MessageType, payl
 	}
 }
 
+func (s *TerminalSession) recordSSHActivity() error {
+	if s.sshAttempt == nil {
+		return nil
+	}
+	s.service.sshMu.Lock()
+	defer s.service.sshMu.Unlock()
+	if s.service.sshAttempts[s.targetDeviceID] != s.sshAttempt {
+		return ErrTerminalOffline
+	}
+	s.sshAttempt.lastActivity = time.Now()
+	return nil
+}
+
 func (s *TerminalSession) Open(ctx context.Context, shell proto.TerminalShell, cols, rows int) error {
+	if err := s.recordSSHActivity(); err != nil {
+		return err
+	}
 	if s.localRunner != nil {
-		localCtx, cancel := context.WithCancel(s.service.ctx)
-		s.localCancel = cancel
 		s.opened = true
 		req := proto.TerminalFrame{
 			SessionID:      s.id,
@@ -182,7 +197,7 @@ func (s *TerminalSession) Open(ctx context.Context, shell proto.TerminalShell, c
 		}
 		go func() {
 			defer s.finishLocal()
-			result := s.localRunner.OpenTerminal(localCtx, req, s.localCmds, func(text string) {
+			result := s.localRunner.OpenTerminal(s.localCtx, req, s.localCmds, func(text string) {
 				select {
 				case s.events <- TerminalEvent{Type: "output", Data: text}:
 				case <-s.done:
@@ -207,9 +222,7 @@ func (s *TerminalSession) Open(ctx context.Context, shell proto.TerminalShell, c
 
 func (s *TerminalSession) finishLocal() {
 	s.localOnce.Do(func() {
-		if s.localCancel != nil {
-			s.localCancel()
-		}
+		s.localCancel()
 		s.service.sshLocalMu.Lock()
 		delete(s.service.sshLocalSess, s.id)
 		s.service.sshLocalMu.Unlock()
@@ -218,6 +231,9 @@ func (s *TerminalSession) finishLocal() {
 }
 
 func (s *TerminalSession) Input(ctx context.Context, data string) error {
+	if err := s.recordSSHActivity(); err != nil {
+		return err
+	}
 	if s.localRunner != nil {
 		select {
 		case <-s.done:

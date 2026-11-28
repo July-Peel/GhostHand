@@ -59,8 +59,8 @@ type Service struct {
 	settings     *settings.Service
 	sshRunner    *sshrunner.Manager
 	sshPending   sync.Map
-	sshWaitMu    sync.Mutex
-	sshWaiters   map[string][]chan proto.SSHStatePayload
+	sshMu        sync.Mutex
+	sshAttempts  map[string]*sshAttempt
 	sshLocalMu   sync.Mutex
 	sshLocalSess map[string]*TerminalSession
 }
@@ -83,7 +83,7 @@ func New(ctx context.Context, store *db.Store, dataDir string, cloudflare bool) 
 	s := &Service{
 		store: store, dir: dir, key: key, ctx: ctx, cloudflare: cloudflare,
 		nodeKey: nodeKey, nodeKeyFixed: nodeKeyFixed, connections: make(map[string]*peer),
-		sshWaiters:   make(map[string][]chan proto.SSHStatePayload),
+		sshAttempts:  make(map[string]*sshAttempt),
 		sshLocalSess: make(map[string]*TerminalSession),
 	}
 	err = store.Write(ctx, func(tx *sql.Tx) error {
@@ -92,6 +92,9 @@ func New(ctx context.Context, store *db.Store, dataDir string, cloudflare bool) 
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE devices SET conn_state='offline'
 			WHERE id<>? AND is_demo=0 AND conn_state IN ('online','unstable')`, workbench.FreeChatDeviceID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE device_ssh_credentials SET enabled=0, last_error='' WHERE enabled=1`); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET state='queued' WHERE state='dispatched' AND

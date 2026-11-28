@@ -238,6 +238,7 @@ func (a *agent) exchange(ctx context.Context, conn *websocket.Conn, interval tim
 		<-terminalWriterDone
 	}()
 	if a.ssh != nil {
+		defer a.ssh.DisconnectManual()
 		go a.ssh.EmitStates()
 	}
 	received := make(chan readResult, 1)

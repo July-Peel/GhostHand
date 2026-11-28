@@ -47,6 +47,24 @@ var MCPDevicesTool = proto.MCPTool{
 	InputSchema: json.RawMessage(`{"type":"object","additionalProperties":false}`), RiskLevel: "read_only",
 }
 
+const (
+	mcpSSHConnect    = "ssh.connect"
+	mcpSSHDisconnect = "ssh.disconnect"
+)
+
+var MCPSSHConnectionTools = [...]proto.MCPTool{
+	{
+		Name: mcpSSHConnect, RiskLevel: "system",
+		Description: "使用已保存的 SSH 配置登录指定设备。可以连接离线的 SSH 设备，已连接时复用会话。连续空闲 10 分钟后自动断开。",
+		InputSchema: json.RawMessage(`{"type":"object","additionalProperties":false}`),
+	},
+	{
+		Name: mcpSSHDisconnect, RiskLevel: "system",
+		Description: "断开指定设备的 SSH 登录并关闭该连接上的 Shell 会话。设备已断开时直接返回离线状态。",
+		InputSchema: json.RawMessage(`{"type":"object","additionalProperties":false}`),
+	},
+}
+
 // AddressedMCPTool adds the server's routing field to the node's tool schema.
 func AddressedMCPTool(tool proto.MCPTool, requireDevice bool) proto.MCPTool {
 	return addressedMCPTool(tool, requireDevice, "设备 ID 或唯一设备名称")
@@ -167,9 +185,39 @@ func (s *Service) MCPCapabilities(ctx context.Context, device string) ([]proto.M
 	return CanonicalTools(tools), CanonicalResources(resources), nil
 }
 
-// CallMCP uses the same serialized desktop lane, local stop controls and audit trail as chat.
+// CallMCP dispatches controller tools directly and queues device tools in the serialized device lane.
 func (s *Service) CallMCP(ctx context.Context, user int64, device, tool string, args json.RawMessage) (proto.MCPResult, error) {
+	if tool == mcpSSHConnect || tool == mcpSSHDisconnect {
+		return s.callSSHConnection(ctx, user, device, tool, args)
+	}
 	return s.callMCP(ctx, user, device, mcpCommand{Tool: tool, Args: args}, "", nil)
+}
+
+func (s *Service) callSSHConnection(ctx context.Context, user int64, target, tool string, args json.RawMessage) (proto.MCPResult, error) {
+	var parameters map[string]json.RawMessage
+	if len(args) != 0 && (json.Unmarshal(args, &parameters) != nil || parameters == nil || len(parameters) != 0) {
+		return proto.MCPResult{}, proto.ErrToolArguments
+	}
+	device, err := s.MCPDeviceID(ctx, target)
+	if err != nil {
+		return proto.MCPResult{}, err
+	}
+	if s.sshExecutor == nil || !s.sshExecutor.IsSSHDevice(ctx, device) {
+		return proto.MCPResult{Error: "此设备未通过 SSH 接入。"}, nil
+	}
+
+	state := proto.Offline
+	if tool == mcpSSHConnect {
+		err = s.sshExecutor.ConnectSSH(ctx, user, device)
+		state = proto.Online
+	} else {
+		err = s.sshExecutor.DisconnectSSH(ctx, user, device)
+	}
+	if err != nil {
+		return proto.MCPResult{Error: err.Error()}, nil
+	}
+	data, err := json.Marshal(map[string]string{"device_id": device, "conn_state": string(state)})
+	return proto.MCPResult{Data: data}, err
 }
 
 func (s *Service) CallBrowserExtension(ctx context.Context, user int64, device, action string) (proto.MCPResult, error) {

@@ -178,6 +178,7 @@ kbd { color: var(--subtle); font: 11px/1.1 Inter, system-ui, sans-serif; border:
 .title-divider { height: 10px; width: 1px; background: var(--line); }
 .demo-label { font-size: 10px; font-weight: 570; border-radius: 5px; background: var(--muted); color: var(--dim); padding: 2px 5px; white-space: nowrap; }
 .chat-header-actions { gap: 10px; }
+.ssh-connection-error { padding: 8px 22px; border-bottom: 1px solid var(--line); background: var(--surface); overflow-wrap: anywhere; }
 .terminal-launch-button { display: inline-flex; align-items: center; gap: 5px; min-height: 28px; padding: 0 9px; border-radius: 7px; border: 1px solid var(--line); background: var(--canvas); color: var(--dim); font-size: 12px; font-weight: 560; white-space: nowrap; }
 .terminal-launch-button:hover:not(:disabled) { background: var(--muted); color: var(--text); }
 .terminal-dialog { position: fixed; inset: 0; margin: auto; width: min(1120px, calc(100vw - 32px)); height: min(740px, calc(100dvh - 32px)); padding: 0; overflow: hidden; border: 1px solid #655A50; border-radius: 12px; background: #2C2622; color: #D8CBB5; box-shadow: 0 20px 70px #0007; }

@@ -84,7 +84,6 @@ func (s *Service) Connect(w http.ResponseWriter, r *http.Request) {
 	if err := sendFrame(ctx, conn, proto.Welcome, welcome, 0); err != nil {
 		return
 	}
-	go s.syncHostAgentSSH(ctx, p)
 	reason = s.servePeer(ctx, p, hello.LastAck)
 }
 
@@ -304,7 +303,7 @@ func (s *Service) servePeer(ctx context.Context, p *peer, sent uint64) string {
 					if json.Unmarshal(frame.Payload, &st) != nil {
 						err = ErrInvalid
 					} else {
-						go s.handleAgentSSHState(p.id, st)
+						s.handleAgentSSHState(p, st)
 						continue
 					}
 				} else {
@@ -602,7 +601,7 @@ func (s *Service) detach(p *peer, reason string) {
 		delete(s.connections, p.id)
 	}
 	s.connectionMu.Unlock()
-	go s.detachHostAgentSSH(p.id)
+	go s.detachHostAgentSSH(p)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	err := s.store.Write(ctx, func(tx *sql.Tx) error {

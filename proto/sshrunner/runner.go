@@ -85,8 +85,8 @@ func (m *Manager) Connect(cfg proto.SSHConnectPayload) {
 			}
 			return
 		}
-		existing.closeClient()
 		existing.cancel()
+		existing.closeClient()
 		delete(m.targets, cfg.SSHDeviceID)
 	}
 	if m.ctx.Err() != nil {
@@ -99,6 +99,7 @@ func (m *Manager) Connect(cfg proto.SSHConnectPayload) {
 		cancel: cancel,
 		lastState: proto.SSHStatePayload{
 			SSHDeviceID: cfg.SSHDeviceID,
+			AttemptID:   cfg.AttemptID,
 			State:       proto.Offline,
 		},
 	}
@@ -119,8 +120,21 @@ func (m *Manager) Disconnect(sshDeviceID string) {
 	delete(m.targets, sshDeviceID)
 	m.mu.Unlock()
 	if target != nil {
-		target.closeClient()
 		target.cancel()
+		target.closeClient()
+	}
+}
+
+// DisconnectManual closes explicit logins when the connection to their controller ends.
+func (m *Manager) DisconnectManual() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id, target := range m.targets {
+		if target.cfg.AttemptID != "" {
+			delete(m.targets, id)
+			target.cancel()
+			target.closeClient()
+		}
 	}
 }
 
@@ -211,11 +225,15 @@ func (m *Manager) supervise(ctx context.Context, target *sshTarget) {
 			}
 			st := proto.SSHStatePayload{
 				SSHDeviceID: target.cfg.SSHDeviceID,
+				AttemptID:   target.cfg.AttemptID,
 				State:       proto.Offline,
 				Error:       limitError(err.Error()),
 			}
 			target.setState(st)
 			m.emit(st)
+			if target.cfg.AttemptID != "" {
+				return
+			}
 			timer := time.NewTimer(delay)
 			select {
 			case <-ctx.Done():
@@ -229,9 +247,16 @@ func (m *Manager) supervise(ctx context.Context, target *sshTarget) {
 
 		delay = 3 * time.Second
 		target.setClient(client)
+		if ctx.Err() != nil {
+			return
+		}
 		osVersion, arch := probeRemoteSystem(ctx, client)
+		if ctx.Err() != nil {
+			return
+		}
 		st := proto.SSHStatePayload{
 			SSHDeviceID: target.cfg.SSHDeviceID,
+			AttemptID:   target.cfg.AttemptID,
 			State:       proto.Online,
 			OSVersion:   osVersion,
 			Arch:        arch,
@@ -251,11 +276,15 @@ func (m *Manager) supervise(ctx context.Context, target *sshTarget) {
 		}
 		off := proto.SSHStatePayload{
 			SSHDeviceID: target.cfg.SSHDeviceID,
+			AttemptID:   target.cfg.AttemptID,
 			State:       proto.Offline,
 			Error:       errMsg,
 		}
 		target.setState(off)
 		m.emit(off)
+		if target.cfg.AttemptID != "" {
+			return
+		}
 
 		timer := time.NewTimer(delay)
 		select {
