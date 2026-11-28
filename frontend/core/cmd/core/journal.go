@@ -246,6 +246,26 @@ func (j *journal) resultAcknowledged(seq uint64) (bool, error) {
 	return j.outboundAck >= seq, nil
 }
 
+func (j *journal) reportCoreUpdate(operation string) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	for _, frame := range j.outbox {
+		if frame.Type == proto.AgentUpdateResult {
+			var outcome proto.OperationOutcome
+			if json.Unmarshal(frame.Payload, &outcome) == nil && outcome.ID == operation && outcome.Success {
+				return nil
+			}
+		}
+	}
+	if _, err := j.enqueueLocked(proto.AgentUpdateResult, proto.OperationOutcome{
+		ID: operation, Success: true, Detail: "Core 已升级并重新连接",
+	}); err != nil {
+		return err
+	}
+	signal(j.changed)
+	return nil
+}
+
 func (j *journal) finish(op pendingOperation, outcome proto.OperationOutcome) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()

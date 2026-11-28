@@ -37,6 +37,9 @@ func (a *agent) runOperations(ctx context.Context, managed bool) {
 				continue
 			}
 			outcome := proto.OperationOutcome{ID: op.Operation.ID, Success: err == nil, Detail: "completed"}
+			if op.Kind == proto.AgentUpdate {
+				outcome.Detail = "节点已运行上传的 Core"
+			}
 			if err != nil {
 				outcome.Detail = err.Error()
 				if len(outcome.Detail) > 2048 {
@@ -88,7 +91,9 @@ func (a *agent) runOperation(ctx context.Context, op pendingOperation, managed b
 		}
 		defer release()
 		return true, false, a.collectThenUpload(ctx, op.Operation)
-	case proto.AgentUpdate, proto.AgentRollback:
+	case proto.AgentUpdate:
+		return true, false, a.runCoreUpdate(ctx, op.Operation)
+	case proto.AgentRollback:
 		return true, false, errors.New("节点为无文件模式，请直接替换程序并用固定密钥重新启动接入")
 	case proto.AgentUninstall:
 		return true, false, a.uninstall(ctx, op)

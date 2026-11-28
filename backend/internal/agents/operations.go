@@ -37,6 +37,7 @@ type RealtimeDevice struct {
 	Version      string           `json:"version"`
 	Revoked      bool             `json:"revoked"`
 	CanUninstall bool             `json:"can_uninstall"`
+	CanUpdate    bool             `json:"can_update"`
 	Sessions     []HistoryEntry   `json:"sessions"`
 	Operations   []OperationEntry `json:"operations"`
 }
@@ -55,6 +56,7 @@ func (s *Service) History(ctx context.Context, id string) (RealtimeDevice, error
 		return result, err
 	}
 	result.CanUninstall = (platform == proto.Windows || platform == proto.Linux) && proto.SupportsUninstall(capsHash)
+	result.CanUpdate = proto.SupportsCoreUpdate(platform, capsHash)
 	rows, err := s.store.QueryContext(ctx, `SELECT id,kind,state,detail,created_at,finished_at,uploaded_at IS NOT NULL
 		FROM device_operations WHERE device_id=? ORDER BY created_at DESC,id DESC LIMIT 50`, id)
 	if err != nil {
@@ -228,6 +230,11 @@ func (s *Service) Queue(ctx context.Context, user int64, id string, input Operat
 			return "", ErrInvalid
 		}
 	case proto.AgentRestart, proto.HelperRestart, proto.AgentRollback:
+	case proto.AgentUpdate:
+		if input.Hours != 0 {
+			return "", ErrInvalid
+		}
+		return s.queueCoreUpdate(ctx, user, id)
 	case proto.AgentUninstall:
 		if input.Hours != 0 {
 			return "", ErrInvalid
@@ -253,13 +260,13 @@ func (s *Service) Queue(ctx context.Context, user int64, id string, input Operat
 		if input.Kind == proto.AgentUninstall && ((platform != proto.Windows && platform != proto.Linux) || !proto.SupportsUninstall(capsHash)) {
 			return ErrUninstallUnsupported
 		}
-		operationID, err = queue(ctx, tx, user, id, input.Kind, input.Hours)
+		operationID, err = queue(ctx, tx, user, id, input.Kind, input.Hours, nil)
 		return err
 	})
 	return operationID, err
 }
 
-func queue(ctx context.Context, tx *sql.Tx, user int64, device string, kind proto.MessageType, hours int) (string, error) {
+func queue(ctx context.Context, tx *sql.Tx, user int64, device string, kind proto.MessageType, hours int, release *proto.Release) (string, error) {
 	var busy bool
 	err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM device_operations WHERE device_id=? AND state='queued'
 		AND (kind IN (?, 'agent.uninstall') OR ?='agent.uninstall'
@@ -275,15 +282,22 @@ func queue(ctx context.Context, tx *sql.Tx, user int64, device string, kind prot
 	if err != nil {
 		return "", err
 	}
-	if _, err := workbench.Enqueue(ctx, tx, device, kind, proto.Operation{ID: id, Hours: hours}); err != nil {
+	if _, err := workbench.Enqueue(ctx, tx, device, kind, proto.Operation{ID: id, Hours: hours, Release: release}); err != nil {
 		return "", err
+	}
+	var releaseID any
+	auditFields := map[string]any{"operation_id": id, "hours": hours}
+	if release != nil {
+		releaseID = release.ID
+		auditFields["release_id"] = release.ID
+		auditFields["sha256"] = release.SHA256
 	}
 	now := time.Now().UnixMilli()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO device_operations(id,device_id,kind,created_at) VALUES (?,?,?,?)`,
-		id, device, kind, now); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO device_operations(id,device_id,kind,created_at,release_id) VALUES (?,?,?,?,?)`,
+		id, device, kind, now, releaseID); err != nil {
 		return "", err
 	}
-	detail, _ := json.Marshal(map[string]any{"operation_id": id, "hours": hours})
+	detail, _ := json.Marshal(auditFields)
 	if err := audit(ctx, tx, user, device, string(kind), string(detail), now); err != nil {
 		return "", err
 	}

@@ -602,7 +602,7 @@ export function SSHSection({ device, devices, session }: { device: Device; devic
 
 const operationNames: Record<OperationKind, string> = {
   'log.collect': '拉取日志', 'agent.restart': '重启 Core', 'helper.restart': '重启执行器',
-  'agent.update': '升级', 'agent.rollback': '回滚', 'agent.uninstall': '卸载 GhostHand',
+  'agent.update': '升级节点', 'agent.rollback': '回滚', 'agent.uninstall': '卸载 GhostHand',
 }
 const operationStates = { queued: '待处理', succeeded: '已完成', failed: '失败' }
 
@@ -633,8 +633,9 @@ export function DeviceOperations({ device, session }: { device: Device; session:
   const data = history.data
   const outstanding = (kind: OperationKind) => data?.operations.some(op => op.kind === kind && op.state === 'queued')
   const uninstallPending = outstanding('agent.uninstall')
+  const updatePending = outstanding('agent.update')
   const busy = action.isPending || !data || data.revoked || uninstallPending
-  const supportsUninstallPlatform = device.platform === 'windows' || device.platform === 'linux'
+  const supportsMaintenancePlatform = device.platform === 'windows' || device.platform === 'linux'
 
   return (
     <>
@@ -653,19 +654,27 @@ export function DeviceOperations({ device, session }: { device: Device; session:
           <label>最近 <input type="number" value={Number.isNaN(hours) ? '' : hours} onChange={event => setHours(event.target.valueAsNumber)}
             min={1} max={168} required aria-label="日志小时数" /> 小时</label>
           <button className="secondary-button" disabled={busy || outstanding('log.collect')}>拉取日志</button>
+          {supportsMaintenancePlatform && <button type="button" className="secondary-button"
+            disabled={busy || !data?.can_update || device.conn_state !== 'online' || updatePending || outstanding('agent.restart') || outstanding('agent.rollback')}
+            title="使用「接入设备」中已上传的 Core，升级期间设备会短暂断开"
+            onClick={() => action.mutate('agent.update')}>
+            {updatePending || (action.isPending && action.variables === 'agent.update') ? '升级中…' : '升级节点'}
+          </button>}
         </form>
         <div className="agent-actions">
-          <button type="button" className="secondary-button" disabled={busy || outstanding('agent.restart')} onClick={() => action.mutate('agent.restart')}>重启 Core</button>
+          <button type="button" className="secondary-button" disabled={busy || updatePending || outstanding('agent.restart')} onClick={() => action.mutate('agent.restart')}>重启 Core</button>
           {device.platform === 'windows' && <>
             <button type="button" className="secondary-button" disabled={busy || outstanding('helper.restart')} onClick={() => action.mutate('helper.restart')}>重启执行器</button>
-            <button type="button" className="secondary-button" disabled={busy || outstanding('agent.rollback')} onClick={() => setConfirm('agent.rollback')}>回滚版本</button>
+            <button type="button" className="secondary-button" disabled={busy || updatePending || outstanding('agent.rollback')} onClick={() => setConfirm('agent.rollback')}>回滚版本</button>
           </>}
           <button type="button" className="text-button" disabled={busy} onClick={() => setConfirm('revoke')}>吊销凭证</button>
-          {supportsUninstallPlatform && <button type="button" className="secondary-button"
+          {supportsMaintenancePlatform && <button type="button" className="secondary-button"
             disabled={busy || !data?.can_uninstall || data.operations.some(op => op.state === 'queued')}
             onClick={() => setConfirm('agent.uninstall')}>卸载节点</button>}
         </div>
-        {supportsUninstallPlatform && data && !data.revoked && !data.can_uninstall &&
+        {supportsMaintenancePlatform && data && !data.revoked && !data.can_update &&
+          <p>此设备需先安装支持远程升级的 Core 服务。</p>}
+        {supportsMaintenancePlatform && data && !data.revoked && !data.can_uninstall &&
           <p>此设备尚未上报远程卸载能力。</p>}
         {confirm && (
           <div className="agent-confirm">
@@ -688,6 +697,7 @@ export function DeviceOperations({ device, session }: { device: Device; session:
             }</strong>
             <time>{formatDate(op.finished_at ?? op.created_at)}</time>
             {op.kind === 'agent.uninstall' && op.state === 'succeeded' && <span>节点退出后无法回报最终清理结果。</span>}
+            {op.kind === 'agent.update' && op.state === 'succeeded' && <span>{op.detail}</span>}
             {op.state === 'failed' && <span>{op.detail}</span>}
             {op.log_available && <a className="text-button" href={agentAPI.logURL(device.id, op.id)}>下载日志</a>}
           </li>)}

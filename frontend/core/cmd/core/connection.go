@@ -36,6 +36,7 @@ type agent struct {
 	ssh          *sshrunner.Manager
 	sshEvents    chan sshOutbound
 	corePath     string
+	coreSHA256   string
 	helperPath   string
 	operations   chan struct{}
 	taskChanges  chan struct{}
@@ -134,6 +135,7 @@ func (a *agent) session(ctx context.Context) error {
 	platform := proto.Platform(runtime.GOOS)
 	hello := proto.HelloPayload{
 		DeviceID: cfg.DeviceID, Token: cfg.Token, Platform: platform, AgentVersion: version,
+		CoreSHA256:         a.coreSHA256,
 		DesktopOperations:  platform == proto.Windows,
 		TerminalOperations: platform == proto.Windows || platform == proto.Linux,
 		LastAck:            lastAck, Fresh: fresh, CapsHash: proto.TaskCapabilitiesHash(platform), RunningTasks: running, State: snapshot,
@@ -144,6 +146,13 @@ func (a *agent) session(ctx context.Context) error {
 			hello.CapsHash = proto.LinuxUninstallCapsHash
 		} else {
 			hello.CapsHash = proto.WindowsUninstallCapsHash
+		}
+	}
+	if a.coreSHA256 != "" {
+		if platform == proto.Linux {
+			hello.CapsHash = proto.LinuxUpdateCapsHash
+		} else {
+			hello.CapsHash = proto.WindowsUpdateCapsHash
 		}
 	}
 	if err := write(helloCtx, conn, proto.Hello, hello, 0); err != nil {
@@ -173,6 +182,11 @@ func (a *agent) session(ctx context.Context) error {
 		}
 		cfg.Token = welcome.TokenRotate
 		a.cfg.Store(&cfg)
+	}
+	if welcome.CoreUpdateID != "" {
+		if err := a.confirmCoreUpdate(welcome.CoreUpdateID); err != nil {
+			return err
+		}
 	}
 	a.firstWelcome.Do(func() { close(a.welcomed) })
 	slog.Info("controller connected", "generation", welcome.ConnGen, "version", version)

@@ -128,6 +128,7 @@ type HelloPayload struct {
 	DeviceID           string        `json:"device_id"`
 	Token              string        `json:"token"`
 	AgentVersion       string        `json:"agent_ver"`
+	CoreSHA256         string        `json:"core_sha256,omitempty"`
 	Platform           Platform      `json:"platform"`
 	LastAck            uint64        `json:"last_ack"`
 	Fresh              bool          `json:"fresh,omitempty"`
@@ -148,6 +149,7 @@ type WelcomePayload struct {
 	NeedCaps      bool           `json:"need_caps"`
 	TokenRotate   string         `json:"token_rotate,omitempty"`
 	TaskHeartbeat bool           `json:"task_heartbeat,omitempty"`
+	CoreUpdateID  string         `json:"core_update_id,omitempty"`
 	DesktopPolicy *DesktopPolicy `json:"desktop_policy,omitempty"`
 }
 

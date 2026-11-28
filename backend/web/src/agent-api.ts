@@ -55,6 +55,7 @@ export type ConnectionHistory = {
   version: string
   revoked: boolean
   can_uninstall: boolean
+  can_update: boolean
   sessions: {
     generation: number
     connected_at: number

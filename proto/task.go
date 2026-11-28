@@ -82,12 +82,19 @@ const (
 	PreviousWindowsUninstallCapsHash = "m45-tasks-v2-windows-uninstall"
 	LegacyWindowsUninstallCapsHash   = "m4-tasks-v1-windows-uninstall"
 	LinuxUninstallCapsHash           = "m5-tasks-v2-linux-uninstall"
+	WindowsUpdateCapsHash            = "m5-tasks-v2-windows-browser-uninstall-update"
+	LinuxUpdateCapsHash              = "m5-tasks-v2-linux-uninstall-update"
 )
+
+func SupportsCoreUpdate(platform Platform, hash string) bool {
+	return (platform == Windows && hash == WindowsUpdateCapsHash) ||
+		(platform == Linux && hash == LinuxUpdateCapsHash)
+}
 
 func SupportsUninstall(hash string) bool {
 	return hash == WindowsUninstallCapsHash || hash == PreviousWindowsUninstallCapsHash ||
 		hash == "m45-tasks-v1-windows-uninstall" || hash == LegacyWindowsUninstallCapsHash ||
-		hash == LinuxUninstallCapsHash
+		hash == LinuxUninstallCapsHash || hash == WindowsUpdateCapsHash || hash == LinuxUpdateCapsHash
 }
 
 func SupportsBrain(platform Platform, hash string) bool {
@@ -95,7 +102,7 @@ func SupportsBrain(platform Platform, hash string) bool {
 		return hash == TaskCapabilitiesHash(platform) || hash == "m45-tasks-v2-windows" || hash == "m45-tasks-v1-windows" || hash == "m4-tasks-v1-windows" || SupportsUninstall(hash)
 	}
 	if platform == Linux {
-		return hash == TaskCapabilitiesHash(platform) || hash == LinuxUninstallCapsHash
+		return hash == TaskCapabilitiesHash(platform) || hash == LinuxUninstallCapsHash || hash == LinuxUpdateCapsHash
 	}
 	return false
 }

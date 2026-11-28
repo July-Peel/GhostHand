@@ -67,7 +67,7 @@ type Service struct {
 
 func New(ctx context.Context, store *db.Store, dataDir string, cloudflare bool) (*Service, error) {
 	dir := filepath.Join(dataDir, "agents")
-	for _, child := range []string{"", "logs", "windows-install", "linux-install"} {
+	for _, child := range []string{"", "logs", "windows-install", "linux-install", "core-updates"} {
 		if err := os.MkdirAll(filepath.Join(dir, child), 0700); err != nil {
 			return nil, err
 		}

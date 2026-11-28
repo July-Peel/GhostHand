@@ -35,6 +35,7 @@ type peer struct {
 	sshDone              chan struct{}
 	conn                 *websocket.Conn
 	id                   string
+	coreSHA256           string
 	gen                  uint64
 	interval             time.Duration
 	asleep               bool
@@ -63,7 +64,7 @@ func (s *Service) Connect(w http.ResponseWriter, r *http.Request) {
 	var hello proto.HelloPayload
 	if err != nil || first.Version != proto.Version || first.Type != proto.Hello || first.Seq != 0 ||
 		first.Ack != 0 || json.Unmarshal(first.Payload, &hello) != nil || len(hello.AgentVersion) > 64 ||
-		len(hello.CapsHash) > 128 || !validState(hello.State) {
+		len(hello.CapsHash) > 128 || len(hello.CoreSHA256) > 64 || !validState(hello.State) {
 		return
 	}
 	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
@@ -115,7 +116,7 @@ func (s *Service) attach(ctx context.Context, conn *websocket.Conn, hello proto.
 	if s.cloudflare && interval > 90 {
 		interval = 90
 	}
-	p := &peer{conn: conn, id: hello.DeviceID, interval: time.Duration(interval) * time.Second, secureTransport: secure,
+	p := &peer{conn: conn, id: hello.DeviceID, coreSHA256: hello.CoreSHA256, interval: time.Duration(interval) * time.Second, secureTransport: secure,
 		desktopOperations: hello.DesktopOperations && hello.Platform == proto.Windows,
 		desktopRequests:   make(chan desktopRequest), desktopDone: make(chan struct{}), desktopPolicyChanged: make(chan struct{}, 1),
 		sshFrames: make(chan proto.Envelope, 32), sshDone: make(chan struct{})}
@@ -140,6 +141,12 @@ func (s *Service) attach(ctx context.Context, conn *websocket.Conn, hello proto.
 		}
 		if platform != hello.Platform {
 			return ErrDenied
+		}
+		if proto.SupportsCoreUpdate(platform, hello.CapsHash) && hello.CoreSHA256 != "" {
+			welcome.CoreUpdateID, err = matchingCoreUpdate(ctx, tx, p.id, hello.CoreSHA256)
+			if err != nil {
+				return err
+			}
 		}
 		if p.desktopOperations {
 			policy, err := readDesktopPolicy(ctx, tx, p.id)
@@ -166,9 +173,11 @@ func (s *Service) attach(ctx context.Context, conn *websocket.Conn, hello proto.
 			}
 			if _, err := tx.ExecContext(ctx, `UPDATE device_operations
 				SET state=CASE WHEN kind='agent.restart' THEN 'succeeded' ELSE 'failed' END,
-				    detail=CASE WHEN kind='agent.restart' THEN '节点已重新启动' ELSE '节点已重新连接' END,
+				    detail=CASE kind WHEN 'agent.restart' THEN '节点已重新启动'
+				        WHEN 'agent.update' THEN '节点已重新连接，但运行中的 Core 与目标文件不一致'
+				        ELSE '节点已重新连接' END,
 				    finished_at=?,ticket_hash=NULL,ticket_expiry=NULL
-				WHERE device_id=? AND state='queued'`, now.UnixMilli(), p.id); err != nil {
+				WHERE device_id=? AND state='queued' AND id<>?`, now.UnixMilli(), p.id, welcome.CoreUpdateID); err != nil {
 				return err
 			}
 			welcome.LastAck = 0
@@ -511,7 +520,7 @@ func (s *Service) receive(ctx context.Context, p *peer, frame proto.Envelope) (a
 			return err
 		}
 		if newID != 0 {
-			if err := s.applyReliable(ctx, tx, p.id, frame, now); err != nil {
+			if err := s.applyReliable(ctx, tx, p.id, p.coreSHA256, frame, now); err != nil {
 				return err
 			}
 		}
@@ -532,7 +541,7 @@ func (s *Service) receive(ctx context.Context, p *peer, frame proto.Envelope) (a
 	return agentAck, err
 }
 
-func (s *Service) applyReliable(ctx context.Context, tx *sql.Tx, id string, frame proto.Envelope, now int64) error {
+func (s *Service) applyReliable(ctx context.Context, tx *sql.Tx, id, coreSHA256 string, frame proto.Envelope, now int64) error {
 	switch frame.Type {
 	case proto.TaskAccepted, proto.TaskProgress, proto.TaskHeartbeat, proto.TaskResult, proto.UploadRequest, proto.MCPToolResult:
 		return workbench.ApplyTaskReport(ctx, tx, id, frame, now)
@@ -568,8 +577,11 @@ func (s *Service) applyReliable(ctx context.Context, tx *sql.Tx, id string, fram
 	}
 	_, err := tx.ExecContext(ctx, `UPDATE device_operations SET state=?,detail=?,finished_at=?,ticket_hash=NULL,ticket_expiry=NULL
 		WHERE id=? AND device_id=? AND (state='queued' OR (kind='agent.uninstall' AND state='succeeded' AND ?=0))
-		AND (kind<>'log.collect' OR ?=0 OR uploaded_at IS NOT NULL)`,
-		status, outcome.Detail, now, outcome.ID, id, outcome.Success, outcome.Success)
+		AND (kind<>'log.collect' OR ?=0 OR uploaded_at IS NOT NULL)
+		AND (kind<>'agent.update' OR ?=0 OR NOT EXISTS (SELECT 1 FROM agent_releases r
+			WHERE r.id=device_operations.release_id AND r.component=? AND r.sha256<>?))`,
+		status, outcome.Detail, now, outcome.ID, id, outcome.Success, outcome.Success,
+		outcome.Success, proto.CoreUpdateComponent, coreSHA256)
 	return err
 }
 

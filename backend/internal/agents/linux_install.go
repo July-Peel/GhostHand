@@ -39,7 +39,7 @@ func (s *Service) SaveLinuxInstallerFile(name string, body io.Reader) (LinuxInst
 	if err != nil {
 		return LinuxInstallerFile{}, err
 	}
-	if size > MaxLinuxInstallerFileSize || !isLinuxAMD64Executable(file) {
+	if size > MaxLinuxInstallerFileSize || linuxExecutableArch(file) == "" {
 		return LinuxInstallerFile{}, ErrInvalid
 	}
 	if err := errors.Join(file.Sync(), file.Close()); err != nil {
@@ -51,19 +51,22 @@ func (s *Service) SaveLinuxInstallerFile(name string, body io.Reader) (LinuxInst
 	return LinuxInstallerFile{Name: name, Size: size}, nil
 }
 
-func isLinuxAMD64Executable(file io.ReaderAt) bool {
+func linuxExecutableArch(file io.ReaderAt) string {
 	f, err := elf.NewFile(file)
 	if err != nil {
-		return false
+		return ""
 	}
 	defer f.Close()
-	if f.Class != elf.ELFCLASS64 {
-		return false
+	if f.Class != elf.ELFCLASS64 || (f.Type != elf.ET_EXEC && f.Type != elf.ET_DYN) {
+		return ""
 	}
-	if f.Machine != elf.EM_X86_64 && f.Machine != elf.EM_AARCH64 {
-		return false
+	switch f.Machine {
+	case elf.EM_X86_64:
+		return "amd64"
+	case elf.EM_AARCH64:
+		return "arm64"
 	}
-	return f.Type == elf.ET_EXEC || f.Type == elf.ET_DYN
+	return ""
 }
 
 func (s *Service) OpenLinuxInstallerFile(name string) (*os.File, os.FileInfo, error) {

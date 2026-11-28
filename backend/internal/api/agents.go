@@ -43,6 +43,7 @@ func (s *Server) agentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/devices/{device}/delete", s.require(s.deleteDevice))
 	mux.HandleFunc("GET /api/devices/{device}/logs/{operation}", s.require(s.readLog))
 	mux.HandleFunc("GET /api/agent/releases/{release}", s.downloadRelease)
+	mux.HandleFunc("GET "+proto.CoreUpdatePath+"{release}", s.downloadCoreUpdate)
 	mux.HandleFunc("POST /api/agent/logs/{operation}/ticket", s.logTicket)
 	mux.HandleFunc("POST /api/agent/logs/{operation}/upload", s.uploadLog)
 }
@@ -191,6 +192,23 @@ func (s *Server) downloadRelease(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, path)
 }
 
+func (s *Server) downloadCoreUpdate(w http.ResponseWriter, r *http.Request) {
+	if !windowsInstallOriginAllowed(requestOrigin(r)) {
+		fail(w, http.StatusForbidden, "请通过 HTTPS 下载 Core 升级文件。")
+		return
+	}
+	file, err := s.agents.OpenCoreUpdate(r.Context(), r.Header.Get("X-GhostHand-Device"), bearer(r), r.PathValue("release"))
+	if err != nil {
+		agentError(w, r, err)
+		return
+	}
+	defer file.Close()
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(10 * time.Minute))
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	http.ServeContent(w, r, "ghosthand-core", time.Time{}, file)
+}
+
 func (s *Server) downloadFreeRDP(w http.ResponseWriter, r *http.Request) {
 	token := bearer(r)
 	if token == "" {
@@ -252,6 +270,14 @@ func agentError(w http.ResponseWriter, r *http.Request, err error) {
 		fail(w, http.StatusNotFound, "设备、版本或操作不存在。")
 	case errors.Is(err, agents.ErrUninstallUnsupported):
 		fail(w, http.StatusConflict, "此设备尚未上报远程卸载能力，请先更新 Windows Core。")
+	case errors.Is(err, agents.ErrCoreUpdateUnsupported):
+		fail(w, http.StatusConflict, "此设备需先安装支持远程升级的 Core 服务。")
+	case errors.Is(err, agents.ErrCoreUpdateOffline):
+		fail(w, http.StatusConflict, "设备在线后才能下发升级命令。")
+	case errors.Is(err, agents.ErrCoreUpdateMissing):
+		fail(w, http.StatusConflict, "请先在「接入设备」中上传对应平台的 Core 安装文件。")
+	case errors.Is(err, agents.ErrCoreUpdateArch):
+		fail(w, http.StatusConflict, "上传的 Core 安装文件与设备架构不匹配。")
 	case errors.Is(err, agents.ErrDeviceOnline):
 		fail(w, http.StatusConflict, "设备当前仍在线，请先断开连接或吊销凭证后再删除。")
 	case errors.Is(err, agents.ErrConflict):

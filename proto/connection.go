@@ -18,9 +18,12 @@ const (
 )
 
 const (
-	MaxReleaseSize  = 96 << 20
-	MaxLogSize      = 8 << 20
-	AgentSocketPath = "/api/agent/connect"
+	MaxReleaseSize      = 96 << 20
+	MaxLogSize          = 8 << 20
+	AgentSocketPath     = "/api/agent/connect"
+	CoreUpdatePath      = "/api/agent/core-updates/"
+	CoreUpdateComponent = "core-binary"
+	MaxCoreUpdateSize   = 256 << 20
 )
 
 type Enrollment struct {

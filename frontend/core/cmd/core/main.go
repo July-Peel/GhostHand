@@ -23,6 +23,10 @@ import (
 var version = "0.4.0"
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == coreUpdateCheck {
+		fmt.Println(proto.CoreUpdateComponent)
+		return
+	}
 	if handled, err := runBrowserProcess(os.Args[1:]); handled {
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -145,6 +149,14 @@ func start(cfg configuration, helper string, service bool) error {
 		background:   make(chan struct{}, 4),
 		sshEvents:    make(chan sshOutbound, 64),
 		canUninstall: service && (runtime.GOOS == "windows" || runtime.GOOS == "linux"),
+	}
+	if service && supportsCoreUpdate(exe) {
+		digest, err := coreBinarySHA256(exe)
+		if err != nil {
+			slog.Warn("read running Core checksum", "error", err)
+		} else {
+			a.coreSHA256 = digest
+		}
 	}
 	a.ssh = sshrunner.NewManager(ctx, func(st proto.SSHStatePayload) {
 		a.enqueueSSHOutbound(proto.SSHStateMessage, st)
