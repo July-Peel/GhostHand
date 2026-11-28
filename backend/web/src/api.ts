@@ -30,7 +30,7 @@ export type Device = {
 
 export type TaskCard = {
   id: string
-  source?: 'quick' | 'brain' | 'mcp' | 'chat'
+  source?: 'quick' | 'brain' | 'chat'
   title: string
   state: 'queued' | 'dispatched' | 'running' | 'paused' | 'waiting_user' | 'cancelling' | 'succeeded' | 'cancelled' | 'expired' | 'failed' | 'unknown'
   step_index: number

@@ -250,11 +250,11 @@ func (s *Service) callMCP(ctx context.Context, user int64, target string, comman
 			return err
 		}
 		taskID, err = insertTask(ctx, tx, user, Device{ID: device}, brainCommand, string(body), "mcp",
-			"MCP · "+toolLabel(tool), time.Now(), ttl, quiet)
+			"MCP · "+toolLabel(tool), time.Now(), ttl, true)
 		if err != nil {
 			return err
 		}
-		if quiet {
+		if auditAction != "" {
 			if err := auditTask(ctx, tx, user, device, taskID, auditAction, time.Now().UnixMilli()); err != nil {
 				return err
 			}
@@ -319,7 +319,7 @@ func (s *Service) runMCP(parent context.Context, task brainTask) {
 	s.registerBrainSession(task.device, task.id, cancel)
 	defer s.unregisterBrainSession(task.device, task.id)
 	go s.watchBrain(ctx, cancel, task.id)
-	state, message := proto.Failed, "外部 MCP 调用失败。"
+	state := proto.Failed
 	args, argsErr := proto.ValidateTool(command.Tool, command.Args)
 	if valid && argsErr == nil && IsMCPToolAllowed(command.Tool) {
 		window := s.mcpObservedWindow(ctx, task.device)
@@ -351,14 +351,14 @@ func (s *Service) runMCP(parent context.Context, task brainTask) {
 			}
 			s.mcpWindowMu.Unlock()
 			if result.Error == "" {
-				state, message = proto.Succeeded, "外部 MCP 调用已完成。"
+				state = proto.Succeeded
 			}
 		}
 	}
 	if parent.Err() != nil {
 		return
 	}
-	if err := s.completeBrain(ctx, parent, task, message, state); err != nil {
+	if err := s.completeBrain(ctx, parent, task, "", state); err != nil {
 		slog.Error("finish MCP task", "task", task.id, "error", err)
 	}
 }

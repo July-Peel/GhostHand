@@ -171,9 +171,11 @@ func recordToolResult(ctx context.Context, tx *sql.Tx, device, task string, raw 
 		(result.AttachmentID != "" && len(result.AttachmentID) != 26) {
 		return ErrTaskMessage
 	}
-	var tool string
+	var tool, source string
 	var existing sql.NullString
-	err := tx.QueryRowContext(ctx, "SELECT tool,result_json FROM brain_calls WHERE id=? AND task_id=?", result.CallID, task).Scan(&tool, &existing)
+	err := tx.QueryRowContext(ctx, `SELECT c.tool,c.result_json,t.source
+		FROM brain_calls c JOIN tasks t ON t.id=c.task_id
+		WHERE c.id=? AND c.task_id=?`, result.CallID, task).Scan(&tool, &existing, &source)
 	if errors.Is(err, sql.ErrNoRows) || existing.Valid {
 		return nil
 	}
@@ -193,10 +195,12 @@ func recordToolResult(ctx context.Context, tx *sql.Tx, device, task string, raw 
 		if err != nil {
 			return err
 		}
-		body, _ := json.Marshal(media)
-		if _, err := tx.ExecContext(ctx, `INSERT INTO chat_messages(device_id,sender,type,task_id,payload_json,created_at)
-			VALUES (?,'agent','media',?,?,?)`, device, task, string(body), now); err != nil {
-			return err
+		if source != "mcp" {
+			body, _ := json.Marshal(media)
+			if _, err := tx.ExecContext(ctx, `INSERT INTO chat_messages(device_id,sender,type,task_id,payload_json,created_at)
+				VALUES (?,'agent','media',?,?,?)`, device, task, string(body), now); err != nil {
+				return err
+			}
 		}
 	}
 	if _, err := tx.ExecContext(ctx, "UPDATE brain_calls SET result_json=? WHERE id=?", string(raw), result.CallID); err != nil {
@@ -268,7 +272,7 @@ func (s *Service) finishBrain(ctx context.Context, t brainTask, reply string, st
 				return err
 			}
 		}
-		if !t.quiet {
+		if !t.quiet && t.source != "mcp" {
 			if t.source != "chat" {
 				reply = limitText(reply, 5000)
 			}

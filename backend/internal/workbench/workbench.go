@@ -652,7 +652,7 @@ func insertTask(ctx context.Context, tx *sql.Tx, userID int64, device Device, co
 	`, id, device.ID, userID, command.Capability, state, now.UnixMilli(), expires.UnixMilli(), due, command.Lane, total, source, prompt, title, startedAt); err != nil {
 		return "", err
 	}
-	if !quiet {
+	if !quiet && source != "mcp" {
 		if err := addTaskCard(ctx, tx, device.ID, id, now); err != nil {
 			return "", err
 		}

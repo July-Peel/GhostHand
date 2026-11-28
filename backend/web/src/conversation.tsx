@@ -730,7 +730,7 @@ function TaskMessage({ card, device, session }: { card: TaskCard; device: Device
             <button className="text-button" type="button" disabled={control.isPending} onClick={() => control.mutate('cancel')}>{card.state === 'queued' ? '撤回' : '终止'}</button>}
           {awaitingForce &&
             <button className="text-button task-force" type="button" disabled={control.isPending} onClick={() => control.mutate('force')}>强制终止</button>}
-          {card.source !== 'mcp' && card.source !== 'chat' && (card.state === 'failed' || card.state === 'expired') &&
+          {card.source !== 'chat' && (card.state === 'failed' || card.state === 'expired') &&
             <button className="text-button" type="button" disabled={control.isPending} onClick={() => control.mutate('retry')}>重试</button>}
         </div>
       </footer>

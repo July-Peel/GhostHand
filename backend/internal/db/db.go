@@ -51,6 +51,9 @@ var m50Schema string
 //go:embed m51.sql
 var m51Schema string
 
+//go:embed m52.sql
+var m52Schema string
+
 type Mutation func(*sql.Tx) error
 
 type writeRequest struct {
@@ -130,7 +133,7 @@ func migrate(ctx context.Context, writer *sql.DB) error {
 	if err := tx.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
-	if version < 0 || version > 12 {
+	if version < 0 || version > 13 {
 		return fmt.Errorf("unsupported SQLite schema version %d", version)
 	}
 	if version == 0 {
@@ -223,6 +226,14 @@ func migrate(ctx context.Context, writer *sql.DB) error {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, "PRAGMA user_version=12"); err != nil {
+			return err
+		}
+	}
+	if version < 13 {
+		if _, err := tx.ExecContext(ctx, m52Schema); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, "PRAGMA user_version=13"); err != nil {
 			return err
 		}
 	}

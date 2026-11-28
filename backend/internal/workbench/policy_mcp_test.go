@@ -1,9 +1,12 @@
 package workbench
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"sync"
 	"testing"
+	"time"
 
 	"ghosthand/backend/internal/db"
 	"ghosthand/backend/internal/settings"
@@ -83,5 +86,110 @@ func TestAutoApproveAndFullMCPTools(t *testing.T) {
 	}
 	if IsMCPToolAllowed(proto.ToolConfirm) {
 		t.Fatal("human.confirm must not be exposed via external MCP")
+	}
+}
+
+func TestCallMCPDoesNotWriteChatMessages(t *testing.T) {
+	s, ctx := newMentionTestWorkbench(t)
+	runCtx, stop := context.WithCancel(ctx)
+	var bg sync.WaitGroup
+	bg.Add(3)
+	go func() { defer bg.Done(); s.RunTasks(runCtx) }()
+	go func() { defer bg.Done(); s.RunBrain(runCtx) }()
+	go func() {
+		defer bg.Done()
+		sampleJPEG := testSampleJPEG(t)
+		var processed int64
+		for runCtx.Err() == nil {
+			rows, err := s.store.QueryContext(runCtx, `SELECT seq, envelope_json FROM outbox WHERE device_id='dev66' AND seq>? ORDER BY seq`, processed)
+			if err != nil {
+				return
+			}
+			type item struct {
+				seq int64
+				raw string
+			}
+			var items []item
+			for rows.Next() {
+				var it item
+				if rows.Scan(&it.seq, &it.raw) == nil {
+					items = append(items, it)
+				}
+			}
+			rows.Close()
+			for _, it := range items {
+				processed = it.seq
+				var env proto.Envelope
+				if json.Unmarshal([]byte(it.raw), &env) != nil {
+					continue
+				}
+				switch env.Type {
+				case proto.TaskAssign:
+					var assign proto.TaskAssignment
+					_ = json.Unmarshal(env.Payload, &assign)
+					accept, _ := proto.NewEnvelope(proto.TaskAccepted, proto.TaskRef{TaskID: assign.TaskID})
+					_ = s.store.Write(runCtx, func(tx *sql.Tx) error {
+						return ApplyTaskReport(runCtx, tx, "dev66", accept, time.Now().UnixMilli())
+					})
+				case proto.MCPToolCall:
+					var call proto.MCPCall
+					_ = json.Unmarshal(env.Payload, &call)
+					res := proto.MCPResult{CallID: call.CallID, TaskID: call.TaskID, Data: json.RawMessage(`{"ok":true}`)}
+					if call.Tool == proto.ToolObserve {
+						now := time.Now()
+						img, err := s.saveUserAttachment(runCtx, UploadImage{Name: "screen.jpg", Data: sampleJPEG}, settings.Configuration{}, now)
+						if err == nil {
+							_ = s.store.Write(runCtx, func(tx *sql.Tx) error {
+								return img.insert(runCtx, tx, call.TaskID, call.CallID, now)
+							})
+							res.AttachmentID = img.ID
+						}
+					}
+					frame, _ := proto.NewEnvelope(proto.MCPToolResult, res)
+					_ = s.store.Write(runCtx, func(tx *sql.Tx) error {
+						if err := ApplyTaskReport(runCtx, tx, "dev66", frame, time.Now().UnixMilli()); err != nil {
+							return err
+						}
+						return RecordChange(runCtx, tx, "dev66")
+					})
+				}
+			}
+			select {
+			case <-runCtx.Done():
+			case <-time.After(15 * time.Millisecond):
+			}
+		}
+	}()
+	defer func() {
+		stop()
+		bg.Wait()
+	}()
+
+	res, err := s.CallMCP(ctx, 1, "dev66", proto.ToolStatus, json.RawMessage(`{}`))
+	if err != nil || res.Error != "" {
+		t.Fatalf("CallMCP(device_status) = (%+v, %v)", res, err)
+	}
+	obs, err := s.CallMCP(ctx, 1, "dev66", proto.ToolObserve, json.RawMessage(`{}`))
+	if err != nil || obs.Error != "" || obs.AttachmentID == "" {
+		t.Fatalf("CallMCP(screen_observe) = (%+v, %v)", obs, err)
+	}
+	img, err := s.MCPImage(ctx, obs.AttachmentID)
+	if err != nil || len(img) == 0 {
+		t.Fatalf("MCPImage(%q) = (%d bytes, %v)", obs.AttachmentID, len(img), err)
+	}
+
+	page, err := s.Messages(ctx, "dev66", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Messages) != 0 {
+		t.Fatalf("expected 0 chat messages after MCP calls, got %+v", page.Messages)
+	}
+	var count int
+	if err := s.store.QueryRowContext(ctx, "SELECT COUNT(*) FROM chat_messages WHERE device_id='dev66'").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("chat_messages count = %d, want 0", count)
 	}
 }

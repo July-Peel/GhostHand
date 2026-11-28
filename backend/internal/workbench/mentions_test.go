@@ -541,6 +541,13 @@ func TestSingleDeviceCrossDeviceLoopAndScreenshotReturn(t *testing.T) {
 	if !foundRemoteMedia {
 		t.Fatal("expected 西班牙 screenshot media card in dev66 chat messages")
 	}
+	remotePage, err := s.Messages(ctx, "deves", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remotePage.Messages) != 0 {
+		t.Fatalf("expected no MCP chat messages on target device deves, got %+v", remotePage.Messages)
+	}
 }
 
 func newMentionTestWorkbench(t *testing.T) (*Service, context.Context) {
